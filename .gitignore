@@ -48,3 +48,7 @@ auth.bin
 *.deb
 *.so
 *.a
+*.pyc
+__pycache__/
+.vscode/
+.DS_Store

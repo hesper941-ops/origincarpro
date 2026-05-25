@@ -5,6 +5,7 @@ from launch_ros.actions import Node
 from launch.substitutions import TextSubstitution, LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python import get_package_share_directory, get_package_prefix
+from launch.launch_description_sources import AnyLaunchDescriptionSource
 
 def generate_launch_description():
     # Copy config files
@@ -58,10 +59,19 @@ def generate_launch_description():
         output='screen',
         arguments=['--ros-args', '--log-level', 'info']
     )
+    
+    rosbridge_node = IncludeLaunchDescription(
+        AnyLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('rosbridge_server'), 'launch', 'rosbridge_websocket_launch.xml')
+        ),
+        launch_arguments={'port': '9091'}.items()
+    )
+    
     return LaunchDescription(launch_args + [
         usb_node,
         nv12_codec_node,
         dnn_node_example_node,
         web_node,
-        image_transport_node
+        image_transport_node,
+        rosbridge_node
     ])
