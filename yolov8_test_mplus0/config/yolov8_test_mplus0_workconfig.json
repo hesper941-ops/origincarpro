@@ -1,14 +1,18 @@
 {
-        "model_file": "/root/intelligent_car_ws/src/yolov8_test_mplus0/models/front_4cls_yolov8n_640x640_x5.bin",
-        "task_num": 4,
-        "dnn_Parser": "yolov8",
-        "model_output_count": 6,
-        "reg_max": 16,
-        "class_num": 4,
-        "cls_names_list": "/root/intelligent_car_ws/src/yolov8_test_mplus0/config/classes.list",
-        "strides": [8, 16, 32],
-        "score_threshold": 0.25,
-        "nms_threshold": 0.7,
-        "nms_top_k": 300,
-        "community_qat": true
+    "model_file": "/root/intelligent_car_ws/src/yolov8_test_mplus0/models/front_4cls_yolov8n_640x640_x5.bin",
+    "task_num": 4,
+    "dnn_Parser": "yolov8",
+    "model_output_count": 6,
+    "reg_max": 16,
+    "class_num": 4,
+    "cls_names_list": "/root/intelligent_car_ws/src/yolov8_test_mplus0/config/classes.list",
+    "strides": [
+        8,
+        16,
+        32
+    ],
+    "score_threshold": 0.25,
+    "nms_threshold": 0.7,
+    "nms_top_k": 300,
+    "community_qat": false
 }
