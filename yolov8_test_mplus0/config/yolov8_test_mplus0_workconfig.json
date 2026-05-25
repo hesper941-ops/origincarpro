@@ -14,5 +14,5 @@
     "score_threshold": 0.25,
     "nms_threshold": 0.7,
     "nms_top_k": 300,
-    "community_qat": false
+    "community_qat": true
 }
