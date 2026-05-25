@@ -1,0 +1,50 @@
+# ROS2 build outputs
+build/
+install/
+log/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# editor
+.vscode/
+.idea/
+
+# temp
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# compressed files
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
+# model files
+*.pt
+*.onnx
+*.bin
+*.engine
+
+# dataset
+datasets/
+data/
+
+# secrets
+.env
+auth.bin
+*.key
+*.pem
+*api_key*
+*secret*
+*token*
+
+# binary packages
+*.deb
+*.so
+*.a
