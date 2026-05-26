@@ -57,3 +57,14 @@ auth.bin
 __pycache__/
 .vscode/
 .DS_Store
+
+# Local third-party source trees
+/3rdparty/deptrum-ros-driver/
+
+# local secrets
+racing_vision_ai/config/vision_ai_config.yaml.bak_local_secret
+*.local_secret
+.env
+
+# local third-party source trees
+/3rdparty/deptrum-ros-driver/

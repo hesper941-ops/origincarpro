@@ -1,0 +1,6 @@
+# Python dependencies for racing_vision_ai package
+volcengine-python-sdk[ark]
+opencv-python
+pillow
+numpy
+pyyaml
