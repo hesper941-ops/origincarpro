@@ -48,6 +48,19 @@ ros2 launch yolov8_test_mplus0 yolov8_detect.launch.py
 ros2 launch vision_birdview bird_view.launch.py
 ```
 
+## Web 显示
+
+```bash
+ros2 launch origincar_bringup usb_websocket_display.launch.py websocket_image_topic:=/image_out/compressed
+```
+
+## 订阅关系
+
+- YOLO 只订阅 `/hbmem_img` 和 `/image_out/compressed`
+- Bird View 只订阅 `/image_out`
+- Web 显示只订阅 `/image_out/compressed`
+- 二维码识别只订阅 `/image_out`
+
 ## 约束说明
 
 以下模块都不允许再启动相机，也不允许直接在正式节点里打开本地摄像头设备：
@@ -59,6 +72,6 @@ ros2 launch vision_birdview bird_view.launch.py
 
 这些模块只能订阅已有图像话题：
 
+- `/hbmem_img`
 - `/image_out`
 - `/image_out/compressed`
-- `/hbmem_img`

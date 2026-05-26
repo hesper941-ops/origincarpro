@@ -7,16 +7,18 @@ if not cap.isOpened():
     print("Camera open failed")
     exit()
 
+# =========================
+# 原图上的4个点（可拖动）
+# =========================
 src = np.float32([
-    [200, 400],
-    [440, 400],
-    [360, 260],
-    [280, 260]
+    [200, 400],   # 左下
+    [440, 400],   # 右下
+    [360, 260],   # 右上
+    [280, 260]    # 左上
 ])
 
 selected_idx = -1
 drag_radius = 20
-
 
 def draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_length=20, gap_length=10):
     pt1 = np.array(pt1, dtype=np.float32)
@@ -34,7 +36,6 @@ def draw_dashed_line(img, pt1, pt2, color, thickness=2, dash_length=20, gap_leng
 
 
 def on_mouse(event, x, y, flags, param):
-    del flags
     global selected_idx
     pts = param
     if event == cv2.EVENT_LBUTTONDOWN:
@@ -46,19 +47,24 @@ def on_mouse(event, x, y, flags, param):
         pts[selected_idx] = [x, y]
     elif event == cv2.EVENT_LBUTTONUP:
         selected_idx = -1
-        print("Current points:", src.tolist())
-
+        print("当前四点坐标:", src.tolist())
 
 cv2.namedWindow("Original")
 cv2.setMouseCallback("Original", on_mouse, src)
-print("Drag the points to align ROI, press ESC to exit.")
+print("拖动红点对齐虚线边缘，按ESC退出。")
 
 while True:
+
     ret, frame = cap.read()
+
     if not ret:
         break
 
     h, w = frame.shape[:2]
+
+    # =========================
+    # 目标俯视图点
+    # =========================
     dst = np.float32([
         [0, h],
         [w, h],
@@ -66,30 +72,40 @@ while True:
         [0, 0]
     ])
 
-    matrix = cv2.getPerspectiveTransform(src, dst)
-    bird = cv2.warpPerspective(frame, matrix, (w, h))
+    # =========================
+    # 计算透视矩阵
+    # =========================
+    M = cv2.getPerspectiveTransform(src, dst)
 
+    # =========================
+    # 逆透视变换
+    # =========================
+    bird = cv2.warpPerspective(frame, M, (w, h))
+
+    # =========================
+    # 在原图画点
+    # =========================
     for i, p in enumerate(src):
         cv2.circle(frame, (int(p[0]), int(p[1])), 8, (0, 0, 255), -1)
-        cv2.putText(
-            frame,
-            f"{i}:{int(p[0])},{int(p[1])}",
-            (int(p[0]) + 10, int(p[1]) - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 255),
-            1
-        )
+        cv2.putText(frame, f"{i}:{int(p[0])},{int(p[1])}", (int(p[0]) + 10, int(p[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
+    # =========================
+    # 画梯形ROI（虚线）
+    # =========================
     for i in range(len(src)):
         pt1 = tuple(src[i].astype(int))
         pt2 = tuple(src[(i + 1) % len(src)].astype(int))
         draw_dashed_line(frame, pt1, pt2, (0, 255, 0), thickness=2, dash_length=15, gap_length=10)
 
+    # =========================
+    # 显示
+    # =========================
     cv2.imshow("Original", frame)
     cv2.imshow("Bird View", bird)
 
-    if cv2.waitKey(1) == 27:
+    key = cv2.waitKey(1)
+
+    if key == 27:
         break
 
 cap.release()

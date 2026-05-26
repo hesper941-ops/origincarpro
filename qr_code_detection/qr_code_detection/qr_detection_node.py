@@ -45,7 +45,7 @@ class QrCodeDetection(Node):
         self.decoded_data = []  # 存储所有解码结果
 #        self.close_sub = self.create_subscription(
 #            Int32, "/close_signal", self.close_callback, 1)
-        # 接受来自utils/NV122BGR的imgae_out
+        # 接收来自 vision_camera/hbm_image_bridge 的 /image_out
         self.image_sub = self.create_subscription(
             Image, "/image_out", self.image_callback, 1)
 
