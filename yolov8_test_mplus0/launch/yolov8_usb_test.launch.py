@@ -18,6 +18,7 @@ def generate_launch_description():
     image_topic = LaunchConfiguration('image_topic')
     detection_topic = LaunchConfiguration('detection_topic')
     show_window = LaunchConfiguration('show_window')
+    usb_pixel_format = LaunchConfiguration('usb_pixel_format')
 
     declare_config_file = DeclareLaunchArgument(
         'config_file',
@@ -51,6 +52,12 @@ def generate_launch_description():
         description='Whether to show OpenCV window'
     )
 
+    declare_usb_pixel_format = DeclareLaunchArgument(
+        'usb_pixel_format',
+        default_value=TextSubstitution(text='mjpeg2rgb'),
+        description='USB camera pixel format: mjpeg, mjpeg2rgb, yuyv, yuyv2rgb'
+    )
+
     dnn_test_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -64,6 +71,7 @@ def generate_launch_description():
             'usb_video_device': device,
             'usb_image_width': '640',
             'usb_image_height': '480',
+            'usb_pixel_format': usb_pixel_format,
             'dnn_example_config_file': config_file,
             'dnn_example_msg_pub_topic_name': 'hobot_dnn_detection',
             'dnn_example_image_width': '640',
@@ -96,6 +104,7 @@ def generate_launch_description():
         declare_image_topic,
         declare_detection_topic,
         declare_show_window,
+        declare_usb_pixel_format,
 
         dnn_test_launch,
         image_transport_node,
