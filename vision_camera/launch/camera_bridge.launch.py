@@ -1,66 +1,75 @@
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, TextSubstitution
-from launch_ros.actions import Node
+#!/usr/bin/env python3
 
-from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
+from launch.substitutions import LaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    device = LaunchConfiguration('device')
-    usb_image_width = LaunchConfiguration('usb_image_width')
-    usb_image_height = LaunchConfiguration('usb_image_height')
-    usb_pixel_format = LaunchConfiguration('usb_pixel_format')
+    color_topic = LaunchConfiguration('color_topic')
+    jpeg_quality = LaunchConfiguration('jpeg_quality')
+
+    aurora_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            FindPackageShare('deptrum-ros-driver-aurora930'),
+            '/launch/aurora930_launch.py'
+        ])
+    )
+
+    aurora_color_bridge = Node(
+        package='vision_camera',
+        executable='aurora_color_bridge.py',
+        name='aurora_color_bridge',
+        output='screen',
+        parameters=[{
+            'color_topic': color_topic,
+            'jpeg_quality': jpeg_quality,
+        }]
+    )
+
+    # Keep original YOLO/BPU input topic unchanged:
+    # /image (CompressedImage) -> hobot_codec -> /hbmem_img (HbmMsg1080P)
+    hobot_codec_decode = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            FindPackageShare('hobot_codec'),
+            '/launch/hobot_codec_decode.launch.py'
+        ]),
+        launch_arguments={
+            'codec_sub_topic': '/image',
+            'codec_pub_topic': '/hbmem_img',
+            'codec_in_mode': 'ros',
+            'codec_out_mode': 'shared_mem',
+            'codec_in_format': 'jpeg',
+            'codec_out_format': 'nv12',
+        }.items()
+    )
 
     return LaunchDescription([
+        SetEnvironmentVariable('ROS_DISABLE_LOANED_MESSAGES', '1'),
+
         DeclareLaunchArgument(
-            'device',
-            default_value=TextSubstitution(text='/dev/video0'),
-            description='USB camera device path'
-        ),
-        DeclareLaunchArgument(
-            'usb_image_width',
-            default_value=TextSubstitution(text='640'),
-            description='USB camera image width'
+            'color_topic',
+            default_value='',
+            description='Aurora color Image topic. Empty means auto select.'
         ),
         DeclareLaunchArgument(
-            'usb_image_height',
-            default_value=TextSubstitution(text='480'),
-            description='USB camera image height'
+            'jpeg_quality',
+            default_value='85',
+            description='JPEG quality for /image and /image_out/compressed'
         ),
-        DeclareLaunchArgument(
-            'usb_pixel_format',
-            default_value=TextSubstitution(text='mjpeg2rgb'),
-            description='USB camera pixel format'
+
+        aurora_launch,
+
+        TimerAction(
+            period=2.0,
+            actions=[aurora_color_bridge]
         ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                get_package_share_directory('hobot_usb_cam') + '/launch/hobot_usb_cam.launch.py'
-            ),
-            launch_arguments={
-                'usb_video_device': device,
-                'usb_image_width': usb_image_width,
-                'usb_image_height': usb_image_height,
-                'usb_pixel_format': usb_pixel_format,
-            }.items()
-        ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                get_package_share_directory('hobot_codec') + '/launch/hobot_codec_decode.launch.py'
-            ),
-            launch_arguments={
-                'codec_in_mode': 'ros',
-                'codec_out_mode': 'shared_mem',
-                'codec_sub_topic': '/image',
-                'codec_pub_topic': '/hbmem_img',
-                'codec_out_format': 'nv12',
-            }.items()
-        ),
-        Node(
-            package='vision_camera',
-            executable='hbm_image_bridge',
-            output='screen',
-            arguments=['--ros-args', '--log-level', 'info']
+
+        TimerAction(
+            period=3.0,
+            actions=[hobot_codec_decode]
         ),
     ])
