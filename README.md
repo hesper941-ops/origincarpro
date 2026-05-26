@@ -1,46 +1,64 @@
-# Origincar 使用说明
+# OriginCar ROS2 视觉链路说明
 
 ## 编译
 
 ```bash
-# 默认工作空间 /userdata/dev_ws/
-cd /userdata/dev_ws/
 colcon build --symlink-install
 ```
 
-## 底盘和控制
+## 底盘控制
 
-启动底盘
+底盘启动保持原流程不变：
+
 ```bash
 ros2 launch origincar_base origincar_bringup.launch.py
 ```
 
-启动键盘控制
+键盘控制：
+
 ```bash
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 ```
-以下按键进行控制
-```
-   u    i    o
-   j    k    l
-   m    ,    .
-```
-键盘节点会发布 速度消息 到 /cmd_vel 话题，底盘节点订阅速度消息实现键盘控制
 
-## USB 相机驱动与图像可视化
-```bash
-ros2 launch origincar_bringup usb_websocket_display.launch.py
-```
-运行成功后，在同一网络的PC端，打开浏览器，输入 http://IP:8000，选择“web展示端”，即可查看图像和算法效果，IP为OriginBot的IP地址。
+## 单相机入口
 
-## 深度相机驱动与图像可视化
-启动相机
+视觉链路统一采用“单相机入口”原则，只有下面这个 launch 允许启动相机和编解码链路：
 
 ```bash
-ros2 launch deptrum-ros-driver-aurora930 aurora930_launch.py
+ros2 launch vision_camera camera_bridge.launch.py device:=/dev/video0
+```
 
+这个入口会启动：
+
+- `hobot_usb_cam`
+- `hobot_codec_decode`
+- `vision_camera/hbm_image_bridge`
+
+桥接后提供的话题：
+
+- `/hbmem_img`
+- `/image_out`
+- `/image_out/compressed`
+
+## 启动顺序
+
+```bash
+ros2 launch vision_camera camera_bridge.launch.py device:=/dev/video0
+ros2 launch yolov8_test_mplus0 yolov8_detect.launch.py
+ros2 launch vision_birdview bird_view.launch.py
 ```
-启动rqt_image_view
-```
-ros2 run rqt_image_view rqt_image_view
-```
+
+## 约束说明
+
+以下模块都不允许再启动相机，也不允许直接在正式节点里打开本地摄像头设备：
+
+- YOLO
+- Bird View
+- 二维码识别
+- Web 显示
+
+这些模块只能订阅已有图像话题：
+
+- `/image_out`
+- `/image_out/compressed`
+- `/hbmem_img`

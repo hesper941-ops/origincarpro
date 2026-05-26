@@ -47,7 +47,7 @@ class QrCodeDetection(Node):
 #            Int32, "/close_signal", self.close_callback, 1)
         # 接受来自utils/NV122BGR的imgae_out
         self.image_sub = self.create_subscription(
-            Image, "/image_bgr8", self.image_callback, 1)
+            Image, "/image_out", self.image_callback, 1)
 
         self.pub_car_signal = self.create_publisher(
             Sign, "/sign_switch", 1)

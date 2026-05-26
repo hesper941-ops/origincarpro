@@ -14,7 +14,7 @@ class YoloBoxViewer(Node):
     def __init__(self):
         super().__init__('yolo_box_viewer')
 
-        self.declare_parameter('image_topic', '/image')
+        self.declare_parameter('image_topic', '/image_out/compressed')
         self.declare_parameter('detection_topic', '/hobot_dnn_detection')
         self.declare_parameter('output_compressed_topic', '/yolov8_result/compressed')
         self.declare_parameter('jpeg_quality', 80)
