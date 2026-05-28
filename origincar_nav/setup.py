@@ -2,7 +2,7 @@ from setuptools import setup
 from glob import glob
 import os
 
-package_name = 'yolov8_test_mplus0'
+package_name = 'origincar_nav'
 
 setup(
     name=package_name,
@@ -16,19 +16,19 @@ setup(
         (os.path.join('share', package_name, 'launch'),
             glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'),
-            glob('config/*')),
+            glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'maps'),
+            glob('maps/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='root',
     maintainer_email='root@todo.todo',
-    description='YOLOv8 test package for intelligent car camera and detection visualization.',
+    description='Navigation bringup package for origincar',
     license='TODO',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'yolo_box_viewer = yolov8_test_mplus0.yolo_box_viewer:main',
-            'cmd_vel_mux = yolov8_test_mplus0.cmd_vel_mux:main',
         ],
     },
 )

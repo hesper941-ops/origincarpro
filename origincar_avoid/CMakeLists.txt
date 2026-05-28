@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(test1)
+project(origincar_avoid)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -12,12 +12,13 @@ find_package(std_msgs REQUIRED)
 
 install(PROGRAMS
   scripts/teleop_smooth_ros2.py
-  
+  scripts/cmd_vel_mux.py
+  scripts/yolo_box_viewer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 execute_process(COMMAND chmod -R +x ${CMAKE_CURRENT_SOURCE_DIR}/scripts/teleop_smooth_ros2.py)
-
-
+execute_process(COMMAND chmod -R +x ${CMAKE_CURRENT_SOURCE_DIR}/scripts/cmd_vel_mux.py)
+execute_process(COMMAND chmod -R +x ${CMAKE_CURRENT_SOURCE_DIR}/scripts/yolo_box_viewer.py)
 
 
 

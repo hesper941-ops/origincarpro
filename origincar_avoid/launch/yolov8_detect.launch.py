@@ -11,7 +11,7 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
-    package_share = get_package_share_directory('yolov8_test_mplus0')
+    package_share = get_package_share_directory('origincar_avoid')
 
     config_file = LaunchConfiguration('config_file')
     image_topic = LaunchConfiguration('image_topic')
@@ -97,7 +97,7 @@ def generate_launch_description():
         # 输出 /yolo_cmd_vel 和 /yolo_avoid_active
         # =========================
         Node(
-            package='yolov8_test_mplus0',
+            package='origincar_avoid',
             executable='yolo_box_viewer',
             output='screen',
             parameters=[
@@ -134,7 +134,7 @@ def generate_launch_description():
         #   /cmd_vel
         # =========================
         Node(
-            package='yolov8_test_mplus0',
+            package='origincar_avoid',
             executable='cmd_vel_mux',
             output='screen',
             parameters=[
