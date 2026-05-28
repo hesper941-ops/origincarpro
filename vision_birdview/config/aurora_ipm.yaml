@@ -1,5 +1,9 @@
 perspective_node:
   ros__parameters:
+    # 默认使用统一相机入口，不直接订阅 /aurora/rgb/image_raw
+    input_topic: /image_out
+    output_topic: /bird_view/image
+    compressed_output_topic: /bird_view/image/compressed
 
     image_width: 640
     image_height: 480
@@ -25,5 +29,5 @@ perspective_node:
       - 0.0
 
     pixel_per_meter: 200.0
-
     publish_compressed: true
+    show_window: false
