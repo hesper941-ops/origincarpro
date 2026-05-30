@@ -72,11 +72,8 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'track_cmd_topic': '/track_cmd_vel',
-                'legacy_nav_cmd_topic': '/nav2_cmd_vel',
                 'avoid_cmd_topic': '/avoid_cmd_vel',
-                'legacy_avoid_cmd_topic': '/yolo_cmd_vel',
                 'avoid_active_topic': '/avoid_active',
-                'legacy_avoid_active_topic': '/yolo_avoid_active',
                 'output_cmd_topic': '/cmd_vel',
             }],
         ),

@@ -11,11 +11,8 @@ class CmdVelMux(Node):
         super().__init__('cmd_vel_mux')
 
         self.declare_parameter('track_cmd_topic', '/track_cmd_vel')
-        self.declare_parameter('legacy_nav_cmd_topic', '/nav2_cmd_vel')
         self.declare_parameter('avoid_cmd_topic', '/avoid_cmd_vel')
-        self.declare_parameter('legacy_avoid_cmd_topic', '/yolo_cmd_vel')
         self.declare_parameter('avoid_active_topic', '/avoid_active')
-        self.declare_parameter('legacy_avoid_active_topic', '/yolo_avoid_active')
         self.declare_parameter('output_cmd_topic', '/cmd_vel')
         self.declare_parameter('cmd_timeout_sec', 0.5)
         self.declare_parameter('publish_rate_hz', 20.0)
@@ -28,11 +25,8 @@ class CmdVelMux(Node):
         self.avoid_active = False
 
         self.create_subscription(Twist, self.get_parameter('track_cmd_topic').value, self.track_callback, 10)
-        self.create_subscription(Twist, self.get_parameter('legacy_nav_cmd_topic').value, self.track_callback, 10)
         self.create_subscription(Twist, self.get_parameter('avoid_cmd_topic').value, self.avoid_callback, 10)
-        self.create_subscription(Twist, self.get_parameter('legacy_avoid_cmd_topic').value, self.avoid_callback, 10)
         self.create_subscription(Bool, self.get_parameter('avoid_active_topic').value, self.active_callback, 10)
-        self.create_subscription(Bool, self.get_parameter('legacy_avoid_active_topic').value, self.active_callback, 10)
 
         self.cmd_pub = self.create_publisher(Twist, self.get_parameter('output_cmd_topic').value, 10)
         rate = float(self.get_parameter('publish_rate_hz').value)

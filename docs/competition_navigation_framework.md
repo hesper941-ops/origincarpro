@@ -1,18 +1,30 @@
 # Competition Navigation Framework
 
-## Core Direction
+## Formal Control Line
 
-The formal competition flow is no longer a fixed waypoint loop. Nav2 and old waypoint tools can still be kept for debugging, but the competition line is:
+The formal competition control line is:
 
 `semantic_map.yaml` -> `task_manager` -> `/current_goal` -> `target_tracker` -> `/track_cmd_vel` -> `cmd_vel_mux` -> `/cmd_vel`
 
-The static map is only for visualization in RViz or CoStudio. It can show the car pose, current goal, tracks, and approximate obstacle positions, but it is not the main decision map.
+Nav2 and fixed waypoint demos can stay as debugging tools, but they are not the formal competition path.
+
+The static map and visualization markers are only for RViz or CoStudio inspection. They do not participate in task decisions or control arbitration.
 
 ## Semantic Map
 
-`origincar_nav/config/semantic_map.yaml` is the rough task map. It stores the start point, task station, channel entry, channel points, map boundary, route order, and goal thresholds.
+`origincar_nav/config/semantic_map.yaml` is the rough semantic map used by the task layer. It stores the start point, task station, channel entry, channel points, boundary, route order, task thresholds, and visualization options.
 
-The coordinates are intentionally coarse defaults. They should be measured and tuned on the real field.
+The current coordinates and boundary values are placeholders. They must be calibrated on the real car and competition field before a real run.
+
+## Half-Route QR Scan
+
+The car does not stop at the task station and wait for QR decoding.
+
+During `TRACK_TO_TASK_STATION`, `task_manager` keeps `/track_enable=true` and keeps the active goal at `task_station`. Once `/odom_combined` shows that the car is within `qr_scan_start_dist_to_task_station`, `/perception_mode` changes to `qr_scan` while tracking continues.
+
+When `/qrcode_detected/info_result` parses as `ClockWise`, `AntiClockWise`, `clockwise`, `anticlockwise`, or a valid numeric value, `task_manager` immediately selects the route, switches to `TRACK_TO_CHANNEL_ENTRY`, and publishes `channel_entry` as `/current_goal`.
+
+If the car reaches the task station but QR has not decoded yet, it remains in QR scan mode and does not automatically enter the channel.
 
 ## Target Tracking
 
@@ -20,48 +32,54 @@ The coordinates are intentionally coarse defaults. They should be measured and t
 
 It does not depend on AMCL or Nav2. If odometry or the current goal is missing, it publishes zero velocity and waits.
 
-## Task State Machine
-
-`task_manager` loads `semantic_map.yaml`, publishes mission state, publishes the active `/current_goal`, and enables or disables tracking. It also reads QR results and chooses the clockwise or anticlockwise channel route.
-
-Main states:
-
-- `TRACK_TO_TASK_STATION`
-- `WAIT_QR_RESULT`
-- `TRACK_TO_CHANNEL_ENTRY`
-- `CHANNEL_NAV`
-- `RETURN_PREPARE`
-- `BIRDVIEW_RETURN`
-- `FINISH`
-
 ## Obstacle Avoidance
 
-`yolo_avoid_controller` reads YOLO detections and `/odom_combined`, checks the semantic map boundary, chooses left or right avoidance, and publishes a short local avoidance command.
+`yolo_avoid_controller` only uses detections whose label is in `obstacle_labels`, which defaults to `["obstacle"]`.
 
-It does not perform a hard-coded return-to-heading action. When avoidance ends, it publishes `/avoid_finished` once and sets `/avoid_active=false`. Then `cmd_vel_mux` returns control to `target_tracker`, which naturally reconnects to the original goal using the current odometry pose.
+It chooses left or right avoidance from the obstacle image position and the semantic map boundary. Obstacle left means prefer right avoidance; obstacle right means prefer left avoidance; centered obstacles use boundary safety to choose a side.
 
-This matters when obstacles are close together or near the field boundary. A forced correction after one obstacle can point the car into the next obstacle or outside the map.
+If both side candidates are outside the boundary, the node performs a protective stop and warns. That branch is for abnormal localization or boundary configuration problems, not a regular competition strategy.
 
-## Bird View Return Interface
+Avoidance is intentionally short. When it ends, the node publishes `/avoid_finished` and does not hard-code a return-to-heading action. Re-centering is handled by `target_tracker` using the current `/odom_combined` pose and the original goal.
 
-`vision_birdview` currently provides the interface for local visual return. It publishes transformed bird-view images and placeholder return topics:
+The optional `/avoid/obstacle_debug_point` is an approximate visualization point estimated from the current pose, yaw, and bounding-box offset. It is not a precise mapped obstacle position and is not used for avoidance decisions.
 
-- `/bird_view/p_point_valid`
-- `/bird_view/p_point_pose`
-- `/bird_view/line_error`
-- `/bird_view/heading_error`
+## Visualization Layer
 
-Reliable P-point recognition is not implemented yet. By default, `p_point_valid=false`. Dummy output is only enabled when `enable_dummy_output=true`.
+`semantic_map_visualizer` is for CoStudio/RViz debugging only. It displays:
 
-## Topic Table
+- Boundary rectangle
+- Semantic points
+- Clockwise and anticlockwise route lines
+- Current goal marker
+- Vehicle path accumulated from `/odom_combined`
+- Current mission and perception mode text
+- Optional approximate obstacle debug marker
+- Current vehicle pose marker
+
+It publishes:
+
+- `/semantic_map/markers`
+- `/current_goal_marker`
+- `/vehicle_path`
+- `/mission_text_marker`
+- `/avoid_obstacle_marker`
+- `/semantic_map/current_pose_marker`
+
+The visualization frame is parameterized. If no `map -> odom_combined` transform is available, launch with `visualization_frame:=odom_combined`.
+
+## Formal Topics
 
 Inputs:
 
 - `/odom_combined`
-- `/qrcode_detected/info_result`
-- `/sign_switch`
+- `/current_goal`
+- `/track_enable`
+- `/goal_reached`
 - `/avoid_active`
+- `/avoid_cmd_vel`
 - `/avoid_finished`
+- `/qrcode_detected/info_result`
 - `/bird_view/p_point_valid`
 
 Outputs:
@@ -73,6 +91,23 @@ Outputs:
 - `/cmd_vel`
 - `/mission_state`
 - `/perception_mode`
+
+Bird View reserved interfaces:
+
+- `/bird_view/p_point_valid`
+- `/bird_view/p_point_pose`
+- `/bird_view/line_error`
+- `/bird_view/heading_error`
+
+## Reserved Work
+
+These pieces are interfaces or placeholders, not completed algorithms:
+
+- Bird View P-point recognition is not complete.
+- `birdview_local_nav` local return control is not complete.
+- Channel-area visual correction is not complete.
+- The YOLO-to-QR ROI decoding path needs confirmation and completion.
+- Semantic map coordinates and boundaries need on-car calibration.
 
 ## Startup
 
@@ -88,16 +123,16 @@ Source:
 source install/setup.bash
 ```
 
-Camera bridge:
-
-```bash
-ros2 launch vision_camera camera_bridge.launch.py device:=/dev/video0
-```
-
-Competition navigation:
+Competition navigation and visualization:
 
 ```bash
 ros2 launch origincar_nav competition_nav.launch.py
+```
+
+Use odometry frame for visualization if there is no map transform:
+
+```bash
+ros2 launch origincar_nav competition_nav.launch.py visualization_frame:=odom_combined
 ```
 
 YOLO avoidance and velocity mux:
@@ -118,11 +153,20 @@ QR detection:
 ros2 launch qr_code_detection qr_code_detection.launch.py
 ```
 
-## Debug Order
+## Debug Checks
 
-1. Confirm `/odom_combined` is publishing.
-2. Start `competition_nav.launch.py`.
-3. Echo `/mission_state`, `/current_goal`, and `/track_cmd_vel`.
-4. Publish a fake QR result and check the state transition.
-5. Start `origincar_avoid` and manually publish `/avoid_active` plus `/avoid_cmd_vel` to verify `cmd_vel_mux`.
-6. Start camera, YOLO, QR, and Bird View after the core navigation loop is stable.
+```bash
+ros2 topic list | grep -E "semantic_map|current_goal|vehicle_path|mission_state|perception_mode|track_cmd_vel|avoid|cmd_vel"
+ros2 topic echo /mission_state
+ros2 topic echo /perception_mode
+ros2 topic echo /current_goal
+ros2 topic echo /vehicle_path
+```
+
+RViz or CoStudio should display:
+
+- `/semantic_map/markers`
+- `/current_goal_marker`
+- `/vehicle_path`
+- `/mission_text_marker`
+- `/avoid_obstacle_marker`

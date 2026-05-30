@@ -9,18 +9,12 @@ import yaml
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import Bool, Int32, String
-
-try:
-    from origincar_msg.msg import Sign
-except ImportError:
-    Sign = None
+from std_msgs.msg import Bool, String
 
 
 class MissionState(Enum):
     INIT = 'INIT'
     TRACK_TO_TASK_STATION = 'TRACK_TO_TASK_STATION'
-    WAIT_QR_RESULT = 'WAIT_QR_RESULT'
     TRACK_TO_CHANNEL_ENTRY = 'TRACK_TO_CHANNEL_ENTRY'
     CHANNEL_NAV = 'CHANNEL_NAV'
     RETURN_PREPARE = 'RETURN_PREPARE'
@@ -41,13 +35,18 @@ class TaskManager(Node):
         self.declare_parameter('semantic_map_file', '')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_topic', '/odom_combined')
-        self.declare_parameter('sign_topic_type', 'origincar_msg/Sign')
         self.declare_parameter('publish_rate_hz', 2.0)
+        self.declare_parameter('qr_scan_start_dist_to_task_station', 1.0)
 
         self.semantic_map = self.load_semantic_map()
         self.map_frame = self.semantic_map.get('map_frame', self.get_parameter('map_frame').value)
         self.points = self.semantic_map.get('points', {})
         self.routes = self.semantic_map.get('routes', {})
+        task_thresholds = self.semantic_map.get('task_manager', {})
+        self.qr_scan_start_dist_to_task_station = float(
+            self.get_parameter('qr_scan_start_dist_to_task_station').value
+            or task_thresholds.get('qr_scan_start_dist_to_task_station', 1.0)
+        )
 
         self.state = MissionState.INIT
         self.route_direction = None
@@ -58,6 +57,9 @@ class TaskManager(Node):
         self.avoid_active = False
         self.birdview_valid = False
         self.last_goal_reached = False
+        self.current_x = None
+        self.current_y = None
+        self.qr_scan_active = False
 
         self.goal_pub = self.create_publisher(PoseStamped, '/current_goal', 10)
         self.track_enable_pub = self.create_publisher(Bool, '/track_enable', 10)
@@ -67,16 +69,9 @@ class TaskManager(Node):
         self.create_subscription(Bool, '/goal_reached', self.goal_reached_callback, 10)
         self.create_subscription(String, '/qrcode_detected/info_result', self.qr_callback, 10)
         self.create_subscription(Bool, '/avoid_active', self.avoid_active_callback, 10)
-        self.create_subscription(Bool, '/yolo_avoid_active', self.avoid_active_callback, 10)
         self.create_subscription(Bool, '/avoid_finished', self.avoid_finished_callback, 10)
-        self.create_subscription(Bool, '/yolo_avoid_finished', self.avoid_finished_callback, 10)
         self.create_subscription(Bool, '/bird_view/p_point_valid', self.birdview_valid_callback, 10)
         self.create_subscription(Odometry, self.get_parameter('odom_topic').value, self.odom_callback, 10)
-
-        if self.get_parameter('sign_topic_type').value == 'std_msgs/Int32' or Sign is None:
-            self.create_subscription(Int32, '/sign_switch', self.sign_int_callback, 10)
-        else:
-            self.create_subscription(Sign, '/sign_switch', self.sign_msg_callback, 10)
 
         rate = float(self.get_parameter('publish_rate_hz').value)
         self.timer = self.create_timer(1.0 / max(rate, 0.5), self.tick)
@@ -115,10 +110,8 @@ class TaskManager(Node):
         if self.state == MissionState.TRACK_TO_TASK_STATION:
             self.publish_named_goal('task_station')
             self.publish_track_enable(True)
-            self.publish_status('target_track')
-        elif self.state == MissionState.WAIT_QR_RESULT:
-            self.publish_track_enable(False)
-            self.publish_status('qr')
+            self.qr_scan_active = self.should_scan_qr()
+            self.publish_status('qr_scan' if self.qr_scan_active else 'target_track')
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
             self.publish_named_goal('channel_entry')
             self.publish_track_enable(True)
@@ -149,6 +142,8 @@ class TaskManager(Node):
         self.state = state
         self.last_published_goal_name = None
         self.last_goal_reached = False
+        if state != MissionState.TRACK_TO_TASK_STATION:
+            self.qr_scan_active = False
         self.get_logger().info(f'Mission state -> {state.value}')
 
     def publish_status(self, perception_mode):
@@ -196,7 +191,8 @@ class TaskManager(Node):
 
         self.last_goal_reached = True
         if self.state == MissionState.TRACK_TO_TASK_STATION:
-            self.set_state(MissionState.WAIT_QR_RESULT)
+            self.qr_scan_active = True
+            self.last_goal_reached = False
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
             self.prepare_channel_route()
             self.set_state(MissionState.CHANNEL_NAV)
@@ -214,21 +210,10 @@ class TaskManager(Node):
         if direction is None:
             return
         self.route_direction = direction
-        if self.state == MissionState.WAIT_QR_RESULT:
+        if self.state == MissionState.TRACK_TO_TASK_STATION:
             self.prepare_channel_route()
             self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY)
-
-    def sign_int_callback(self, msg):
-        self.apply_sign_value(int(msg.data))
-
-    def sign_msg_callback(self, msg):
-        self.apply_sign_value(int(msg.sign_data))
-
-    def apply_sign_value(self, value):
-        self.route_direction = 'clockwise' if value % 2 else 'anticlockwise'
-        if self.state == MissionState.WAIT_QR_RESULT:
-            self.prepare_channel_route()
-            self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY)
+            self.publish_named_goal('channel_entry')
 
     def parse_direction(self, text):
         normalized = str(text).strip().lower()
@@ -266,7 +251,18 @@ class TaskManager(Node):
         self.birdview_valid = bool(msg.data)
 
     def odom_callback(self, msg):
-        del msg
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+
+    def should_scan_qr(self):
+        if self.current_x is None or self.current_y is None:
+            return False
+        task_station = self.points.get('task_station')
+        if not task_station:
+            return False
+        pose = task_station.get('pose', [0.0, 0.0, 0.0])
+        distance = math.hypot(float(pose[0]) - self.current_x, float(pose[1]) - self.current_y)
+        return distance <= self.qr_scan_start_dist_to_task_station
 
 
 def main(args=None):

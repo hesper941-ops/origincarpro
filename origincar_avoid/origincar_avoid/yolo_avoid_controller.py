@@ -6,7 +6,7 @@ import os
 import rclpy
 import yaml
 from ai_msgs.msg import PerceptionTargets
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PointStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from std_msgs.msg import Bool
@@ -34,6 +34,8 @@ class YoloAvoidController(Node):
         self.declare_parameter('lateral_check_dist', 0.35)
         self.declare_parameter('avoid_linear_speed', 0.08)
         self.declare_parameter('avoid_angular_speed', 0.65)
+        self.declare_parameter('obstacle_debug_forward_dist', 0.6)
+        self.declare_parameter('obstacle_debug_lateral_scale', 0.5)
         self.declare_parameter('publish_rate_hz', 20.0)
 
         self.boundary = self.load_boundary()
@@ -49,6 +51,8 @@ class YoloAvoidController(Node):
         self.lateral_check_dist = float(self.get_parameter('lateral_check_dist').value)
         self.avoid_linear_speed = float(self.get_parameter('avoid_linear_speed').value)
         self.avoid_angular_speed = float(self.get_parameter('avoid_angular_speed').value)
+        self.obstacle_debug_forward_dist = float(self.get_parameter('obstacle_debug_forward_dist').value)
+        self.obstacle_debug_lateral_scale = float(self.get_parameter('obstacle_debug_lateral_scale').value)
 
         self.current_x = None
         self.current_y = None
@@ -72,11 +76,9 @@ class YoloAvoidController(Node):
         )
 
         self.cmd_pub = self.create_publisher(Twist, '/avoid_cmd_vel', 10)
-        self.legacy_cmd_pub = self.create_publisher(Twist, '/yolo_cmd_vel', 10)
         self.active_pub = self.create_publisher(Bool, '/avoid_active', 10)
-        self.legacy_active_pub = self.create_publisher(Bool, '/yolo_avoid_active', 10)
         self.finished_pub = self.create_publisher(Bool, '/avoid_finished', 10)
-        self.legacy_finished_pub = self.create_publisher(Bool, '/yolo_avoid_finished', 10)
+        self.debug_point_pub = self.create_publisher(PointStamped, '/avoid/obstacle_debug_point', 10)
 
         rate = float(self.get_parameter('publish_rate_hz').value)
         self.timer = self.create_timer(1.0 / max(rate, 1.0), self.tick)
@@ -111,6 +113,7 @@ class YoloAvoidController(Node):
             return
 
         direction = self.choose_direction(obstacle['center_x'])
+        self.publish_obstacle_debug_point(obstacle['center_x'])
         self.avoid_active = True
         self.avoid_direction = direction
         self.avoid_end_time = now + self.avoid_duration_sec
@@ -137,7 +140,10 @@ class YoloAvoidController(Node):
         right_ok = self.side_inside_boundary(left=False)
 
         if not left_ok and not right_ok:
-            self.get_logger().warn('Both avoidance sides are outside boundary; stopping')
+            self.get_logger().warn(
+                'Protective stop: both avoidance candidates are outside boundary. '
+                'This is an abnormal protection branch, not the regular competition strategy.'
+            )
             return 0
         if not left_ok:
             return -1
@@ -181,17 +187,39 @@ class YoloAvoidController(Node):
 
     def publish_cmd(self, cmd):
         self.cmd_pub.publish(cmd)
-        self.legacy_cmd_pub.publish(cmd)
 
     def publish_active(self, active):
         msg = Bool(data=bool(active))
         self.active_pub.publish(msg)
-        self.legacy_active_pub.publish(msg)
 
     def publish_finished(self):
         msg = Bool(data=True)
         self.finished_pub.publish(msg)
-        self.legacy_finished_pub.publish(msg)
+
+    def publish_obstacle_debug_point(self, center_x):
+        if self.current_x is None or self.current_y is None:
+            return
+
+        lateral_offset = (
+            (center_x - self.image_width * 0.5)
+            / max(self.image_width, 1.0)
+            * self.obstacle_debug_lateral_scale
+        )
+        point = PointStamped()
+        point.header.stamp = self.get_clock().now().to_msg()
+        point.header.frame_id = 'odom_combined'
+        point.point.x = (
+            self.current_x
+            + math.cos(self.current_yaw) * self.obstacle_debug_forward_dist
+            - math.sin(self.current_yaw) * lateral_offset
+        )
+        point.point.y = (
+            self.current_y
+            + math.sin(self.current_yaw) * self.obstacle_debug_forward_dist
+            + math.cos(self.current_yaw) * lateral_offset
+        )
+        point.point.z = 0.0
+        self.debug_point_pub.publish(point)
 
     def now_sec(self):
         return self.get_clock().now().nanoseconds / 1e9
