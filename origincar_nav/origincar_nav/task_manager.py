@@ -37,6 +37,7 @@ class TaskManager(Node):
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('publish_rate_hz', 2.0)
         self.declare_parameter('qr_scan_start_dist_to_task_station', 1.0)
+        self.declare_parameter('debug_allow_numeric_qr_route', False)
 
         self.semantic_map = self.load_semantic_map()
         self.map_frame = self.semantic_map.get('map_frame', self.get_parameter('map_frame').value)
@@ -46,6 +47,9 @@ class TaskManager(Node):
         self.qr_scan_start_dist_to_task_station = float(
             self.get_parameter('qr_scan_start_dist_to_task_station').value
             or task_thresholds.get('qr_scan_start_dist_to_task_station', 1.0)
+        )
+        self.debug_allow_numeric_qr_route = bool(
+            self.get_parameter('debug_allow_numeric_qr_route').value
         )
 
         self.state = MissionState.INIT
@@ -206,6 +210,8 @@ class TaskManager(Node):
             self.set_state(MissionState.FINISH)
 
     def qr_callback(self, msg):
+        if self.state != MissionState.TRACK_TO_TASK_STATION or not self.qr_scan_active:
+            return
         direction = self.parse_direction(msg.data)
         if direction is None:
             return
@@ -221,12 +227,19 @@ class TaskManager(Node):
             return 'clockwise'
         if normalized in ('anticlockwise', 'anti-clockwise', 'anti clockwise', 'counterclockwise'):
             return 'anticlockwise'
-        try:
-            value = int(normalized)
-            return 'clockwise' if value % 2 else 'anticlockwise'
-        except ValueError:
-            self.get_logger().warn(f'Unknown QR route content: {text}')
-            return None
+        if normalized == '顺时针':
+            return 'clockwise'
+        if normalized == '逆时针':
+            return 'anticlockwise'
+        if self.debug_allow_numeric_qr_route:
+            try:
+                value = int(normalized)
+                self.get_logger().warn('Using debug numeric QR route fallback; this is not the formal rule')
+                return 'clockwise' if value % 2 else 'anticlockwise'
+            except ValueError:
+                pass
+        self.get_logger().warn(f'Unknown QR route content: {text}')
+        return None
 
     def prepare_channel_route(self):
         direction = self.route_direction or 'clockwise'

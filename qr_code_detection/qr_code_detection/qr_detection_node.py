@@ -8,6 +8,7 @@ import cv2
 import cv_bridge
 import rclpy
 from ament_index_python.packages import get_package_share_directory
+from ai_msgs.msg import PerceptionTargets
 from origincar_msg.msg import Sign
 from pyzbar.pyzbar import decode
 from rclpy.node import Node
@@ -20,13 +21,28 @@ class QrCodeDetection(Node):
         super().__init__('qrcode_detect')
         self.bridge = cv_bridge.CvBridge()
         self.last_decoded_data = None
+        self.latest_rois = []
+        self.declare_parameter('image_topic', '/image_out')
+        self.declare_parameter('detection_topic', '/hobot_dnn_detection')
+        self.declare_parameter('qr_labels', ['qr_board'])
+        self.declare_parameter('debug_allow_numeric_sign', False)
+        self.qr_labels = {
+            str(label).strip().lower()
+            for label in self.get_parameter('qr_labels').value
+        }
+        self.debug_allow_numeric_sign = bool(self.get_parameter('debug_allow_numeric_sign').value)
 
-        # Subscribe to /image_out from vision_camera/hbm_image_bridge.
         self.image_sub = self.create_subscription(
             Image,
-            '/image_out',
+            self.get_parameter('image_topic').value,
             self.image_callback,
             1,
+        )
+        self.detection_sub = self.create_subscription(
+            PerceptionTargets,
+            self.get_parameter('detection_topic').value,
+            self.detection_callback,
+            10,
         )
 
         self.pub_car_signal = self.create_publisher(Sign, '/sign_switch', 1)
@@ -54,12 +70,33 @@ class QrCodeDetection(Node):
             return 3
         if lowered in ('anticlockwise', 'anti-clockwise', 'anti clockwise', 'counterclockwise'):
             return 4
-        try:
-            value = int(normalized)
-        except ValueError:
-            self.get_logger().warn(f'Unknown QR content, publishing text only: {qr_text}')
-            return None
-        return 4 if value % 2 == 0 else 3
+        if self.debug_allow_numeric_sign:
+            try:
+                value = int(normalized)
+            except ValueError:
+                pass
+            else:
+                self.get_logger().warn('Using debug numeric QR sign fallback; this is not the formal rule')
+                return 4 if value % 2 == 0 else 3
+        self.get_logger().warn(f'Unknown QR content, publishing text only: {qr_text}')
+        return None
+
+    def detection_callback(self, msg):
+        rois = []
+        for target in msg.targets:
+            if str(target.type).strip().lower() not in self.qr_labels:
+                continue
+            for roi in target.rois:
+                rect = roi.rect
+                if rect.width <= 0 or rect.height <= 0:
+                    continue
+                rois.append((
+                    int(rect.x_offset),
+                    int(rect.y_offset),
+                    int(rect.width),
+                    int(rect.height),
+                ))
+        self.latest_rois = rois
 
     def image_callback(self, msg):
         try:
@@ -68,33 +105,46 @@ class QrCodeDetection(Node):
             self.get_logger().warn(f'Failed to convert image for QR detection: {exc}')
             return
 
-        qr_codes = decode(cv_image)
-        if not qr_codes:
+        if not self.latest_rois:
             return
 
-        for qr in qr_codes:
-            try:
-                qr_data = qr.data.decode('utf-8')
-            except UnicodeDecodeError:
-                self.get_logger().warn('Failed to decode QR content as UTF-8')
-                continue
-            except Exception as exc:
-                self.get_logger().warn(f'QR decode error: {exc}')
-                continue
-
-            latest = self.handle_qr_data(qr_data)
-            if latest is None:
+        height, width = cv_image.shape[:2]
+        for x, y, w, h in self.latest_rois:
+            x1 = max(0, x)
+            y1 = max(0, y)
+            x2 = min(width, x + w)
+            y2 = min(height, y + h)
+            if x2 <= x1 or y2 <= y1:
                 continue
 
-            self.pub_qrcode_info.publish(String(data=latest))
+            roi_image = cv_image[y1:y2, x1:x2]
+            qr_codes = decode(roi_image)
+            if not qr_codes:
+                continue
 
-            sign_data = self.parse_sign_data(latest)
-            if sign_data is not None:
-                sign = Sign()
-                sign.sign_data = sign_data
-                self.pub_car_signal.publish(sign)
+            for qr in qr_codes:
+                try:
+                    qr_data = qr.data.decode('utf-8')
+                except UnicodeDecodeError:
+                    self.get_logger().warn('Failed to decode QR content as UTF-8')
+                    continue
+                except Exception as exc:
+                    self.get_logger().warn(f'QR decode error: {exc}')
+                    continue
 
-            self.qr_start_pub.publish(Int32(data=1))
+                latest = self.handle_qr_data(qr_data)
+                if latest is None:
+                    continue
+
+                self.pub_qrcode_info.publish(String(data=latest))
+
+                sign_data = self.parse_sign_data(latest)
+                if sign_data is not None:
+                    sign = Sign()
+                    sign.sign_data = sign_data
+                    self.pub_car_signal.publish(sign)
+
+                self.qr_start_pub.publish(Int32(data=1))
 
 
 def main(args=None):

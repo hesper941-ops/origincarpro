@@ -22,9 +22,13 @@ The car does not stop at the task station and wait for QR decoding.
 
 During `TRACK_TO_TASK_STATION`, `task_manager` keeps `/track_enable=true` and keeps the active goal at `task_station`. Once `/odom_combined` shows that the car is within `qr_scan_start_dist_to_task_station`, `/perception_mode` changes to `qr_scan` while tracking continues.
 
-When `/qrcode_detected/info_result` parses as `ClockWise`, `AntiClockWise`, `clockwise`, `anticlockwise`, or a valid numeric value, `task_manager` immediately selects the route, switches to `TRACK_TO_CHANNEL_ENTRY`, and publishes `channel_entry` as `/current_goal`.
+Before `qr_scan` is active, `task_manager` ignores `/qrcode_detected/info_result`. When QR scan is active and the result parses as `ClockWise`, `AntiClockWise`, `clockwise`, `anticlockwise`, `顺时针`, or `逆时针`, `task_manager` immediately selects the route, switches to `TRACK_TO_CHANNEL_ENTRY`, and publishes `channel_entry` as `/current_goal`.
 
 If the car reaches the task station but QR has not decoded yet, it remains in QR scan mode and does not automatically enter the channel.
+
+QR decoding is constrained by the YOLO QR-board ROI. `qr_code_detection` uses `qr_labels`, defaulting to `["qr_board"]`, and only runs QR decoding inside those ROIs. `/qrcode_detected/info_result` contains the decoded QR text, not the YOLO label.
+
+Numeric odd/even direction parsing is a debug fallback only and is disabled by default. The formal route rule is direction text confirming clockwise or anticlockwise.
 
 ## Target Tracking
 
@@ -106,7 +110,7 @@ These pieces are interfaces or placeholders, not completed algorithms:
 - Bird View P-point recognition is not complete.
 - `birdview_local_nav` local return control is not complete.
 - Channel-area visual correction is not complete.
-- The YOLO-to-QR ROI decoding path needs confirmation and completion.
+- The YOLO QR-board label and ROI quality need field confirmation.
 - Semantic map coordinates and boundaries need on-car calibration.
 
 ## Startup
