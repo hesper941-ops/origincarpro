@@ -4,8 +4,11 @@ import cv2
 import cv_bridge
 import numpy as np
 import rclpy
+import yaml
+from geometry_msgs.msg import Pose2D
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import Bool, Float32
 
 
 def get_bool_param(value):
@@ -19,52 +22,24 @@ class PerspectiveNode(Node):
         super().__init__('perspective_node')
 
         self.bridge = cv_bridge.CvBridge()
-
-        # 话题参数：默认走统一图像入口 /image_out
         self.input_topic = self.declare_parameter('input_topic', '/image_out').value
         self.output_topic = self.declare_parameter('output_topic', '/bird_view/image').value
         self.compressed_output_topic = self.declare_parameter(
             'compressed_output_topic',
             '/bird_view/image/compressed'
         ).value
-
+        self.declare_parameter('perspective_config', '')
         self.publish_compressed = get_bool_param(
             self.declare_parameter('publish_compressed', True).value
         )
-
-        # 默认不要 imshow，X5 / SSH / launch 环境下容易没有显示窗口
         self.show_window = get_bool_param(
             self.declare_parameter('show_window', False).value
         )
-
-        self.image_width = int(self.declare_parameter('image_width', 640).value)
-        self.image_height = int(self.declare_parameter('image_height', 480).value)
-
-        self.declare_parameter(
-            'src_points',
-            [
-                257.0, 391.0,
-                315.0, 395.0,
-                307.0, 277.0,
-                278.0, 275.0
-            ]
+        self.enable_dummy_output = get_bool_param(
+            self.declare_parameter('enable_dummy_output', False).value
         )
 
-        self.declare_parameter(
-            'dst_points',
-            [
-                0.0, 480.0,
-                640.0, 480.0,
-                640.0, 0.0,
-                0.0, 0.0
-            ]
-        )
-
-        src_points = self.get_parameter('src_points').value
-        dst_points = self.get_parameter('dst_points').value
-
-        self.src = np.array(src_points, dtype=np.float32).reshape((4, 2))
-        self.dst = np.array(dst_points, dtype=np.float32).reshape((4, 2))
+        self.src, self.dst, self.output_size = self.load_perspective_config()
         self.matrix = cv2.getPerspectiveTransform(self.src, self.dst)
 
         self.image_sub = self.create_subscription(
@@ -73,37 +48,69 @@ class PerspectiveNode(Node):
             self.image_callback,
             10
         )
-
-        self.image_pub = self.create_publisher(
-            Image,
-            self.output_topic,
-            10
-        )
-
+        self.image_pub = self.create_publisher(Image, self.output_topic, 10)
         self.compressed_pub = self.create_publisher(
             CompressedImage,
             self.compressed_output_topic,
             10
         )
+        self.p_valid_pub = self.create_publisher(Bool, '/bird_view/p_point_valid', 10)
+        self.p_pose_pub = self.create_publisher(Pose2D, '/bird_view/p_point_pose', 10)
+        self.line_error_pub = self.create_publisher(Float32, '/bird_view/line_error', 10)
+        self.heading_error_pub = self.create_publisher(Float32, '/bird_view/heading_error', 10)
 
-        self.get_logger().info('Perspective node started')
-        self.get_logger().info(f'input_topic: {self.input_topic}')
-        self.get_logger().info(f'output_topic: {self.output_topic}')
-        self.get_logger().info(f'compressed_output_topic: {self.compressed_output_topic}')
-        self.get_logger().info(f'publish_compressed: {self.publish_compressed}')
-        self.get_logger().info(f'show_window: {self.show_window}')
+        self.interface_timer = self.create_timer(0.5, self.publish_return_interface)
+
+    def load_perspective_config(self):
+        default_src = np.float32([
+            [264, 427],
+            [335, 422],
+            [315, 325],
+            [271, 329],
+        ])
+        default_size = [400, 400]
+        default_dst = np.float32([
+            [0, default_size[1]],
+            [default_size[0], default_size[1]],
+            [default_size[0], 0],
+            [0, 0],
+        ])
+        path = self.get_parameter('perspective_config').value
+        if not path:
+            return default_src, default_dst, default_size
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            src_points = data.get('src_points', default_src.tolist())
+            output_size = data.get('output_size', default_size)
+            dst_points = data.get('dst_points')
+            if len(src_points) != 4:
+                raise ValueError('src_points must contain four points')
+            if dst_points is None:
+                dst_points = [
+                    [0, output_size[1]],
+                    [output_size[0], output_size[1]],
+                    [output_size[0], 0],
+                    [0, 0],
+                ]
+            if len(dst_points) != 4:
+                raise ValueError('dst_points must contain four points')
+            return np.float32(src_points), np.float32(dst_points), output_size
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to load perspective config {path}: {exc}')
+            return default_src, default_dst, default_size
 
     def image_callback(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f'CV Bridge Error: {e}')
+        except Exception as exc:
+            self.get_logger().error(f'CV Bridge Error: {exc}')
             return
 
-        out_w = self.image_width if self.image_width > 0 else frame.shape[1]
-        out_h = self.image_height if self.image_height > 0 else frame.shape[0]
-
-        bird = cv2.warpPerspective(frame, self.matrix, (out_w, out_h))
+        out_width = int(self.output_size[0]) if self.output_size else frame.shape[1]
+        out_height = int(self.output_size[1]) if self.output_size else frame.shape[0]
+        bird = cv2.warpPerspective(frame, self.matrix, (out_width, out_height))
 
         if self.show_window:
             cv2.imshow('bird_view', bird)
@@ -114,18 +121,20 @@ class PerspectiveNode(Node):
         self.image_pub.publish(bird_msg)
 
         if self.publish_compressed:
-            compressed_msg = self.bridge.cv2_to_compressed_imgmsg(
-                bird,
-                dst_format='jpg'
-            )
+            compressed_msg = self.bridge.cv2_to_compressed_imgmsg(bird, dst_format='jpg')
             compressed_msg.header = msg.header
             self.compressed_pub.publish(compressed_msg)
+
+    def publish_return_interface(self):
+        self.p_valid_pub.publish(Bool(data=self.enable_dummy_output))
+        self.p_pose_pub.publish(Pose2D())
+        self.line_error_pub.publish(Float32(data=0.0))
+        self.heading_error_pub.publish(Float32(data=0.0))
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = PerspectiveNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

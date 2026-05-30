@@ -4,7 +4,7 @@ import os
 from setuptools import find_packages, setup
 
 
-package_name = 'origincar_nav'
+package_name = 'origincar_avoid'
 
 
 setup(
@@ -14,21 +14,19 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        (os.path.join('share', package_name, 'maps'), glob('maps/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='root',
     maintainer_email='root@todo.todo',
-    description='Competition navigation state machine and odometry target tracker.',
+    description='Short-horizon obstacle avoidance and velocity mux for OriginCar.',
     license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'target_tracker = origincar_nav.target_tracker:main',
-            'task_manager = origincar_nav.task_manager:main',
+            'cmd_vel_mux = origincar_avoid.cmd_vel_mux:main',
+            'yolo_avoid_controller = origincar_avoid.yolo_avoid_controller:main',
         ],
     },
 )

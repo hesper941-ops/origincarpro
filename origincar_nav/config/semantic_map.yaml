@@ -1,0 +1,46 @@
+map_frame: map
+odom_frame: odom_combined
+base_frame: base_footprint
+
+boundary:
+  x_min: 0.0
+  x_max: 4.0
+  y_min: 0.0
+  y_max: 3.0
+
+points:
+  p_start:
+    pose: [0.0, 0.0, 0.0]
+    description: "P point / start point"
+
+  task_station:
+    pose: [1.2, 0.0, 0.0]
+    description: "QR task publishing station"
+
+  channel_entry:
+    pose: [2.4, 0.5, 0.0]
+    description: "Entrance of the channel area"
+
+  channel_p1:
+    pose: [2.4, 0.5, 0.0]
+
+  channel_p2:
+    pose: [3.2, 0.5, 1.57]
+
+  channel_p3:
+    pose: [3.2, 1.5, 3.14]
+
+  channel_p4:
+    pose: [2.4, 1.5, -1.57]
+
+routes:
+  clockwise:
+    channel_order: [channel_p1, channel_p2, channel_p3, channel_p4]
+
+  anticlockwise:
+    channel_order: [channel_p1, channel_p4, channel_p3, channel_p2]
+
+thresholds:
+  goal_reached_dist: 0.15
+  goal_reached_yaw: 0.35
+  channel_goal_reached_dist: 0.12
