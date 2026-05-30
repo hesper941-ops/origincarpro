@@ -54,6 +54,7 @@ class TaskManager(Node):
         self.channel_order = []
         self.channel_index = 0
         self.current_goal_name = None
+        self.last_published_goal_name = None
         self.avoid_active = False
         self.birdview_valid = False
         self.last_goal_reached = False
@@ -109,7 +110,6 @@ class TaskManager(Node):
         if self.avoid_active:
             self.publish_track_enable(False)
             self.publish_status('target_track')
-            self.republish_current_goal()
             return
 
         if self.state == MissionState.TRACK_TO_TASK_STATION:
@@ -147,6 +147,7 @@ class TaskManager(Node):
         if self.state == state:
             return
         self.state = state
+        self.last_published_goal_name = None
         self.last_goal_reached = False
         self.get_logger().info(f'Mission state -> {state.value}')
 
@@ -163,12 +164,18 @@ class TaskManager(Node):
             self.publish_track_enable(False)
             return
 
+        if name == self.last_published_goal_name:
+            self.current_goal_name = name
+            return
+
         self.current_goal_name = name
+        self.last_published_goal_name = name
         self.goal_pub.publish(self.pose_from_point(name))
 
     def republish_current_goal(self):
         if self.current_goal_name:
             self.goal_pub.publish(self.pose_from_point(self.current_goal_name))
+            self.last_published_goal_name = self.current_goal_name
 
     def pose_from_point(self, name):
         pose = self.points[name].get('pose', [0.0, 0.0, 0.0])
@@ -251,6 +258,7 @@ class TaskManager(Node):
         if msg.data:
             self.avoid_active = False
             self.last_goal_reached = False
+            self.last_published_goal_name = None
             self.republish_current_goal()
             self.publish_track_enable(True)
 

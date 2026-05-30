@@ -25,6 +25,7 @@ class YoloAvoidController(Node):
         self.declare_parameter('detection_topic', '/hobot_dnn_detection')
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('semantic_map_file', '')
+        self.declare_parameter('obstacle_labels', ['obstacle'])
         self.declare_parameter('image_width', 640.0)
         self.declare_parameter('trigger_area_ratio', 0.08)
         self.declare_parameter('center_deadband_ratio', 0.12)
@@ -36,6 +37,10 @@ class YoloAvoidController(Node):
         self.declare_parameter('publish_rate_hz', 20.0)
 
         self.boundary = self.load_boundary()
+        self.obstacle_labels = {
+            str(label).strip().lower()
+            for label in self.get_parameter('obstacle_labels').value
+        }
         self.image_width = float(self.get_parameter('image_width').value)
         self.trigger_area_ratio = float(self.get_parameter('trigger_area_ratio').value)
         self.center_deadband_ratio = float(self.get_parameter('center_deadband_ratio').value)
@@ -114,6 +119,8 @@ class YoloAvoidController(Node):
     def select_obstacle(self, msg):
         best = None
         for target in msg.targets:
+            if str(target.type).strip().lower() not in self.obstacle_labels:
+                continue
             for roi in target.rois:
                 rect = roi.rect
                 area_ratio = (float(rect.width) * float(rect.height)) / max(self.image_width * self.image_width, 1.0)

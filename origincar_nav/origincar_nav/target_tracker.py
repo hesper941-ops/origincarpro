@@ -62,6 +62,7 @@ class TargetTracker(Node):
         self.current_yaw = 0.0
         self.goal = None
         self.goal_yaw = 0.0
+        self.goal_signature = None
         self.enabled = False
         self.last_warn_time = 0.0
         self.goal_was_reached = False
@@ -112,9 +113,12 @@ class TargetTracker(Node):
         self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
 
     def goal_callback(self, msg):
+        signature = self.make_goal_signature(msg)
         self.goal = msg.pose
         self.goal_yaw = yaw_from_quaternion(msg.pose.orientation)
-        self.goal_was_reached = False
+        if signature != self.goal_signature:
+            self.goal_signature = signature
+            self.goal_was_reached = False
 
     def enable_callback(self, msg):
         self.enabled = bool(msg.data)
@@ -164,14 +168,24 @@ class TargetTracker(Node):
                 )
                 reached_msg.data = False
             else:
-                reached_msg.data = True
-                self.goal_was_reached = True
+                reached_msg.data = not self.goal_was_reached
+                if reached_msg.data:
+                    self.goal_was_reached = True
 
         self.cmd_pub.publish(cmd)
         self.goal_reached_pub.publish(reached_msg)
 
     def publish_zero(self):
         self.cmd_pub.publish(Twist())
+
+    def make_goal_signature(self, msg):
+        return (
+            msg.header.frame_id,
+            round(float(msg.pose.position.x), 3),
+            round(float(msg.pose.position.y), 3),
+            round(float(msg.pose.position.z), 3),
+            round(float(yaw_from_quaternion(msg.pose.orientation)), 3),
+        )
 
 
 def main(args=None):

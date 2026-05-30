@@ -1,3 +1,5 @@
+# Current coordinates are placeholders for software bringup only.
+# They must be calibrated on the real car and competition field before use.
 map_frame: map
 odom_frame: odom_combined
 base_frame: base_footprint
