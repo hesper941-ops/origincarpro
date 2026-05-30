@@ -26,7 +26,14 @@ Before `qr_scan` is active, `task_manager` ignores `/qrcode_detected/info_result
 
 If the car reaches the task station but QR has not decoded yet, it remains in QR scan mode and does not automatically enter the channel.
 
-QR decoding is constrained by the YOLO QR-board ROI. `qr_code_detection` uses `qr_labels`, defaulting to `["qr_board"]`, and only runs QR decoding inside those ROIs. `/qrcode_detected/info_result` contains the decoded QR text, not the YOLO label.
+QR decoding is constrained by the YOLO `QR_code` ROI. `qr_code_detection` uses `qr_labels`, defaulting to `["QR_code"]`, and only runs QR decoding inside those ROIs. `/qrcode_detected/info_result` contains the decoded QR text, not the `QR_code` YOLO label.
+
+The formal YOLO label set is:
+
+- `QR_code`: QR board ROI for QR decoding.
+- `line`: black line label reserved for later Bird View or return visual correction.
+- `end`: P-point or finish confirmation label reserved for later return-to-P judgment.
+- `roadblock`: physical blocking-object label, and the only label that triggers avoidance.
 
 Numeric odd/even direction parsing is a debug fallback only and is disabled by default. The formal route rule is direction text confirming clockwise or anticlockwise.
 
@@ -38,15 +45,15 @@ It does not depend on AMCL or Nav2. If odometry or the current goal is missing, 
 
 ## Obstacle Avoidance
 
-`yolo_avoid_controller` only uses detections whose label is in `obstacle_labels`, which defaults to `["obstacle"]`.
+`yolo_avoid_controller` only uses detections whose label is in `obstacle_labels`, which defaults to `["roadblock"]`.
 
-It chooses left or right avoidance from the obstacle image position and the semantic map boundary. Obstacle left means prefer right avoidance; obstacle right means prefer left avoidance; centered obstacles use boundary safety to choose a side.
+It chooses left or right avoidance from the `roadblock` image position and the semantic map boundary. A `roadblock` on the left means prefer right avoidance; a `roadblock` on the right means prefer left avoidance; centered `roadblock` detections use boundary safety to choose a side.
 
 If both side candidates are outside the boundary, the node performs a protective stop and warns. That branch is for abnormal localization or boundary configuration problems, not a regular competition strategy.
 
 Avoidance is intentionally short. When it ends, the node publishes `/avoid_finished` and does not hard-code a return-to-heading action. Re-centering is handled by `target_tracker` using the current `/odom_combined` pose and the original goal.
 
-The optional `/avoid/obstacle_debug_point` is an approximate visualization point estimated from the current pose, yaw, and bounding-box offset. It is not a precise mapped obstacle position and is not used for avoidance decisions.
+The optional `/avoid/obstacle_debug_point` is an approximate visualization point estimated from the current pose, yaw, and `roadblock` bounding-box offset. It is not a precise mapped obstacle position and is not used for avoidance decisions.
 
 ## Visualization Layer
 
@@ -58,7 +65,7 @@ The optional `/avoid/obstacle_debug_point` is an approximate visualization point
 - Current goal marker
 - Vehicle path accumulated from `/odom_combined`
 - Current mission and perception mode text
-- Optional approximate obstacle debug marker
+- Optional approximate `roadblock` debug marker
 - Current vehicle pose marker
 
 It publishes:
@@ -110,7 +117,8 @@ These pieces are interfaces or placeholders, not completed algorithms:
 - Bird View P-point recognition is not complete.
 - `birdview_local_nav` local return control is not complete.
 - Channel-area visual correction is not complete.
-- The YOLO QR-board label and ROI quality need field confirmation.
+- `line` and `end` are reserved labels only; Bird View return recognition and P-point confirmation are not completed closed-loop algorithms yet.
+- The `QR_code` ROI quality and QR decode chain need field confirmation.
 - Semantic map coordinates and boundaries need on-car calibration.
 
 ## Startup

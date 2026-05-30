@@ -24,7 +24,7 @@ class QrCodeDetection(Node):
         self.last_stale_warn_time = 0.0
         self.declare_parameter('image_topic', '/image_out')
         self.declare_parameter('detection_topic', '/hobot_dnn_detection')
-        self.declare_parameter('qr_labels', ['qr_board'])
+        self.declare_parameter('qr_labels', ['QR_code'])
         self.declare_parameter('max_detection_age_sec', 0.5)
         self.declare_parameter('publish_deprecated_outputs', False)
         self.declare_parameter('debug_allow_numeric_sign', False)

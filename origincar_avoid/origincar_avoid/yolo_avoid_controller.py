@@ -25,7 +25,7 @@ class YoloAvoidController(Node):
         self.declare_parameter('detection_topic', '/hobot_dnn_detection')
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('semantic_map_file', '')
-        self.declare_parameter('obstacle_labels', ['obstacle'])
+        self.declare_parameter('obstacle_labels', ['roadblock'])
         self.declare_parameter('image_width', 640.0)
         self.declare_parameter('trigger_area_ratio', 0.08)
         self.declare_parameter('center_deadband_ratio', 0.12)
