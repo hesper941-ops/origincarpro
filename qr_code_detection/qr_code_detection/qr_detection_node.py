@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import time
 
-import cv2
 import cv_bridge
 import rclpy
-from ament_index_python.packages import get_package_share_directory
 from ai_msgs.msg import PerceptionTargets
 from origincar_msg.msg import Sign
 from pyzbar.pyzbar import decode
@@ -22,14 +19,21 @@ class QrCodeDetection(Node):
         self.bridge = cv_bridge.CvBridge()
         self.last_decoded_data = None
         self.latest_rois = []
+        self.detection_stamp = None
+        self.detection_receive_time = None
+        self.last_stale_warn_time = 0.0
         self.declare_parameter('image_topic', '/image_out')
         self.declare_parameter('detection_topic', '/hobot_dnn_detection')
         self.declare_parameter('qr_labels', ['qr_board'])
+        self.declare_parameter('max_detection_age_sec', 0.5)
+        self.declare_parameter('publish_deprecated_outputs', False)
         self.declare_parameter('debug_allow_numeric_sign', False)
         self.qr_labels = {
             str(label).strip().lower()
             for label in self.get_parameter('qr_labels').value
         }
+        self.max_detection_age_sec = float(self.get_parameter('max_detection_age_sec').value)
+        self.publish_deprecated_outputs = bool(self.get_parameter('publish_deprecated_outputs').value)
         self.debug_allow_numeric_sign = bool(self.get_parameter('debug_allow_numeric_sign').value)
 
         self.image_sub = self.create_subscription(
@@ -48,14 +52,6 @@ class QrCodeDetection(Node):
         self.pub_car_signal = self.create_publisher(Sign, '/sign_switch', 1)
         self.pub_qrcode_info = self.create_publisher(String, '/qrcode_detected/info_result', 1)
         self.qr_start_pub = self.create_publisher(Int32, '/close_signal', 10)
-
-        model_path = os.path.join(get_package_share_directory('qr_code_detection'), 'model')
-        self.detect_obj = cv2.wechat_qrcode_WeChatQRCode(
-            os.path.join(model_path, 'detect.prototxt'),
-            os.path.join(model_path, 'detect.caffemodel'),
-            os.path.join(model_path, 'sr.prototxt'),
-            os.path.join(model_path, 'sr.caffemodel'),
-        )
 
     def handle_qr_data(self, qr_data):
         if qr_data and qr_data != self.last_decoded_data:
@@ -97,6 +93,8 @@ class QrCodeDetection(Node):
                     int(rect.height),
                 ))
         self.latest_rois = rois
+        self.detection_stamp = self.msg_stamp_to_sec(msg)
+        self.detection_receive_time = self.now_sec()
 
     def image_callback(self, msg):
         try:
@@ -106,6 +104,9 @@ class QrCodeDetection(Node):
             return
 
         if not self.latest_rois:
+            return
+
+        if self.rois_are_stale(msg):
             return
 
         height, width = cv_image.shape[:2]
@@ -139,12 +140,48 @@ class QrCodeDetection(Node):
                 self.pub_qrcode_info.publish(String(data=latest))
 
                 sign_data = self.parse_sign_data(latest)
-                if sign_data is not None:
+                if self.publish_deprecated_outputs and sign_data is not None:
                     sign = Sign()
                     sign.sign_data = sign_data
                     self.pub_car_signal.publish(sign)
 
-                self.qr_start_pub.publish(Int32(data=1))
+                if self.publish_deprecated_outputs:
+                    self.qr_start_pub.publish(Int32(data=1))
+
+    def rois_are_stale(self, image_msg):
+        if self.detection_receive_time is None:
+            return True
+
+        image_stamp = self.msg_stamp_to_sec(image_msg)
+        if image_stamp is not None and self.detection_stamp is not None:
+            age = abs(image_stamp - self.detection_stamp)
+        else:
+            age = self.now_sec() - self.detection_receive_time
+
+        if age <= self.max_detection_age_sec:
+            return False
+
+        now = self.now_sec()
+        if now - self.last_stale_warn_time > 2.0:
+            self.get_logger().warn(
+                f'Skip QR ROI decode: detection/image timestamp gap {age:.3f}s '
+                f'exceeds max_detection_age_sec={self.max_detection_age_sec:.3f}'
+            )
+            self.last_stale_warn_time = now
+        return True
+
+    def msg_stamp_to_sec(self, msg):
+        stamp = getattr(getattr(msg, 'header', None), 'stamp', None)
+        if stamp is None:
+            return None
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+        if sec == 0 and nanosec == 0:
+            return None
+        return sec + nanosec * 1e-9
+
+    def now_sec(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
 
 def main(args=None):
