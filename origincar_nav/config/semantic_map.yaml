@@ -1,5 +1,7 @@
-# Current coordinates are placeholders for software bringup only.
-# They must be calibrated on the real car and competition field before use.
+# Coordinates use the 5m x 5m official field convention:
+# origin at the lower-left corner, x to the right, y upward, units in meters.
+# Current point values are approximate from the rule map and must be tuned
+# on the real car with /odom_combined before competition use.
 map_frame: map
 odom_frame: odom_combined
 base_frame: base_footprint
@@ -22,34 +24,41 @@ yolo_labels:
 
 boundary:
   x_min: 0.0
-  x_max: 4.0
+  x_max: 5.0
   y_min: 0.0
-  y_max: 3.0
+  y_max: 5.0
 
 points:
   p_start:
-    pose: [0.0, 0.0, 0.0]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [0.35, 0.20, 0.0]
     description: "P point / start point"
 
   task_station:
-    pose: [1.2, 0.0, 0.0]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [4.70, 1.55, 0.0]
     description: "QR task publishing station"
 
   channel_entry:
-    pose: [2.4, 0.5, 0.0]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [2.50, 2.35, 0.0]
     description: "Entrance of the channel area"
 
   channel_p1:
-    pose: [2.4, 0.5, 0.0]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [1.05, 3.25, 0.0]
 
   channel_p2:
-    pose: [3.2, 0.5, 1.57]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [4.00, 3.25, 1.57]
 
   channel_p3:
-    pose: [3.2, 1.5, 3.14]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [4.00, 4.25, 3.14]
 
   channel_p4:
-    pose: [2.4, 1.5, -1.57]
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [1.05, 4.25, -1.57]
 
 routes:
   clockwise:

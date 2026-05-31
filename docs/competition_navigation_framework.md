@@ -44,7 +44,13 @@ The chassis USER key is not used as the formal start input in this version. On X
 
 `origincar_nav/config/semantic_map.yaml` is the rough semantic map used by the task layer. It stores the start point, task station, channel entry, channel points, boundary, route order, task thresholds, and visualization options.
 
-The current coordinates and boundary values are placeholders. They must be calibrated on the real car and competition field before a real run.
+The semantic coordinate convention follows the official 500cm x 500cm field map: origin at the lower-left corner, x to the right, y upward, and units in meters. The boundary is `0.0..5.0m` on both axes.
+
+`origincar_nav/maps/field_map.png` and `origincar_nav/maps/field_map.yaml` provide a static field background for CoStudio/RViz debugging. This map is a visual reference, not a high-precision Nav2 occupancy grid for formal navigation.
+
+The current semantic coordinates are approximate values from the rule map. They must be refined on the real car with `/odom_combined` before competition use.
+
+Formal navigation still uses `/odom_combined` plus `semantic_map.yaml` plus `target_tracker`; the static field image does not drive decisions.
 
 ## Half-Route QR Scan
 
@@ -111,7 +117,7 @@ It publishes:
 
 The visualization frame is parameterized. If no `map -> odom_combined` transform is available, launch with `visualization_frame:=odom_combined`.
 
-If CoStudio does not show Marker or MarkerArray topics clearly, use the image panel with `/semantic_map/preview/compressed`. This preview is a simple 2D drawing generated from `semantic_map.yaml`, `/current_goal`, and `/odom_combined`; it is only for debugging display and does not participate in navigation decisions.
+If CoStudio does not show Marker or MarkerArray topics clearly, use the image panel with `/semantic_map/preview/compressed`. This preview overlays `semantic_map.yaml`, `/current_goal`, `/odom_combined`, and the vehicle path on top of the official 500cm x 500cm field image. It is only for debugging display and does not participate in navigation decisions.
 
 ## Formal Topics
 
