@@ -41,6 +41,9 @@ class SemanticMapPreviewNode(Node):
         self.declare_parameter('max_path_points', 300)
         self.declare_parameter('overlay_font_scale', 0.45)
         self.declare_parameter('overlay_font_thickness', 1)
+        self.declare_parameter('point_radius', 6)
+        self.declare_parameter('goal_radius', 7)
+        self.declare_parameter('robot_radius', 6)
 
         self.image_size = int(self.get_parameter('preview_image_size').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
@@ -48,6 +51,9 @@ class SemanticMapPreviewNode(Node):
         self.max_path_points = int(self.get_parameter('max_path_points').value)
         self.overlay_font_scale = float(self.get_parameter('overlay_font_scale').value)
         self.overlay_font_thickness = int(self.get_parameter('overlay_font_thickness').value)
+        self.point_radius = int(self.get_parameter('point_radius').value)
+        self.goal_radius = int(self.get_parameter('goal_radius').value)
+        self.robot_radius = int(self.get_parameter('robot_radius').value)
         self.semantic_map = self.load_semantic_map()
         self.points = self.semantic_map.get('points', {})
         self.routes = self.semantic_map.get('routes', {})
@@ -287,8 +293,8 @@ class SemanticMapPreviewNode(Node):
             if pixel is None:
                 continue
             color = colors.get(name, (80, 80, 220))
-            cv2.circle(image, pixel, 8, color, -1, lineType=cv2.LINE_AA)
-            cv2.circle(image, pixel, 10, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+            cv2.circle(image, pixel, self.point_radius, color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(image, pixel, self.point_radius + 2, (255, 255, 255), 2, lineType=cv2.LINE_AA)
             dx, dy = label_offsets.get(name, (10, -8))
             label_pos = self.clamp_label_position(pixel[0] + dx, pixel[1] + dy)
             cv2.putText(image, name, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, lineType=cv2.LINE_AA)
@@ -299,7 +305,15 @@ class SemanticMapPreviewNode(Node):
         pixel = transform(self.current_goal[0], self.current_goal[1])
         if pixel is None:
             return
-        cv2.drawMarker(image, pixel, (0, 0, 255), cv2.MARKER_STAR, 24, 2, line_type=cv2.LINE_AA)
+        cv2.drawMarker(
+            image,
+            pixel,
+            (0, 0, 255),
+            cv2.MARKER_STAR,
+            self.goal_radius * 3,
+            2,
+            line_type=cv2.LINE_AA,
+        )
         cv2.putText(image, 'current_goal', (pixel[0] + 10, pixel[1] + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, lineType=cv2.LINE_AA)
 
@@ -314,7 +328,7 @@ class SemanticMapPreviewNode(Node):
             int(pixel[0] + math.cos(self.current_yaw) * heading_len),
             int(pixel[1] - math.sin(self.current_yaw) * heading_len),
         )
-        cv2.circle(image, pixel, 8, (0, 0, 0), 2, lineType=cv2.LINE_AA)
+        cv2.circle(image, pixel, self.robot_radius, (0, 0, 0), 2, lineType=cv2.LINE_AA)
         cv2.arrowedLine(image, pixel, end, (0, 0, 0), 2, tipLength=0.3, line_type=cv2.LINE_AA)
         cv2.putText(image, 'car', (pixel[0] + 10, pixel[1] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, lineType=cv2.LINE_AA)

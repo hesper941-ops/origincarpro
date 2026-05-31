@@ -50,7 +50,7 @@ The semantic coordinate convention follows the official 500cm x 500cm field map:
 
 `origincar_nav/maps/field_map.png` and `origincar_nav/maps/field_map.yaml` provide a static field background for CoStudio/RViz debugging. This map is a visual reference, not a high-precision Nav2 occupancy grid for formal navigation.
 
-The current semantic coordinates are approximate values from the rule map. They must be refined on the real car with `/odom_combined` before competition use.
+The current semantic coordinates are measured / manually confirmed values and can still be refined on the real car with `/odom_combined`.
 
 Formal navigation still uses `/odom_combined` plus `semantic_map.yaml` plus `target_tracker`; the static field image does not drive decisions.
 

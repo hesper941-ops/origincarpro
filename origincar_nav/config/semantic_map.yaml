@@ -1,7 +1,7 @@
 # Coordinates use the 5m x 5m official field convention:
 # origin at the lower-left corner, x to the right, y upward, units in meters.
-# Current point values are approximate from the rule map and must be tuned
-# on the real car with /odom_combined before competition use.
+# Current point values are measured / manually confirmed coordinates.
+# They can still be fine-tuned on the real car with /odom_combined.
 map_frame: map
 odom_frame: odom_combined
 base_frame: base_footprint
@@ -30,46 +30,46 @@ boundary:
 
 points:
   p_start:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [0.33, 0.23, 0.0]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [0.55, 0.20, 0.0]
     description: "P point / start point"
 
   task_station:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [4.72, 1.55, 0.0]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [4.75, 1.80, 0.0]
     description: "QR task publishing station"
 
   channel_entry:
     # Compatibility field for current task_manager; prefer channel_entry_lower / channel_entry_upper later.
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [2.50, 2.30, 0.0]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [2.50, 2.00, 0.0]
     description: "Compatibility entrance point, currently equal to channel_entry_lower"
 
   channel_entry_lower:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [2.50, 2.30, 0.0]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [2.50, 2.00, 0.0]
     description: "Lower entrance from blue hall to vertical yellow channel"
 
   channel_entry_upper:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [2.50, 3.25, 0.0]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [2.50, 3.17, 0.0]
     description: "Upper transition from vertical entrance channel to yellow loop"
 
   channel_p1:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [1.12, 3.25, 0.0]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [0.75, 3.17, 0.0]
 
   channel_p2:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [3.88, 3.25, 1.57]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [4.25, 3.17, 0.0]
 
   channel_p3:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [3.88, 4.18, 3.14]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [4.25, 4.32, 0.0]
 
   channel_p4:
-    # Approximate rule-map coordinate; calibrate on car.
-    pose: [1.12, 4.18, -1.57]
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [0.75, 4.32, 0.0]
 
 routes:
   clockwise:
