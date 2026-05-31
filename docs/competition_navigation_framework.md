@@ -106,8 +106,12 @@ It publishes:
 - `/mission_text_marker`
 - `/avoid_obstacle_marker`
 - `/semantic_map/current_pose_marker`
+- `/semantic_map/preview`
+- `/semantic_map/preview/compressed`
 
 The visualization frame is parameterized. If no `map -> odom_combined` transform is available, launch with `visualization_frame:=odom_combined`.
+
+If CoStudio does not show Marker or MarkerArray topics clearly, use the image panel with `/semantic_map/preview/compressed`. This preview is a simple 2D drawing generated from `semantic_map.yaml`, `/current_goal`, and `/odom_combined`; it is only for debugging display and does not participate in navigation decisions.
 
 ## Formal Topics
 
@@ -226,6 +230,15 @@ Use odometry frame for visualization if there is no map transform:
 ros2 launch origincar_nav competition_nav.launch.py visualization_frame:=odom_combined
 ```
 
+Semantic map preview image for CoStudio:
+
+```bash
+ros2 launch origincar_nav competition_nav.launch.py enable_visualization:=true enable_preview_image:=true visualization_frame:=map
+ros2 topic hz /semantic_map/preview/compressed
+```
+
+In CoStudio, select `/semantic_map/preview/compressed` in an image panel.
+
 YOLO avoidance and velocity mux:
 
 ```bash
@@ -261,6 +274,7 @@ ros2 topic echo /vehicle_path
 RViz or CoStudio should display:
 
 - `/semantic_map/markers`
+- `/semantic_map/preview/compressed`
 - `/current_goal_marker`
 - `/vehicle_path`
 - `/mission_text_marker`

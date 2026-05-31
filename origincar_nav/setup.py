@@ -30,6 +30,7 @@ setup(
             'target_tracker = origincar_nav.target_tracker:main',
             'task_manager = origincar_nav.task_manager:main',
             'semantic_map_visualizer = origincar_nav.semantic_map_visualizer:main',
+            'semantic_map_preview_node = origincar_nav.semantic_map_preview_node:main',
         ],
     },
 )

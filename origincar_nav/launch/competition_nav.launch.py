@@ -4,7 +4,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -15,7 +15,12 @@ def generate_launch_description():
     semantic_map_file = LaunchConfiguration('semantic_map_file')
     odom_topic = LaunchConfiguration('odom_topic')
     enable_visualization = LaunchConfiguration('enable_visualization')
+    enable_preview_image = LaunchConfiguration('enable_preview_image')
     visualization_frame = LaunchConfiguration('visualization_frame')
+    preview_image_topic = LaunchConfiguration('preview_image_topic')
+    preview_compressed_topic = LaunchConfiguration('preview_compressed_topic')
+    preview_image_size = LaunchConfiguration('preview_image_size')
+    preview_publish_rate = LaunchConfiguration('preview_publish_rate')
     debug_mode = LaunchConfiguration('debug_mode')
     debug_start_state = LaunchConfiguration('debug_start_state')
     debug_route_direction = LaunchConfiguration('debug_route_direction')
@@ -27,7 +32,12 @@ def generate_launch_description():
         DeclareLaunchArgument('semantic_map_file', default_value=default_map),
         DeclareLaunchArgument('odom_topic', default_value='/odom_combined'),
         DeclareLaunchArgument('enable_visualization', default_value='true'),
+        DeclareLaunchArgument('enable_preview_image', default_value='true'),
         DeclareLaunchArgument('visualization_frame', default_value='map'),
+        DeclareLaunchArgument('preview_image_topic', default_value='/semantic_map/preview'),
+        DeclareLaunchArgument('preview_compressed_topic', default_value='/semantic_map/preview/compressed'),
+        DeclareLaunchArgument('preview_image_size', default_value='800'),
+        DeclareLaunchArgument('preview_publish_rate', default_value='1.0'),
         DeclareLaunchArgument('debug_mode', default_value='false'),
         DeclareLaunchArgument('debug_start_state', default_value='TRACK_TO_TASK_STATION'),
         DeclareLaunchArgument('debug_route_direction', default_value='clockwise'),
@@ -70,6 +80,27 @@ def generate_launch_description():
                 'semantic_map_file': semantic_map_file,
                 'odom_topic': odom_topic,
                 'visualization_frame': visualization_frame,
+            }],
+        ),
+        Node(
+            package='origincar_nav',
+            executable='semantic_map_preview_node',
+            output='screen',
+            condition=IfCondition(PythonExpression([
+                "'",
+                enable_visualization,
+                "' == 'true' and '",
+                enable_preview_image,
+                "' == 'true'",
+            ])),
+            parameters=[{
+                'semantic_map_file': semantic_map_file,
+                'odom_topic': odom_topic,
+                'goal_topic': '/current_goal',
+                'preview_image_topic': preview_image_topic,
+                'preview_compressed_topic': preview_compressed_topic,
+                'preview_image_size': preview_image_size,
+                'preview_publish_rate': preview_publish_rate,
             }],
         ),
     ])
