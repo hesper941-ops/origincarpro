@@ -21,6 +21,7 @@ def generate_launch_description():
     preview_compressed_topic = LaunchConfiguration('preview_compressed_topic')
     preview_image_size = LaunchConfiguration('preview_image_size')
     preview_publish_rate = LaunchConfiguration('preview_publish_rate')
+    publish_raw_image = LaunchConfiguration('publish_raw_image')
     debug_mode = LaunchConfiguration('debug_mode')
     debug_start_state = LaunchConfiguration('debug_start_state')
     debug_route_direction = LaunchConfiguration('debug_route_direction')
@@ -36,8 +37,9 @@ def generate_launch_description():
         DeclareLaunchArgument('visualization_frame', default_value='map'),
         DeclareLaunchArgument('preview_image_topic', default_value='/semantic_map/preview'),
         DeclareLaunchArgument('preview_compressed_topic', default_value='/semantic_map/preview/compressed'),
-        DeclareLaunchArgument('preview_image_size', default_value='800'),
+        DeclareLaunchArgument('preview_image_size', default_value='500'),
         DeclareLaunchArgument('preview_publish_rate', default_value='1.0'),
+        DeclareLaunchArgument('publish_raw_image', default_value='false'),
         DeclareLaunchArgument('debug_mode', default_value='false'),
         DeclareLaunchArgument('debug_start_state', default_value='TRACK_TO_TASK_STATION'),
         DeclareLaunchArgument('debug_route_direction', default_value='clockwise'),
@@ -101,6 +103,7 @@ def generate_launch_description():
                 'preview_compressed_topic': preview_compressed_topic,
                 'preview_image_size': preview_image_size,
                 'preview_publish_rate': preview_publish_rate,
+                'publish_raw_image': publish_raw_image,
             }],
         ),
     ])

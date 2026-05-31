@@ -34,14 +34,16 @@ class SemanticMapPreviewNode(Node):
         self.declare_parameter('goal_topic', '/current_goal')
         self.declare_parameter('preview_image_topic', '/semantic_map/preview')
         self.declare_parameter('preview_compressed_topic', '/semantic_map/preview/compressed')
-        self.declare_parameter('preview_image_size', 800)
+        self.declare_parameter('preview_image_size', 500)
         self.declare_parameter('preview_publish_rate', 1.0)
+        self.declare_parameter('publish_raw_image', False)
         self.declare_parameter('jpeg_quality', 85)
-        self.declare_parameter('path_max_length', 500)
+        self.declare_parameter('max_path_points', 300)
 
         self.image_size = int(self.get_parameter('preview_image_size').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
-        self.path_max_length = int(self.get_parameter('path_max_length').value)
+        self.publish_raw_image = self.as_bool(self.get_parameter('publish_raw_image').value)
+        self.max_path_points = int(self.get_parameter('max_path_points').value)
         self.semantic_map = self.load_semantic_map()
         self.points = self.semantic_map.get('points', {})
         self.routes = self.semantic_map.get('routes', {})
@@ -58,11 +60,13 @@ class SemanticMapPreviewNode(Node):
         else:
             self.background = self.load_field_map_background()
 
-        self.image_pub = self.create_publisher(
-            Image,
-            self.get_parameter('preview_image_topic').value,
-            10,
-        )
+        self.image_pub = None
+        if self.publish_raw_image:
+            self.image_pub = self.create_publisher(
+                Image,
+                self.get_parameter('preview_image_topic').value,
+                10,
+            )
         self.compressed_pub = self.create_publisher(
             CompressedImage,
             self.get_parameter('preview_compressed_topic').value,
@@ -83,6 +87,13 @@ class SemanticMapPreviewNode(Node):
         )
 
         rate = float(self.get_parameter('preview_publish_rate').value)
+        self.get_logger().info(
+            'Semantic map preview config: '
+            f'background_shape={None if self.background is None else self.background.shape}, '
+            f'preview_image_size={self.image_size}, '
+            f'publish_raw_image={self.publish_raw_image}, '
+            f'preview_publish_rate={rate}'
+        )
         self.timer = self.create_timer(1.0 / max(rate, 0.1), self.publish_preview)
 
     def load_semantic_map(self):
@@ -110,6 +121,7 @@ class SemanticMapPreviewNode(Node):
             )
             return None
 
+        self.get_logger().info(f'Field map path: {path}')
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None:
             self.get_logger().warn(
@@ -118,6 +130,8 @@ class SemanticMapPreviewNode(Node):
             return None
 
         self.get_logger().info(f'Loaded field map preview background: {path}')
+        if image.shape[0] == self.image_size and image.shape[1] == self.image_size:
+            return image
         return cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
 
     def package_file(self, *path_parts):
@@ -128,41 +142,52 @@ class SemanticMapPreviewNode(Node):
             return os.path.join(os.getcwd(), 'origincar_nav', *path_parts)
 
     def goal_callback(self, msg):
-        self.current_goal = (msg.pose.position.x, msg.pose.position.y)
+        point = (msg.pose.position.x, msg.pose.position.y)
+        self.current_goal = point if self.valid_xy(*point) else None
 
     def odom_callback(self, msg):
         pose = msg.pose.pose
-        self.current_pose = (pose.position.x, pose.position.y)
-        self.current_yaw = yaw_from_quaternion(pose.orientation)
+        point = (pose.position.x, pose.position.y)
+        yaw = yaw_from_quaternion(pose.orientation)
+        if not self.valid_xy(*point) or not math.isfinite(yaw):
+            return
+        self.current_pose = point
+        self.current_yaw = yaw
         self.vehicle_path.append(self.current_pose)
-        if len(self.vehicle_path) > self.path_max_length:
-            self.vehicle_path = self.vehicle_path[-self.path_max_length:]
+        if len(self.vehicle_path) > self.max_path_points:
+            self.vehicle_path = self.vehicle_path[-self.max_path_points:]
 
     def publish_preview(self):
-        if cv2 is None or np is None:
-            return
+        try:
+            if cv2 is None or np is None:
+                return
 
-        if self.background is None:
-            image = np.full((self.image_size, self.image_size, 3), 255, dtype=np.uint8)
-        else:
-            image = self.background.copy()
+            if self.background is None:
+                frame = np.full((self.image_size, self.image_size, 3), 255, dtype=np.uint8)
+            else:
+                frame = self.background.copy()
 
-        transform = self.world_to_pixel
-        self.draw_boundary(image, transform)
-        self.draw_routes(image, transform)
-        self.draw_vehicle_path(image, transform)
-        self.draw_points(image, transform)
-        self.draw_goal(image, transform)
-        self.draw_pose(image, transform)
-        self.draw_overlay_text(image)
+            transform = self.world_to_pixel
+            self.draw_boundary(frame, transform)
+            self.draw_routes(frame, transform)
+            self.draw_vehicle_path(frame, transform)
+            self.draw_points(frame, transform)
+            self.draw_goal(frame, transform)
+            self.draw_pose(frame, transform)
+            self.draw_overlay_text(frame)
 
-        stamp = self.get_clock().now().to_msg()
-        self.image_pub.publish(self.to_image_msg(image, stamp))
-        compressed = self.to_compressed_msg(image, stamp)
-        if compressed is not None:
-            self.compressed_pub.publish(compressed)
+            stamp = self.get_clock().now().to_msg()
+            if self.publish_raw_image and self.image_pub is not None:
+                self.image_pub.publish(self.to_image_msg(frame, stamp))
+            compressed = self.to_compressed_msg(frame, stamp)
+            if compressed is not None:
+                self.compressed_pub.publish(compressed)
+        except Exception as exc:
+            self.get_logger().error(f'Failed to publish semantic map preview: {exc}')
 
     def world_to_pixel(self, x, y):
+        if not self.valid_xy(x, y):
+            return None
         x_min = float(self.boundary.get('x_min', 0.0))
         x_max = float(self.boundary.get('x_max', 5.0))
         y_min = float(self.boundary.get('y_min', 0.0))
@@ -174,6 +199,8 @@ class SemanticMapPreviewNode(Node):
         return self.clamp_pixel(px, py)
 
     def clamp_pixel(self, px, py):
+        if px is None or py is None:
+            return None
         px = max(0, min(self.image_size - 1, int(px)))
         py = max(0, min(self.image_size - 1, int(py)))
         return px, py
@@ -182,8 +209,14 @@ class SemanticMapPreviewNode(Node):
         keys = ('x_min', 'x_max', 'y_min', 'y_max')
         if not all(key in self.boundary for key in keys):
             return
+        if not self.valid_xy(self.boundary['x_min'], self.boundary['y_min']):
+            return
+        if not self.valid_xy(self.boundary['x_max'], self.boundary['y_max']):
+            return
         p1 = transform(self.boundary['x_min'], self.boundary['y_min'])
         p2 = transform(self.boundary['x_max'], self.boundary['y_max'])
+        if p1 is None or p2 is None:
+            return
         top_left = (min(p1[0], p2[0]), min(p1[1], p2[1]))
         bottom_right = (max(p1[0], p2[0]), max(p1[1], p2[1]))
         cv2.rectangle(image, top_left, bottom_right, (40, 40, 40), 2)
@@ -199,7 +232,9 @@ class SemanticMapPreviewNode(Node):
         for name in order:
             pose = self.point_pose(name)
             if pose is not None:
-                pixels.append(transform(pose[0], pose[1]))
+                pixel = transform(pose[0], pose[1])
+                if pixel is not None:
+                    pixels.append(pixel)
         for start, end in zip(pixels, pixels[1:]):
             cv2.line(image, start, end, color, 3, lineType=cv2.LINE_AA)
         if pixels:
@@ -209,7 +244,8 @@ class SemanticMapPreviewNode(Node):
     def draw_vehicle_path(self, image, transform):
         if len(self.vehicle_path) < 2:
             return
-        pixels = [transform(x, y) for x, y in self.vehicle_path]
+        pixels = [transform(x, y) for x, y in self.vehicle_path if self.valid_xy(x, y)]
+        pixels = [pixel for pixel in pixels if pixel is not None]
         for start, end in zip(pixels, pixels[1:]):
             cv2.line(image, start, end, (60, 60, 60), 2, lineType=cv2.LINE_AA)
 
@@ -232,6 +268,8 @@ class SemanticMapPreviewNode(Node):
             if pose is None:
                 continue
             pixel = transform(pose[0], pose[1])
+            if pixel is None:
+                continue
             color = colors.get(name, (80, 80, 220))
             cv2.circle(image, pixel, 8, color, -1, lineType=cv2.LINE_AA)
             cv2.circle(image, pixel, 10, (255, 255, 255), 2, lineType=cv2.LINE_AA)
@@ -242,6 +280,8 @@ class SemanticMapPreviewNode(Node):
         if self.current_goal is None:
             return
         pixel = transform(self.current_goal[0], self.current_goal[1])
+        if pixel is None:
+            return
         cv2.drawMarker(image, pixel, (0, 0, 255), cv2.MARKER_STAR, 24, 2, line_type=cv2.LINE_AA)
         cv2.putText(image, 'current_goal', (pixel[0] + 10, pixel[1] + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, lineType=cv2.LINE_AA)
@@ -250,6 +290,8 @@ class SemanticMapPreviewNode(Node):
         if self.current_pose is None:
             return
         pixel = transform(self.current_pose[0], self.current_pose[1])
+        if pixel is None:
+            return
         heading_len = 30
         end = (
             int(pixel[0] + math.cos(self.current_yaw) * heading_len),
@@ -285,6 +327,8 @@ class SemanticMapPreviewNode(Node):
         pose = cfg.get('pose', [])
         if len(pose) < 2:
             return None
+        if not self.valid_xy(pose[0], pose[1]):
+            return None
         return float(pose[0]), float(pose[1])
 
     def nearest_point_name(self, point):
@@ -299,6 +343,17 @@ class SemanticMapPreviewNode(Node):
                 best_dist = dist
                 best_name = name
         return best_name
+
+    def valid_xy(self, x, y):
+        try:
+            return math.isfinite(float(x)) and math.isfinite(float(y))
+        except (TypeError, ValueError):
+            return False
+
+    def as_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
     def to_image_msg(self, image, stamp):
         msg = Image()
