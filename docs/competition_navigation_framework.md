@@ -116,7 +116,8 @@ These pieces are interfaces or placeholders, not completed algorithms:
 
 - Bird View P-point recognition is not complete.
 - `birdview_local_nav` local return control is not complete.
-- Channel-area visual correction is not complete.
+- Channel-area yellow-region visual correction is not complete.
+- Human standee recognition, image-to-text reasoning, and display are not complete.
 - `line` and `end` are reserved labels only; Bird View return recognition and P-point confirmation are not completed closed-loop algorithms yet.
 - The `QR_code` ROI quality and QR decode chain need field confirmation.
 - Semantic map coordinates and boundaries need on-car calibration.
@@ -126,14 +127,44 @@ These pieces are interfaces or placeholders, not completed algorithms:
 Build:
 
 ```bash
-colcon build --symlink-install --packages-select origincar_nav origincar_avoid qr_code_detection vision_birdview
+colcon build --symlink-install --packages-select origincar_bringup origincar_nav origincar_avoid qr_code_detection vision_birdview
 ```
 
 Source:
 
 ```bash
+source /opt/tros/humble/setup.bash
 source install/setup.bash
 ```
+
+Competition one-shot bringup:
+
+```bash
+ros2 launch origincar_bringup competition_bringup.launch.py
+```
+
+For safer bench testing, disable the base first:
+
+```bash
+ros2 launch origincar_bringup competition_bringup.launch.py enable_base:=false
+```
+
+Safety: if `enable_base=true` and navigation plus `cmd_vel_mux` are running, the system may publish velocity commands to `/cmd_vel`. Lift the wheels or confirm the field is safe before testing on the real car.
+
+`competition_bringup.launch.py` currently starts the connected formal modules:
+
+- Base bringup: `origincar_base/origincar_bringup.launch.py`
+- Camera bridge: `vision_camera/camera_bridge.launch.py`
+- YOLO inference, avoidance, and velocity mux: `origincar_avoid/yolov8_detect.launch.py`
+- QR detection: `qr_code_detection/qr_detection_node`
+- Bird View image interface: `vision_birdview/bird_view.launch.py`
+- Navigation state machine, target tracker, and semantic map visualization: `origincar_nav/competition_nav.launch.py`
+
+It supports module switches: `enable_base`, `enable_camera`, `enable_yolo_avoid`, `enable_qr`, `enable_birdview`, `enable_nav`, `enable_visualization`, and `enable_cobridge`. `enable_cobridge` defaults to `false` because the web/rosbridge display bridge can conflict with separately started debugging tools.
+
+It also forwards `odom_topic` and `visualization_frame`. If no `map -> odom_combined` transform is available, the one-shot launch defaults visualization to `odom_combined`.
+
+Later modules such as image-to-text, channel visual correction, and Bird View local return can be added by including them in `competition_bringup.launch.py` without changing the formal navigation state machine.
 
 Competition navigation and visualization:
 
@@ -172,6 +203,7 @@ ros2 topic list | grep -E "semantic_map|current_goal|vehicle_path|mission_state|
 ros2 topic echo /mission_state
 ros2 topic echo /perception_mode
 ros2 topic echo /current_goal
+ros2 topic hz /current_goal
 ros2 topic echo /vehicle_path
 ```
 

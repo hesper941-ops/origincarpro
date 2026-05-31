@@ -37,6 +37,7 @@ class TaskManager(Node):
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('publish_rate_hz', 2.0)
         self.declare_parameter('qr_scan_start_dist_to_task_station', 1.0)
+        self.declare_parameter('current_goal_republish_period_sec', 1.0)
         self.declare_parameter('debug_allow_numeric_qr_route', False)
 
         self.semantic_map = self.load_semantic_map()
@@ -51,6 +52,9 @@ class TaskManager(Node):
         self.debug_allow_numeric_qr_route = bool(
             self.get_parameter('debug_allow_numeric_qr_route').value
         )
+        self.current_goal_republish_period_sec = float(
+            self.get_parameter('current_goal_republish_period_sec').value
+        )
 
         self.state = MissionState.INIT
         self.route_direction = None
@@ -58,6 +62,7 @@ class TaskManager(Node):
         self.channel_index = 0
         self.current_goal_name = None
         self.last_published_goal_name = None
+        self.last_goal_republish_time = 0.0
         self.avoid_active = False
         self.birdview_valid = False
         self.last_goal_reached = False
@@ -140,6 +145,8 @@ class TaskManager(Node):
             self.publish_track_enable(False)
             self.publish_status('idle')
 
+        self.maybe_republish_current_goal()
+
     def set_state(self, state):
         if self.state == state:
             return
@@ -170,11 +177,29 @@ class TaskManager(Node):
         self.current_goal_name = name
         self.last_published_goal_name = name
         self.goal_pub.publish(self.pose_from_point(name))
+        self.last_goal_republish_time = self.now_sec()
 
     def republish_current_goal(self):
-        if self.current_goal_name:
+        if self.current_goal_name and self.current_goal_name in self.points:
             self.goal_pub.publish(self.pose_from_point(self.current_goal_name))
             self.last_published_goal_name = self.current_goal_name
+            self.last_goal_republish_time = self.now_sec()
+
+    def maybe_republish_current_goal(self):
+        tracking_states = {
+            MissionState.TRACK_TO_TASK_STATION,
+            MissionState.TRACK_TO_CHANNEL_ENTRY,
+            MissionState.CHANNEL_NAV,
+            MissionState.RETURN_PREPARE,
+        }
+        if self.state not in tracking_states or not self.current_goal_name:
+            return
+        if self.current_goal_name not in self.points:
+            return
+
+        now = self.now_sec()
+        if now - self.last_goal_republish_time >= self.current_goal_republish_period_sec:
+            self.republish_current_goal()
 
     def pose_from_point(self, name):
         pose = self.points[name].get('pose', [0.0, 0.0, 0.0])
@@ -276,6 +301,9 @@ class TaskManager(Node):
         pose = task_station.get('pose', [0.0, 0.0, 0.0])
         distance = math.hypot(float(pose[0]) - self.current_x, float(pose[1]) - self.current_y)
         return distance <= self.qr_scan_start_dist_to_task_station
+
+    def now_sec(self):
+        return self.get_clock().now().nanoseconds / 1e9
 
 
 def main(args=None):
