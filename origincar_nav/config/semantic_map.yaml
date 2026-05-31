@@ -31,34 +31,45 @@ boundary:
 points:
   p_start:
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [0.35, 0.20, 0.0]
+    pose: [0.33, 0.23, 0.0]
     description: "P point / start point"
 
   task_station:
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [4.70, 1.55, 0.0]
+    pose: [4.72, 1.55, 0.0]
     description: "QR task publishing station"
 
   channel_entry:
+    # Compatibility field for current task_manager; prefer channel_entry_lower / channel_entry_upper later.
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [2.50, 2.35, 0.0]
-    description: "Entrance of the channel area"
+    pose: [2.50, 2.30, 0.0]
+    description: "Compatibility entrance point, currently equal to channel_entry_lower"
+
+  channel_entry_lower:
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [2.50, 2.30, 0.0]
+    description: "Lower entrance from blue hall to vertical yellow channel"
+
+  channel_entry_upper:
+    # Approximate rule-map coordinate; calibrate on car.
+    pose: [2.50, 3.25, 0.0]
+    description: "Upper transition from vertical entrance channel to yellow loop"
 
   channel_p1:
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [1.05, 3.25, 0.0]
+    pose: [1.12, 3.25, 0.0]
 
   channel_p2:
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [4.00, 3.25, 1.57]
+    pose: [3.88, 3.25, 1.57]
 
   channel_p3:
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [4.00, 4.25, 3.14]
+    pose: [3.88, 4.18, 3.14]
 
   channel_p4:
     # Approximate rule-map coordinate; calibrate on car.
-    pose: [1.05, 4.25, -1.57]
+    pose: [1.12, 4.18, -1.57]
 
 routes:
   clockwise:

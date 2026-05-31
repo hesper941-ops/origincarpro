@@ -39,11 +39,15 @@ class SemanticMapPreviewNode(Node):
         self.declare_parameter('publish_raw_image', False)
         self.declare_parameter('jpeg_quality', 85)
         self.declare_parameter('max_path_points', 300)
+        self.declare_parameter('overlay_font_scale', 0.45)
+        self.declare_parameter('overlay_font_thickness', 1)
 
         self.image_size = int(self.get_parameter('preview_image_size').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.publish_raw_image = self.as_bool(self.get_parameter('publish_raw_image').value)
         self.max_path_points = int(self.get_parameter('max_path_points').value)
+        self.overlay_font_scale = float(self.get_parameter('overlay_font_scale').value)
+        self.overlay_font_thickness = int(self.get_parameter('overlay_font_thickness').value)
         self.semantic_map = self.load_semantic_map()
         self.points = self.semantic_map.get('points', {})
         self.routes = self.semantic_map.get('routes', {})
@@ -236,10 +240,7 @@ class SemanticMapPreviewNode(Node):
                 if pixel is not None:
                     pixels.append(pixel)
         for start, end in zip(pixels, pixels[1:]):
-            cv2.line(image, start, end, color, 3, lineType=cv2.LINE_AA)
-        if pixels:
-            cv2.putText(image, route_name, (pixels[0][0] + 8, pixels[0][1] + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, lineType=cv2.LINE_AA)
+            cv2.line(image, start, end, color, 2, lineType=cv2.LINE_AA)
 
     def draw_vehicle_path(self, image, transform):
         if len(self.vehicle_path) < 2:
@@ -254,11 +255,26 @@ class SemanticMapPreviewNode(Node):
             'p_start': (0, 90, 255),
             'task_station': (255, 0, 0),
             'channel_entry': (0, 160, 160),
+            'channel_entry_lower': (0, 130, 210),
+            'channel_entry_upper': (0, 130, 210),
+        }
+        label_offsets = {
+            'p_start': (10, -12),
+            'task_station': (-118, -12),
+            'channel_entry': (-105, 4),
+            'channel_entry_lower': (10, 20),
+            'channel_entry_upper': (10, -12),
+            'channel_p1': (10, -12),
+            'channel_p2': (10, -12),
+            'channel_p3': (10, -12),
+            'channel_p4': (10, -12),
         }
         for name in (
             'p_start',
             'task_station',
             'channel_entry',
+            'channel_entry_lower',
+            'channel_entry_upper',
             'channel_p1',
             'channel_p2',
             'channel_p3',
@@ -273,8 +289,9 @@ class SemanticMapPreviewNode(Node):
             color = colors.get(name, (80, 80, 220))
             cv2.circle(image, pixel, 8, color, -1, lineType=cv2.LINE_AA)
             cv2.circle(image, pixel, 10, (255, 255, 255), 2, lineType=cv2.LINE_AA)
-            cv2.putText(image, name, (pixel[0] + 10, pixel[1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, lineType=cv2.LINE_AA)
+            dx, dy = label_offsets.get(name, (10, -8))
+            label_pos = self.clamp_label_position(pixel[0] + dx, pixel[1] + dy)
+            cv2.putText(image, name, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, lineType=cv2.LINE_AA)
 
     def draw_goal(self, image, transform):
         if self.current_goal is None:
@@ -314,11 +331,11 @@ class SemanticMapPreviewNode(Node):
             pose_text,
         ]
         for index, text in enumerate(lines):
-            org = (18, 30 + index * 24)
-            cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (255, 255, 255), 4, lineType=cv2.LINE_AA)
-            cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (20, 20, 20), 2, lineType=cv2.LINE_AA)
+            org = (12, 22 + index * 17)
+            cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, self.overlay_font_scale,
+                        (255, 255, 255), self.overlay_font_thickness + 2, lineType=cv2.LINE_AA)
+            cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, self.overlay_font_scale,
+                        (20, 20, 20), self.overlay_font_thickness, lineType=cv2.LINE_AA)
 
     def point_pose(self, name):
         cfg = self.points.get(name)
@@ -349,6 +366,12 @@ class SemanticMapPreviewNode(Node):
             return math.isfinite(float(x)) and math.isfinite(float(y))
         except (TypeError, ValueError):
             return False
+
+    def clamp_label_position(self, x, y):
+        return (
+            max(4, min(self.image_size - 120, int(x))),
+            max(14, min(self.image_size - 6, int(y))),
+        )
 
     def as_bool(self, value):
         if isinstance(value, bool):

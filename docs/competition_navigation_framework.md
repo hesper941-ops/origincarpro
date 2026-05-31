@@ -46,6 +46,8 @@ The chassis USER key is not used as the formal start input in this version. On X
 
 The semantic coordinate convention follows the official 500cm x 500cm field map: origin at the lower-left corner, x to the right, y upward, and units in meters. The boundary is `0.0..5.0m` on both axes.
 
+`p_start` and `task_station` are aligned to the centers of the printed P marker and task-station marker. `channel_entry` remains as a compatibility field for the current task manager and currently equals `channel_entry_lower`; newer semantic planning should use `channel_entry_lower` for the hall-to-channel threshold and `channel_entry_upper` for the transition into the yellow loop. `channel_p1` through `channel_p4` are centerline key points in the yellow loop, not geometric corner points.
+
 `origincar_nav/maps/field_map.png` and `origincar_nav/maps/field_map.yaml` provide a static field background for CoStudio/RViz debugging. This map is a visual reference, not a high-precision Nav2 occupancy grid for formal navigation.
 
 The current semantic coordinates are approximate values from the rule map. They must be refined on the real car with `/odom_combined` before competition use.
