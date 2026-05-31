@@ -74,7 +74,7 @@ def generate_launch_description():
                 'track_cmd_topic': '/track_cmd_vel',
                 'avoid_cmd_topic': '/avoid_cmd_vel',
                 'avoid_active_topic': '/avoid_active',
-                'output_cmd_topic': '/cmd_vel',
+                'output_cmd_topic': '/cmd_vel_raw',
             }],
         ),
     ])

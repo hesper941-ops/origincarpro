@@ -26,6 +26,13 @@ def generate_launch_description():
     enable_cobridge = LaunchConfiguration('enable_cobridge')
     odom_topic = LaunchConfiguration('odom_topic')
     visualization_frame = LaunchConfiguration('visualization_frame')
+    button_backend = LaunchConfiguration('button_backend')
+    debug_mode = LaunchConfiguration('debug_mode')
+    debug_start_state = LaunchConfiguration('debug_start_state')
+    debug_route_direction = LaunchConfiguration('debug_route_direction')
+    debug_channel_index = LaunchConfiguration('debug_channel_index')
+    debug_goal_name = LaunchConfiguration('debug_goal_name')
+    debug_auto_start = LaunchConfiguration('debug_auto_start')
 
     safety_note = (
         'Safety: if enable_base=true with navigation and cmd_vel_mux enabled, '
@@ -48,8 +55,25 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('odom_topic', default_value='/odom_combined'),
         DeclareLaunchArgument('visualization_frame', default_value='odom_combined'),
+        DeclareLaunchArgument('button_backend', default_value='topic'),
+        DeclareLaunchArgument('debug_mode', default_value='false'),
+        DeclareLaunchArgument('debug_start_state', default_value='TRACK_TO_TASK_STATION'),
+        DeclareLaunchArgument('debug_route_direction', default_value='clockwise'),
+        DeclareLaunchArgument('debug_channel_index', default_value='0'),
+        DeclareLaunchArgument('debug_goal_name', default_value=''),
+        DeclareLaunchArgument('debug_auto_start', default_value='false'),
 
         LogInfo(msg=safety_note),
+
+        Node(
+            package='origincar_bringup',
+            executable='competition_button_node.py',
+            output='screen',
+            parameters=[{
+                'button_backend': button_backend,
+                'debug_auto_start': debug_auto_start,
+            }],
+        ),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(launch_file('origincar_base', 'origincar_bringup.launch.py')),
@@ -83,7 +107,24 @@ def generate_launch_description():
                 'odom_topic': odom_topic,
                 'enable_visualization': enable_visualization,
                 'visualization_frame': visualization_frame,
+                'debug_mode': debug_mode,
+                'debug_start_state': debug_start_state,
+                'debug_route_direction': debug_route_direction,
+                'debug_channel_index': debug_channel_index,
+                'debug_goal_name': debug_goal_name,
+                'debug_auto_start': debug_auto_start,
             }.items(),
+        ),
+        Node(
+            package='origincar_avoid',
+            executable='cmd_vel_gate',
+            output='screen',
+            parameters=[{
+                'input_cmd_topic': '/cmd_vel_raw',
+                'output_cmd_topic': '/cmd_vel',
+                'started_topic': '/competition/started',
+                'emergency_stop_topic': '/competition/emergency_stop',
+            }],
         ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(launch_file('origincar_bringup', 'usb_websocket_display.launch.py')),

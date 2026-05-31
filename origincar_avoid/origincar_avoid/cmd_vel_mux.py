@@ -13,7 +13,7 @@ class CmdVelMux(Node):
         self.declare_parameter('track_cmd_topic', '/track_cmd_vel')
         self.declare_parameter('avoid_cmd_topic', '/avoid_cmd_vel')
         self.declare_parameter('avoid_active_topic', '/avoid_active')
-        self.declare_parameter('output_cmd_topic', '/cmd_vel')
+        self.declare_parameter('output_cmd_topic', '/cmd_vel_raw')
         self.declare_parameter('cmd_timeout_sec', 0.5)
         self.declare_parameter('publish_rate_hz', 20.0)
 

@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'cmd_vel_mux = origincar_avoid.cmd_vel_mux:main',
+            'cmd_vel_gate = origincar_avoid.cmd_vel_gate:main',
             'yolo_avoid_controller = origincar_avoid.yolo_avoid_controller:main',
         ],
     },

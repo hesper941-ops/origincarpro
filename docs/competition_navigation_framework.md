@@ -4,11 +4,41 @@
 
 The formal competition control line is:
 
-`semantic_map.yaml` -> `task_manager` -> `/current_goal` -> `target_tracker` -> `/track_cmd_vel` -> `cmd_vel_mux` -> `/cmd_vel`
+`semantic_map.yaml` -> `task_manager` -> `/current_goal` -> `target_tracker` -> `/track_cmd_vel` -> `cmd_vel_mux` -> `/cmd_vel_raw` -> `cmd_vel_gate` -> `/cmd_vel`
 
 Nav2 and fixed waypoint demos can stay as debugging tools, but they are not the formal competition path.
 
 The static map and visualization markers are only for RViz or CoStudio inspection. They do not participate in task decisions or control arbitration.
+
+## Topic Start And Velocity Gate
+
+The first competition bringup uses topic start instead of the chassis USER key. All nodes can be launched before the race for warm-up, but the chassis only receives zero velocity until the start topic is set.
+
+Velocity flow:
+
+```text
+/track_cmd_vel + /avoid_cmd_vel
+    ↓
+cmd_vel_mux
+    ↓
+/cmd_vel_raw
+    ↓
+cmd_vel_gate
+    ↓
+/cmd_vel
+    ↓
+chassis
+```
+
+`cmd_vel_gate` subscribes to `/competition/started` and `/competition/emergency_stop`. If `started=false`, if `emergency_stop=true`, or if `/cmd_vel_raw` times out, it publishes zero velocity to `/cmd_vel`. Only `started=true` and `emergency_stop=false` allow `/cmd_vel_raw` to pass through.
+
+Formal start command:
+
+```bash
+ros2 topic pub --once /competition/start_button std_msgs/msg/Bool "{data: true}"
+```
+
+The chassis USER key is not used as the formal start input in this version. On X5, `/dev/input/event*` does not observe the USER key, and `/UserKey_Value` maps to `Receive_Data.rx[22]`, which jumped during field testing instead of behaving as a stable button state. If a physical start button is needed later, prefer an external X5 GPIO button or a chassis firmware protocol update.
 
 ## Semantic Map
 
@@ -92,6 +122,8 @@ Inputs:
 - `/avoid_finished`
 - `/qrcode_detected/info_result`
 - `/bird_view/p_point_valid`
+- `/competition/started`
+- `/competition/emergency_stop`
 
 Outputs:
 
@@ -99,6 +131,7 @@ Outputs:
 - `/track_enable`
 - `/track_cmd_vel`
 - `/avoid_cmd_vel`
+- `/cmd_vel_raw`
 - `/cmd_vel`
 - `/mission_state`
 - `/perception_mode`
@@ -159,10 +192,25 @@ Safety: if `enable_base=true` and navigation plus `cmd_vel_mux` are running, the
 - QR detection: `qr_code_detection/qr_detection_node`
 - Bird View image interface: `vision_birdview/bird_view.launch.py`
 - Navigation state machine, target tracker, and semantic map visualization: `origincar_nav/competition_nav.launch.py`
+- Topic start node and velocity gate: `competition_button_node.py` and `cmd_vel_gate`
 
 It supports module switches: `enable_base`, `enable_camera`, `enable_yolo_avoid`, `enable_qr`, `enable_birdview`, `enable_nav`, `enable_visualization`, and `enable_cobridge`. `enable_cobridge` defaults to `false` because the web/rosbridge display bridge can conflict with separately started debugging tools.
 
 It also forwards `odom_topic` and `visualization_frame`. If no `map -> odom_combined` transform is available, the one-shot launch defaults visualization to `odom_combined`.
+
+Start-related launch parameters:
+
+- `button_backend:=topic` is the formal default.
+- `debug_mode:=false` keeps the formal competition flow.
+- `debug_start_state:=TRACK_TO_TASK_STATION`, `debug_route_direction:=clockwise`, `debug_channel_index:=0`, and `debug_goal_name:=""` are for pre-race single-point debugging.
+- `debug_auto_start:=false` means debug mode still waits for `/competition/start_button`; only set it to `true` for bench tests where automatic start is intentional.
+
+Example single-point debug launch:
+
+```bash
+ros2 launch origincar_bringup competition_bringup.launch.py enable_base:=false debug_mode:=true debug_goal_name:=channel_entry
+ros2 topic pub --once /competition/start_button std_msgs/msg/Bool "{data: true}"
+```
 
 Later modules such as image-to-text, channel visual correction, and Bird View local return can be added by including them in `competition_bringup.launch.py` without changing the formal navigation state machine.
 
@@ -204,6 +252,9 @@ ros2 topic echo /mission_state
 ros2 topic echo /perception_mode
 ros2 topic echo /current_goal
 ros2 topic hz /current_goal
+ros2 topic echo /competition/started --once
+ros2 topic echo /cmd_vel_raw --once
+ros2 topic echo /cmd_vel --once
 ros2 topic echo /vehicle_path
 ```
 

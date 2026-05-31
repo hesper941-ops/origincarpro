@@ -19,6 +19,11 @@ install(
   DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
+
+install(
+  PROGRAMS origincar_bringup/competition_button_node.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 # uncomment the following section in order to fill in

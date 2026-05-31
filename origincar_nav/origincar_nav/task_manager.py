@@ -13,6 +13,7 @@ from std_msgs.msg import Bool, String
 
 
 class MissionState(Enum):
+    WAIT_START = 'WAIT_START'
     INIT = 'INIT'
     TRACK_TO_TASK_STATION = 'TRACK_TO_TASK_STATION'
     TRACK_TO_CHANNEL_ENTRY = 'TRACK_TO_CHANNEL_ENTRY'
@@ -39,6 +40,12 @@ class TaskManager(Node):
         self.declare_parameter('qr_scan_start_dist_to_task_station', 1.0)
         self.declare_parameter('current_goal_republish_period_sec', 1.0)
         self.declare_parameter('debug_allow_numeric_qr_route', False)
+        self.declare_parameter('debug_mode', False)
+        self.declare_parameter('debug_start_state', 'TRACK_TO_TASK_STATION')
+        self.declare_parameter('debug_route_direction', 'clockwise')
+        self.declare_parameter('debug_channel_index', 0)
+        self.declare_parameter('debug_goal_name', '')
+        self.declare_parameter('debug_auto_start', False)
 
         self.semantic_map = self.load_semantic_map()
         self.map_frame = self.semantic_map.get('map_frame', self.get_parameter('map_frame').value)
@@ -55,8 +62,15 @@ class TaskManager(Node):
         self.current_goal_republish_period_sec = float(
             self.get_parameter('current_goal_republish_period_sec').value
         )
+        self.debug_mode = bool(self.get_parameter('debug_mode').value)
+        self.debug_start_state = str(self.get_parameter('debug_start_state').value)
+        self.debug_route_direction = str(self.get_parameter('debug_route_direction').value).lower()
+        self.debug_channel_index = int(self.get_parameter('debug_channel_index').value)
+        self.debug_goal_name = str(self.get_parameter('debug_goal_name').value)
 
-        self.state = MissionState.INIT
+        self.state = MissionState.WAIT_START
+        self.competition_started = bool(self.get_parameter('debug_auto_start').value)
+        self.debug_started = False
         self.route_direction = None
         self.channel_order = []
         self.channel_index = 0
@@ -80,6 +94,7 @@ class TaskManager(Node):
         self.create_subscription(Bool, '/avoid_active', self.avoid_active_callback, 10)
         self.create_subscription(Bool, '/avoid_finished', self.avoid_finished_callback, 10)
         self.create_subscription(Bool, '/bird_view/p_point_valid', self.birdview_valid_callback, 10)
+        self.create_subscription(Bool, '/competition/started', self.competition_started_callback, 10)
         self.create_subscription(Odometry, self.get_parameter('odom_topic').value, self.odom_callback, 10)
 
         rate = float(self.get_parameter('publish_rate_hz').value)
@@ -108,6 +123,21 @@ class TaskManager(Node):
             return {'points': {}, 'routes': {}, 'map_frame': self.get_parameter('map_frame').value}
 
     def tick(self):
+        if not self.competition_started:
+            if self.state != MissionState.WAIT_START:
+                self.set_state(MissionState.WAIT_START)
+            self.current_goal_name = None
+            self.last_published_goal_name = None
+            self.publish_track_enable(False)
+            self.publish_status('standby')
+            return
+
+        if self.state == MissionState.WAIT_START:
+            if self.debug_mode:
+                self.apply_debug_start()
+            else:
+                self.set_state(MissionState.INIT)
+
         if self.state == MissionState.INIT:
             self.set_state(MissionState.TRACK_TO_TASK_STATION)
 
@@ -117,24 +147,24 @@ class TaskManager(Node):
             return
 
         if self.state == MissionState.TRACK_TO_TASK_STATION:
-            self.publish_named_goal('task_station')
+            self.publish_named_goal(self.goal_name_for_state('task_station'))
             self.publish_track_enable(True)
             self.qr_scan_active = self.should_scan_qr()
             self.publish_status('qr_scan' if self.qr_scan_active else 'target_track')
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
-            self.publish_named_goal('channel_entry')
+            self.publish_named_goal(self.goal_name_for_state('channel_entry'))
             self.publish_track_enable(True)
             self.publish_status('target_track')
         elif self.state == MissionState.CHANNEL_NAV:
             self.publish_track_enable(True)
             self.publish_status('channel_visual_correction')
             if self.channel_index < len(self.channel_order):
-                self.publish_named_goal(self.channel_order[self.channel_index])
+                self.publish_named_goal(self.goal_name_for_state(self.channel_order[self.channel_index]))
             else:
                 self.set_state(MissionState.RETURN_PREPARE)
         elif self.state == MissionState.RETURN_PREPARE:
             self.publish_status('target_track')
-            self.publish_named_goal('p_start')
+            self.publish_named_goal(self.goal_name_for_state('p_start'))
             self.publish_track_enable(True)
             if self.birdview_valid:
                 self.set_state(MissionState.BIRDVIEW_RETURN)
@@ -156,6 +186,31 @@ class TaskManager(Node):
         if state != MissionState.TRACK_TO_TASK_STATION:
             self.qr_scan_active = False
         self.get_logger().info(f'Mission state -> {state.value}')
+
+    def apply_debug_start(self):
+        if self.debug_started:
+            return
+
+        self.route_direction = self.debug_route_direction
+        self.prepare_channel_route()
+        self.channel_index = max(0, min(self.debug_channel_index, len(self.channel_order)))
+
+        try:
+            self.set_state(MissionState[self.debug_start_state])
+        except KeyError:
+            self.get_logger().warn(
+                f'Unknown debug_start_state={self.debug_start_state}, using TRACK_TO_TASK_STATION'
+            )
+            self.set_state(MissionState.TRACK_TO_TASK_STATION)
+
+        if self.debug_goal_name:
+            self.publish_named_goal(self.debug_goal_name)
+        self.debug_started = True
+
+    def goal_name_for_state(self, default_name):
+        if self.debug_mode and self.debug_goal_name:
+            return self.debug_goal_name
+        return default_name
 
     def publish_status(self, perception_mode):
         self.state_pub.publish(String(data=self.state.value))
@@ -287,6 +342,11 @@ class TaskManager(Node):
 
     def birdview_valid_callback(self, msg):
         self.birdview_valid = bool(msg.data)
+
+    def competition_started_callback(self, msg):
+        self.competition_started = bool(msg.data)
+        if not self.competition_started:
+            self.debug_started = False
 
     def odom_callback(self, msg):
         self.current_x = msg.pose.pose.position.x
