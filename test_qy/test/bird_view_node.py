@@ -14,6 +14,8 @@ class PerspectiveNode(Node):
 
         # 打开摄像头
         self.cap = cv2.VideoCapture(0)
+        
+        self.click_point = None
 
         if not self.cap.isOpened():
             self.get_logger().error("Camera open failed")
@@ -31,6 +33,19 @@ class PerspectiveNode(Node):
         self.timer = self.create_timer(0.03, self.loop)
 
         self.get_logger().info("Perspective node started")
+
+        cv2.namedWindow("Bird View")
+        cv2.setMouseCallback("Bird View", self.mouse_callback)
+
+    def mouse_callback(self, event, x, y, flags, param):
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+
+            self.click_point = (x, y)
+
+            print("\n====================")
+            print(f"BirdView坐标: ({x},{y})")
+            print("====================")
 
     def loop(self):
 
@@ -54,7 +69,55 @@ class PerspectiveNode(Node):
         M = cv2.getPerspectiveTransform(self.src, dst)
 
         # 透视变换
+
         bird = cv2.warpPerspective(frame, M, (w, h))
+
+        # 小车原点
+        car_u = w // 2
+        car_v = h - 1
+
+        # 蓝点（理论车中心）
+        cv2.circle(
+            bird,
+            (car_u, car_v),
+            10,
+            (255,0,0),
+            -1
+        )
+
+        cv2.putText(
+            bird,
+            "CAR",
+            (car_u-30, car_v-20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255,0,0),
+            2
+        )
+        # 显示点击点
+
+        if self.click_point is not None:
+
+            x, y = self.click_point
+
+            cv2.circle(
+                bird,
+                (x, y),
+                8,
+                (0, 0, 255),
+                -1
+            )
+
+            cv2.putText(
+                bird,
+                f"({x},{y})",
+                (x + 10, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2
+            )
+
 
         # 原图画点
         for p in self.src:

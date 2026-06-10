@@ -9,7 +9,7 @@ from geometry_msgs.msg import Pose2D
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import Bool, Float32
-
+from ai_msgs.msg import PerceptionTargets
 
 def get_bool_param(value):
     if isinstance(value, str):
@@ -41,6 +41,17 @@ class PerspectiveNode(Node):
 
         self.src, self.dst, self.output_size = self.load_perspective_config()
         self.matrix = cv2.getPerspectiveTransform(self.src, self.dst)
+        # 保存最新检测到的 end 中心
+        self.latest_end = None
+
+        # YOLO检测结果
+        self.det_sub = self.create_subscription(
+            PerceptionTargets,
+            '/hobot_dnn_detection',
+            self.det_callback,
+            10
+        )
+
 
         self.image_sub = self.create_subscription(
             Image,
@@ -60,6 +71,7 @@ class PerspectiveNode(Node):
         self.heading_error_pub = self.create_publisher(Float32, '/bird_view/heading_error', 10)
 
         self.interface_timer = self.create_timer(0.5, self.publish_return_interface)
+        
 
     def load_perspective_config(self):
         default_src = np.float32([
@@ -101,6 +113,32 @@ class PerspectiveNode(Node):
             self.get_logger().warn(f'Failed to load perspective config {path}: {exc}')
             return default_src, default_dst, default_size
 
+    def det_callback(self, msg):
+
+        self.latest_end = None
+
+        for target in msg.targets:
+
+            if target.type != "end":
+                continue
+
+            if len(target.rois) == 0:
+                continue
+
+            roi = target.rois[0]
+
+            x = roi.rect.x_offset
+            y = roi.rect.y_offset
+            w = roi.rect.width
+            h = roi.rect.height
+
+            cx = x + w * 0.5
+            cy = y + h * 0.5
+
+            self.latest_end = (cx, cy)
+
+            break
+
     def image_callback(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -111,6 +149,57 @@ class PerspectiveNode(Node):
         out_width = int(self.output_size[0]) if self.output_size else frame.shape[1]
         out_height = int(self.output_size[1]) if self.output_size else frame.shape[0]
         bird = cv2.warpPerspective(frame, self.matrix, (out_width, out_height))
+
+        p_valid = False
+        p_pose = Pose2D()
+
+        if self.latest_end is not None:
+
+            cx, cy = self.latest_end
+
+            src_pt = np.array(
+                [[[cx, cy]]],
+                dtype=np.float32
+            )
+
+            bird_pt = cv2.perspectiveTransform(
+                src_pt,
+                self.matrix
+            )
+
+            u = bird_pt[0][0][0]
+            v = bird_pt[0][0][1]
+
+            cv2.circle(
+                bird,
+                (int(u), int(v)),
+                8,
+                (0, 0, 255),
+                -1
+            )
+
+            cv2.putText(
+                bird,
+                "P",
+                (int(u) + 10, int(v)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2
+            )      
+            car_u = 320     #逆透视框中底部中心坐标x轴
+            car_v = 475     #逆透视框中底部中心坐标y轴
+
+            scale = 0.01 / 219      #逆透视比例尺
+
+            dx_pixel = u - car_u
+            dy_pixel = car_v - v
+
+            p_pose.x = dy_pixel * scale + 0.085      #逆透视框中底部中心与车前端距离8.5cm
+            p_pose.y = dx_pixel * scale             #这里单位是米
+
+
+            p_valid = True
 
         if self.show_window:
             cv2.imshow('bird_view', bird)
@@ -125,9 +214,15 @@ class PerspectiveNode(Node):
             compressed_msg.header = msg.header
             self.compressed_pub.publish(compressed_msg)
 
+        self.p_valid_pub.publish(
+            Bool(data=p_valid)
+        )
+
+        self.p_pose_pub.publish(
+            p_pose
+        )
+
     def publish_return_interface(self):
-        self.p_valid_pub.publish(Bool(data=self.enable_dummy_output))
-        self.p_pose_pub.publish(Pose2D())
         self.line_error_pub.publish(Float32(data=0.0))
         self.heading_error_pub.publish(Float32(data=0.0))
 

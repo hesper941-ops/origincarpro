@@ -44,9 +44,9 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(
-                    get_package_share_directory('yolov8_test_mplus0'),
+                    get_package_share_directory('origincar_avoid'),
                     'launch',
-                    'yolov8_detect.launch.py',
+                    'detect.launch.py',
                 )
             ),
             launch_arguments={

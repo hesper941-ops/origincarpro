@@ -69,6 +69,8 @@ def generate_launch_description():
             package='origincar_bringup',
             executable='competition_button_node.py',
             output='screen',
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[{
                 'button_backend': button_backend,
                 'debug_auto_start': debug_auto_start,

@@ -7,9 +7,6 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import CompressedImage
-from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool
-
 from ai_msgs.msg import PerceptionTargets
 
 
@@ -26,52 +23,31 @@ class YoloBoxViewer(Node):
         self.declare_parameter('jpeg_quality', 80)
 
         # =========================
-        # YOLO 避障输出话题
-        # 注意：这里不再直接发布 /cmd_vel
+        # 可视化参考参数
+        # 这里只用于画触发线和显示文字，不控制小车
         # =========================
-        self.declare_parameter('yolo_cmd_vel_topic', '/yolo_cmd_vel')
-        self.declare_parameter('yolo_avoid_active_topic', '/yolo_avoid_active')
-
-        # =========================
-        # 避障判断参数
-        # =========================
-
-        # 红线超过画面高度多少比例后开始避障
-        # 0.65 表示红线到达画面下方 65% 以后开始避障
         self.declare_parameter('avoid_start_y_ratio', 0.65)
-
-        # 中心死区，防止判断左右时太敏感
-        # 0.08 表示画面宽度的 8%
         self.declare_parameter('center_deadzone_ratio', 0.08)
-
-        # 避障时前进速度
-        self.declare_parameter('linear_speed', 0.15)
-
-        # 避障时转向速度
-        self.declare_parameter('turn_speed', 0.45)
-
-        # 没检测到 roadblock 时是否让 YOLO 自己继续前进
-        # 注意：和 NAV2 结合时，建议这里保持 False
-        # 因为没有障碍物时应该交给 NAV2 控制
-        self.declare_parameter('forward_when_no_roadblock', False)
+        self.declare_parameter('obstacle_labels', ['roadblock'])
 
         self.image_topic = self.get_parameter('image_topic').value
         self.detection_topic = self.get_parameter('detection_topic').value
         self.output_topic = self.get_parameter('output_compressed_topic').value
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
 
-        self.yolo_cmd_vel_topic = self.get_parameter('yolo_cmd_vel_topic').value
-        self.yolo_avoid_active_topic = self.get_parameter('yolo_avoid_active_topic').value
-
-        self.avoid_start_y_ratio = float(self.get_parameter('avoid_start_y_ratio').value)
-        self.center_deadzone_ratio = float(self.get_parameter('center_deadzone_ratio').value)
-        self.linear_speed = float(self.get_parameter('linear_speed').value)
-        self.turn_speed = float(self.get_parameter('turn_speed').value)
-
-        self.forward_when_no_roadblock = bool(
-            self.get_parameter('forward_when_no_roadblock').value
+        self.avoid_start_y_ratio = float(
+            self.get_parameter('avoid_start_y_ratio').value
+        )
+        self.center_deadzone_ratio = float(
+            self.get_parameter('center_deadzone_ratio').value
         )
 
+        self.obstacle_labels = {
+            str(label).strip().lower()
+            for label in self.get_parameter('obstacle_labels').value
+        }
+
+        # 保存最近一次 YOLO 检测结果
         self.latest_targets = []
 
         # =========================
@@ -103,40 +79,21 @@ class YoloBoxViewer(Node):
             10
         )
 
-        # =========================
-        # 发布 YOLO 避障速度
-        # 注意：发布到 /yolo_cmd_vel，不是 /cmd_vel
-        # =========================
-        self.yolo_cmd_pub = self.create_publisher(
-            Twist,
-            self.yolo_cmd_vel_topic,
-            10
-        )
-
-        # =========================
-        # 发布 YOLO 是否接管控制权
-        # True  ：cmd_vel_mux 使用 YOLO 速度
-        # False ：cmd_vel_mux 使用 NAV2 速度
-        # =========================
-        self.yolo_active_pub = self.create_publisher(
-            Bool,
-            self.yolo_avoid_active_topic,
-            10
-        )
-
+        self.get_logger().info('yolo_box_viewer started')
+        self.get_logger().info('Mode: visualization only')
         self.get_logger().info(f'Input image topic: {self.image_topic}')
         self.get_logger().info(f'Detection topic: {self.detection_topic}')
         self.get_logger().info(f'Output compressed topic: {self.output_topic}')
-        self.get_logger().info(f'YOLO cmd vel topic: {self.yolo_cmd_vel_topic}')
-        self.get_logger().info(f'YOLO avoid active topic: {self.yolo_avoid_active_topic}')
-        self.get_logger().info(f'Linear speed: {self.linear_speed}')
-        self.get_logger().info(f'Turn speed: {self.turn_speed}')
+        self.get_logger().info('This node does NOT publish /cmd_vel, /yolo_cmd_vel, or /yolo_avoid_active')
 
     def detection_callback(self, msg):
+        """
+        接收 YOLO 检测结果，只保存目标信息，不做控制。
+        """
         targets = []
 
         for target in msg.targets:
-            target_type = str(target.type)
+            target_type = str(target.type).strip()
 
             for roi in target.rois:
                 rect = roi.rect
@@ -161,41 +118,11 @@ class YoloBoxViewer(Node):
 
         self.latest_targets = targets
 
-    def publish_yolo_active(self, active):
-        """
-        发布 YOLO 是否接管控制权。
-        """
-        msg = Bool()
-        msg.data = bool(active)
-        self.yolo_active_pub.publish(msg)
-
-    def publish_cmd(self, linear_x, angular_z):
-        """
-        发布 YOLO 避障速度。
-
-        注意：
-        这里发布的是 /yolo_cmd_vel，
-        不再直接发布 /cmd_vel。
-        """
-        cmd = Twist()
-
-        cmd.linear.x = float(linear_x)
-        cmd.linear.y = 0.0
-        cmd.linear.z = 0.0
-
-        cmd.angular.x = 0.0
-        cmd.angular.y = 0.0
-        cmd.angular.z = float(angular_z)
-
-        self.yolo_cmd_pub.publish(cmd)
-
-    def stop_yolo_cmd(self):
-        """
-        发布 YOLO 停车速度。
-        """
-        self.publish_cmd(0.0, 0.0)
-
     def image_callback(self, msg):
+        """
+        接收压缩图像，在图像上画 YOLO 结果，然后重新发布。
+        这个函数不发布任何速度控制。
+        """
         data = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
 
@@ -209,30 +136,30 @@ class YoloBoxViewer(Node):
         avoid_start_y = frame_h * self.avoid_start_y_ratio
         deadzone = frame_w * self.center_deadzone_ratio
 
-        # 用来记录最靠近车的 roadblock
-        # 画面坐标里，y 越大表示越靠近画面底部
+        # 记录最靠近车的 roadblock
+        # 图像坐标中 y 越大，越靠近画面底部
         nearest_roadblock = None
         max_bottom_y = -1
 
-        avoid_action = 'nav2 control'
-        yolo_active = False
+        display_action = 'no roadblock'
 
         # =========================
         # 遍历 YOLO 检测目标
         # =========================
         for t in self.latest_targets:
-            x1 = max(0, t['x'])
-            y1 = max(0, t['y'])
-            x2 = min(frame_w - 1, t['x'] + t['w'])
-            y2 = min(frame_h - 1, t['y'] + t['h'])
+            x1 = max(0, int(t['x']))
+            y1 = max(0, int(t['y']))
+            x2 = min(frame_w - 1, int(t['x'] + t['w']))
+            y2 = min(frame_h - 1, int(t['y'] + t['h']))
 
-            label = t['label']
-            score = t['score']
+            label = str(t['label']).strip()
+            label_lower = label.lower()
+            score = float(t['score'])
 
             # =========================
-            # roadblock：只画底部红线
+            # roadblock / 锥形筒：只画底部红线
             # =========================
-            if label == 'roadblock':
+            if label_lower in self.obstacle_labels:
                 bottom_y = y2
                 red_center_x = (x1 + x2) / 2.0
 
@@ -247,6 +174,7 @@ class YoloBoxViewer(Node):
                         'y1': y1,
                         'y2': y2,
                         'score': score,
+                        'label': label,
                     }
 
                 # 画 roadblock 底部红线
@@ -302,7 +230,7 @@ class YoloBoxViewer(Node):
                 )
 
         # =========================
-        # 画画面中心线和避障触发线
+        # 画画面中心线
         # =========================
         cv2.line(
             frame,
@@ -312,6 +240,10 @@ class YoloBoxViewer(Node):
             1
         )
 
+        # =========================
+        # 画避障参考触发线
+        # 注意：这里只是显示参考线，不控制小车
+        # =========================
         cv2.line(
             frame,
             (0, int(avoid_start_y)),
@@ -321,62 +253,35 @@ class YoloBoxViewer(Node):
         )
 
         # =========================
-        # 避障逻辑
+        # 只生成显示文字，不发布速度
         # =========================
         if nearest_roadblock is not None:
             red_center_x = nearest_roadblock['center_x']
             red_bottom_y = nearest_roadblock['bottom_y']
 
-            # 只有红线超过设定 Y 值，才让 YOLO 接管控制
+            offset = red_center_x - frame_center_x
+
             if red_bottom_y >= avoid_start_y:
-                yolo_active = True
-                offset = red_center_x - frame_center_x
-
-                # 红线中心在画面左边：障碍物在左边，小车向右转
                 if offset < -deadzone:
-                    self.publish_cmd(self.linear_speed, -self.turn_speed)
-                    avoid_action = 'YOLO active: roadblock left -> turn right'
-
-                # 红线中心在画面右边：障碍物在右边，小车向左转
+                    display_action = 'near obstacle: left side'
                 elif offset > deadzone:
-                    self.publish_cmd(self.linear_speed, self.turn_speed)
-                    avoid_action = 'YOLO active: roadblock right -> turn left'
-
-                # 红线中心接近画面中心：默认向左转
+                    display_action = 'near obstacle: right side'
                 else:
-                    self.publish_cmd(self.linear_speed, self.turn_speed)
-                    avoid_action = 'YOLO active: roadblock center -> turn left'
-
+                    display_action = 'near obstacle: center'
             else:
-                # 检测到 roadblock，但是还没到避障距离
-                # 这时候不接管，继续让 NAV2 控制
-                yolo_active = False
-                self.stop_yolo_cmd()
-                avoid_action = 'roadblock far -> NAV2 control'
-
-        else:
-            # 没有检测到 roadblock
-            # 默认不接管，交给 NAV2
-            yolo_active = False
-
-            if self.forward_when_no_roadblock:
-                # 如果你想不用 NAV2，仅靠 YOLO 直行，可以把参数改 True
-                yolo_active = True
-                self.publish_cmd(self.linear_speed, 0.0)
-                avoid_action = 'YOLO active: no roadblock -> forward'
-            else:
-                self.stop_yolo_cmd()
-                avoid_action = 'no roadblock -> NAV2 control'
-
-        # 发布 YOLO 是否接管
-        self.publish_yolo_active(yolo_active)
+                if offset < -deadzone:
+                    display_action = 'far obstacle: left side'
+                elif offset > deadzone:
+                    display_action = 'far obstacle: right side'
+                else:
+                    display_action = 'far obstacle: center'
 
         # =========================
         # 显示调试信息
         # =========================
         cv2.putText(
             frame,
-            'YOLOv8 X5',
+            'YOLOv8 X5 Viewer',
             (10, 25),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -386,7 +291,7 @@ class YoloBoxViewer(Node):
 
         cv2.putText(
             frame,
-            f'avoid: {avoid_action}',
+            'mode: visualization only',
             (10, 55),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -396,7 +301,7 @@ class YoloBoxViewer(Node):
 
         cv2.putText(
             frame,
-            f'yolo_active: {yolo_active}',
+            f'obstacle: {display_action}',
             (10, 85),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -432,6 +337,7 @@ class YoloBoxViewer(Node):
         out.header = msg.header
         out.format = 'jpeg'
         out.data = encoded.tobytes()
+
         self.result_pub.publish(out)
 
 
@@ -444,10 +350,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # 退出前让 YOLO 放弃控制权，并发布停车速度
-        node.publish_yolo_active(False)
-        node.stop_yolo_cmd()
-
         node.destroy_node()
         rclpy.shutdown()
 

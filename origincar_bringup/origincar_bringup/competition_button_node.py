@@ -27,11 +27,13 @@ class CompetitionButtonNode(Node):
             self.get_parameter('started_topic').value,
             10,
         )
+
         self.emergency_pub = self.create_publisher(
             Bool,
             self.get_parameter('emergency_stop_topic').value,
             10,
         )
+
         self.create_subscription(
             Bool,
             self.get_parameter('emergency_stop_topic').value,
@@ -65,34 +67,88 @@ class CompetitionButtonNode(Node):
         rate = float(self.get_parameter('publish_rate_hz').value)
         self.timer = self.create_timer(1.0 / max(rate, 1.0), self.publish_state)
 
+        self.get_logger().info(
+            f'competition_button_node started, backend={self.button_backend}, '
+            f'auto_start={self.started}'
+        )
+
+    def safe_publish(self, publisher, msg, topic_name):
+        try:
+            publisher.publish(msg)
+            return True
+        except Exception as e:
+            self.get_logger().warn(f'Failed to publish {topic_name}: {e}')
+            return False
+
     def start_button_callback(self, msg):
         if msg.data:
             self.started = True
+            self.emergency_stop = False
+            self.get_logger().info('Competition started by topic button.')
 
     def reset_button_callback(self, msg):
         if msg.data:
             self.started = False
+            self.emergency_stop = False
+            self.get_logger().info('Competition reset by topic button.')
 
     def emergency_stop_callback(self, msg):
         self.emergency_stop = bool(msg.data)
+        if self.emergency_stop:
+            self.started = False
+            self.get_logger().warn('Emergency stop received.')
 
     def publish_state(self):
-        self.started_pub.publish(Bool(data=self.started))
-        self.emergency_pub.publish(Bool(data=self.emergency_stop))
+        self.safe_publish(
+            self.started_pub,
+            Bool(data=self.started),
+            '/competition/started',
+        )
+
+        self.safe_publish(
+            self.emergency_pub,
+            Bool(data=self.emergency_stop),
+            '/competition/emergency_stop',
+        )
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = CompetitionButtonNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        try:
+            node.get_logger().error(f'competition_button_node crashed: {e}')
+        except Exception:
+            pass
     finally:
-        node.started_pub.publish(Bool(data=False))
-        node.emergency_pub.publish(Bool(data=True))
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.safe_publish(
+                node.started_pub,
+                Bool(data=False),
+                '/competition/started',
+            )
+            node.safe_publish(
+                node.emergency_pub,
+                Bool(data=True),
+                '/competition/emergency_stop',
+            )
+        except Exception:
+            pass
+
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

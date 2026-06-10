@@ -12,10 +12,22 @@ find_package(std_msgs REQUIRED)
 
 install(PROGRAMS
   scripts/teleop_smooth_ros2.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME teleop_smooth_ros2
+)
+
+install(PROGRAMS
   scripts/cmd_vel_mux.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME cmd_vel_mux
+)
+
+install(PROGRAMS
   scripts/yolo_box_viewer.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME yolo_box_viewer
 )
+
 execute_process(COMMAND chmod -R +x ${CMAKE_CURRENT_SOURCE_DIR}/scripts/teleop_smooth_ros2.py)
 execute_process(COMMAND chmod -R +x ${CMAKE_CURRENT_SOURCE_DIR}/scripts/cmd_vel_mux.py)
 execute_process(COMMAND chmod -R +x ${CMAKE_CURRENT_SOURCE_DIR}/scripts/yolo_box_viewer.py)

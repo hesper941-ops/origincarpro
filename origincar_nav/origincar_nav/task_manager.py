@@ -12,6 +12,11 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
 
+ANSI_GREEN = '\033[92m'
+ANSI_BOLD = '\033[1m'
+ANSI_RESET = '\033[0m'
+
+
 class MissionState(Enum):
     WAIT_START = 'WAIT_START'
     INIT = 'INIT'
@@ -39,7 +44,7 @@ class TaskManager(Node):
         self.declare_parameter('publish_rate_hz', 2.0)
         self.declare_parameter('qr_scan_start_dist_to_task_station', 1.0)
         self.declare_parameter('current_goal_republish_period_sec', 1.0)
-        self.declare_parameter('debug_allow_numeric_qr_route', False)
+        self.declare_parameter('debug_allow_numeric_qr_route', True)
         self.declare_parameter('debug_mode', False)
         self.declare_parameter('debug_start_state', 'TRACK_TO_TASK_STATION')
         self.declare_parameter('debug_route_direction', 'clockwise')
@@ -47,15 +52,20 @@ class TaskManager(Node):
         self.declare_parameter('debug_goal_name', '')
         self.declare_parameter('debug_auto_start', False)
 
+        # 新增：二维码内容无法解析方向时，默认走哪个方向
+        self.declare_parameter('default_route_direction', 'clockwise')
+
         self.semantic_map = self.load_semantic_map()
         self.map_frame = self.semantic_map.get('map_frame', self.get_parameter('map_frame').value)
         self.points = self.semantic_map.get('points', {})
         self.routes = self.semantic_map.get('routes', {})
+
         task_thresholds = self.semantic_map.get('task_manager', {})
         self.qr_scan_start_dist_to_task_station = float(
             self.get_parameter('qr_scan_start_dist_to_task_station').value
             or task_thresholds.get('qr_scan_start_dist_to_task_station', 1.0)
         )
+
         self.debug_allow_numeric_qr_route = bool(
             self.get_parameter('debug_allow_numeric_qr_route').value
         )
@@ -67,6 +77,16 @@ class TaskManager(Node):
         self.debug_route_direction = str(self.get_parameter('debug_route_direction').value).lower()
         self.debug_channel_index = int(self.get_parameter('debug_channel_index').value)
         self.debug_goal_name = str(self.get_parameter('debug_goal_name').value)
+
+        self.default_route_direction = str(
+            self.get_parameter('default_route_direction').value
+        ).strip().lower()
+
+        if self.default_route_direction not in ('clockwise', 'anticlockwise'):
+            self.get_logger().warn(
+                f'Invalid default_route_direction={self.default_route_direction}, use clockwise'
+            )
+            self.default_route_direction = 'clockwise'
 
         self.state = MissionState.WAIT_START
         self.competition_started = bool(self.get_parameter('debug_auto_start').value)
@@ -84,10 +104,17 @@ class TaskManager(Node):
         self.current_y = None
         self.qr_scan_active = False
 
+        # 新增：防止同一个二维码短时间内重复触发
+        self.qr_already_used = False
+
         self.goal_pub = self.create_publisher(PoseStamped, '/current_goal', 10)
         self.track_enable_pub = self.create_publisher(Bool, '/track_enable', 10)
         self.state_pub = self.create_publisher(String, '/mission_state', 10)
         self.perception_pub = self.create_publisher(String, '/perception_mode', 10)
+
+        # 新增：任务事件广播。
+        # 终端会用绿色打印，同时也会发布到 /mission_event，方便你 ros2 topic echo 查看。
+        self.mission_event_pub = self.create_publisher(String, '/mission_event', 10)
 
         self.create_subscription(Bool, '/goal_reached', self.goal_reached_callback, 10)
         self.create_subscription(String, '/qrcode_detected/info_result', self.qr_callback, 10)
@@ -99,6 +126,15 @@ class TaskManager(Node):
 
         rate = float(self.get_parameter('publish_rate_hz').value)
         self.timer = self.create_timer(1.0 / max(rate, 0.5), self.tick)
+
+    def broadcast_green(self, text):
+        """在终端用绿色醒目提示，并同步发布到 /mission_event。"""
+        message = str(text)
+        self.get_logger().info(f'{ANSI_GREEN}{ANSI_BOLD}{message}{ANSI_RESET}')
+
+        # mission_event_pub 在 __init__ 后才存在；加保护避免初始化阶段异常。
+        if hasattr(self, 'mission_event_pub'):
+            self.mission_event_pub.publish(String(data=message))
 
     def load_semantic_map(self):
         path = self.get_parameter('semantic_map_file').value
@@ -120,14 +156,21 @@ class TaskManager(Node):
             return data
         except Exception as exc:
             self.get_logger().warn(f'Failed to load semantic map {path}: {exc}')
-            return {'points': {}, 'routes': {}, 'map_frame': self.get_parameter('map_frame').value}
+            return {
+                'points': {},
+                'routes': {},
+                'map_frame': self.get_parameter('map_frame').value,
+            }
 
     def tick(self):
         if not self.competition_started:
             if self.state != MissionState.WAIT_START:
                 self.set_state(MissionState.WAIT_START)
+
             self.current_goal_name = None
             self.last_published_goal_name = None
+            self.qr_already_used = False
+
             self.publish_track_enable(False)
             self.publish_status('standby')
             return
@@ -139,6 +182,7 @@ class TaskManager(Node):
                 self.set_state(MissionState.INIT)
 
         if self.state == MissionState.INIT:
+            self.qr_already_used = False
             self.set_state(MissionState.TRACK_TO_TASK_STATION)
 
         if self.avoid_active:
@@ -149,28 +193,39 @@ class TaskManager(Node):
         if self.state == MissionState.TRACK_TO_TASK_STATION:
             self.publish_named_goal(self.goal_name_for_state('task_station'))
             self.publish_track_enable(True)
+
+            # 这个只影响 perception_mode 的显示，不再限制二维码是否能触发下一目标
             self.qr_scan_active = self.should_scan_qr()
             self.publish_status('qr_scan' if self.qr_scan_active else 'target_track')
+
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
             self.publish_named_goal(self.goal_name_for_state('channel_entry'))
             self.publish_track_enable(True)
             self.publish_status('target_track')
+
         elif self.state == MissionState.CHANNEL_NAV:
             self.publish_track_enable(True)
             self.publish_status('channel_visual_correction')
+
             if self.channel_index < len(self.channel_order):
-                self.publish_named_goal(self.goal_name_for_state(self.channel_order[self.channel_index]))
+                self.publish_named_goal(
+                    self.goal_name_for_state(self.channel_order[self.channel_index])
+                )
             else:
                 self.set_state(MissionState.RETURN_PREPARE)
+
         elif self.state == MissionState.RETURN_PREPARE:
             self.publish_status('target_track')
             self.publish_named_goal(self.goal_name_for_state('p_start'))
             self.publish_track_enable(True)
+
             if self.birdview_valid:
                 self.set_state(MissionState.BIRDVIEW_RETURN)
+
         elif self.state == MissionState.BIRDVIEW_RETURN:
             self.publish_track_enable(False)
             self.publish_status('birdview_return')
+
         elif self.state == MissionState.FINISH:
             self.publish_track_enable(False)
             self.publish_status('idle')
@@ -180,12 +235,15 @@ class TaskManager(Node):
     def set_state(self, state):
         if self.state == state:
             return
+
         self.state = state
         self.last_published_goal_name = None
         self.last_goal_reached = False
+
         if state != MissionState.TRACK_TO_TASK_STATION:
             self.qr_scan_active = False
-        self.get_logger().info(f'Mission state -> {state.value}')
+
+        self.broadcast_green(f'📍 任务状态切换 -> {state.value}')
 
     def apply_debug_start(self):
         if self.debug_started:
@@ -205,6 +263,7 @@ class TaskManager(Node):
 
         if self.debug_goal_name:
             self.publish_named_goal(self.debug_goal_name)
+
         self.debug_started = True
 
     def goal_name_for_state(self, default_name):
@@ -234,6 +293,13 @@ class TaskManager(Node):
         self.goal_pub.publish(self.pose_from_point(name))
         self.last_goal_republish_time = self.now_sec()
 
+        pose = self.points[name].get('pose', [0.0, 0.0, 0.0])
+        yaw = float(pose[2]) if len(pose) > 2 else 0.0
+        self.broadcast_green(
+            f'🚗 前往目标点 -> {name}  '
+            f'x={float(pose[0]):.2f}, y={float(pose[1]):.2f}, yaw={yaw:.2f}'
+        )
+
     def republish_current_goal(self):
         if self.current_goal_name and self.current_goal_name in self.points:
             self.goal_pub.publish(self.pose_from_point(self.current_goal_name))
@@ -247,8 +313,10 @@ class TaskManager(Node):
             MissionState.CHANNEL_NAV,
             MissionState.RETURN_PREPARE,
         }
+
         if self.state not in tracking_states or not self.current_goal_name:
             return
+
         if self.current_goal_name not in self.points:
             return
 
@@ -258,15 +326,20 @@ class TaskManager(Node):
 
     def pose_from_point(self, name):
         pose = self.points[name].get('pose', [0.0, 0.0, 0.0])
+
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
+
         msg.pose.position.x = float(pose[0])
         msg.pose.position.y = float(pose[1])
         msg.pose.position.z = 0.0
-        qz, qw = quaternion_from_yaw(float(pose[2]) if len(pose) > 2 else 0.0)
+
+        yaw = float(pose[2]) if len(pose) > 2 else 0.0
+        qz, qw = quaternion_from_yaw(yaw)
         msg.pose.orientation.z = qz
         msg.pose.orientation.w = qw
+
         return msg
 
     def goal_reached_callback(self, msg):
@@ -274,58 +347,115 @@ class TaskManager(Node):
             return
 
         self.last_goal_reached = True
+
+        finished_goal = self.current_goal_name or 'unknown'
+        self.broadcast_green(f'✅ 完成目标点 -> {finished_goal}')
+
         if self.state == MissionState.TRACK_TO_TASK_STATION:
+            # 到达任务站但还没识别到二维码时，不切下一目标，继续等待二维码
             self.qr_scan_active = True
             self.last_goal_reached = False
+
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
             self.prepare_channel_route()
             self.set_state(MissionState.CHANNEL_NAV)
+
         elif self.state == MissionState.CHANNEL_NAV:
             self.channel_index += 1
+
             if self.channel_index >= len(self.channel_order):
                 self.set_state(MissionState.RETURN_PREPARE)
             else:
                 self.last_goal_reached = False
+
         elif self.state == MissionState.RETURN_PREPARE:
             self.set_state(MissionState.FINISH)
 
     def qr_callback(self, msg):
-        if self.state != MissionState.TRACK_TO_TASK_STATION or not self.qr_scan_active:
+        """
+        关键改动：
+        一旦在 TRACK_TO_TASK_STATION 阶段识别到二维码，
+        不管二维码内容是不是标准方向，都立刻前往 channel_entry。
+        """
+
+        if self.state != MissionState.TRACK_TO_TASK_STATION:
             return
-        direction = self.parse_direction(msg.data)
+
+        if self.qr_already_used:
+            return
+
+        qr_text = str(msg.data).strip()
+        if not qr_text:
+            return
+
+        self.qr_already_used = True
+
+        self.broadcast_green(f'🔎 识别到二维码 -> {qr_text}，立即切换下一个目标')
+
+        direction = self.parse_direction(qr_text)
+
         if direction is None:
-            return
+            self.get_logger().warn(
+                f'QR content "{qr_text}" is not a valid route direction, '
+                f'use default route direction: {self.default_route_direction}'
+            )
+            direction = self.default_route_direction
+
         self.route_direction = direction
-        if self.state == MissionState.TRACK_TO_TASK_STATION:
-            self.prepare_channel_route()
-            self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY)
-            self.publish_named_goal('channel_entry')
+        self.prepare_channel_route()
+        self.broadcast_green(
+            f'🧭 路线方向 -> {direction}，通道顺序 -> {self.channel_order}'
+        )
+
+        # 立刻切换到下一个目标点
+        self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY)
+        self.publish_named_goal('channel_entry')
+        self.publish_track_enable(True)
+        self.publish_status('target_track')
 
     def parse_direction(self, text):
         normalized = str(text).strip().lower()
+
         if normalized in ('clockwise', 'clock wise'):
             return 'clockwise'
-        if normalized in ('anticlockwise', 'anti-clockwise', 'anti clockwise', 'counterclockwise'):
+
+        if normalized in (
+            'anticlockwise',
+            'anti-clockwise',
+            'anti clockwise',
+            'counterclockwise',
+            'counter-clockwise',
+            'counter clockwise',
+        ):
             return 'anticlockwise'
-        if normalized == '顺时针':
+
+        if normalized in ('顺时针', '順時針'):
             return 'clockwise'
-        if normalized == '逆时针':
+
+        if normalized in ('逆时针', '逆時針'):
             return 'anticlockwise'
+
         if self.debug_allow_numeric_qr_route:
             try:
                 value = int(normalized)
-                self.get_logger().warn('Using debug numeric QR route fallback; this is not the formal rule')
-                return 'clockwise' if value % 2 else 'anticlockwise'
             except ValueError:
                 pass
+            else:
+                self.get_logger().warn(
+                    'Using debug numeric QR route fallback; this is not the formal rule'
+                )
+                return 'clockwise' if value % 2 else 'anticlockwise'
+
         self.get_logger().warn(f'Unknown QR route content: {text}')
         return None
 
     def prepare_channel_route(self):
-        direction = self.route_direction or 'clockwise'
+        direction = self.route_direction or self.default_route_direction
+
         route = self.routes.get(direction, {})
         self.channel_order = list(route.get('channel_order', []))
         self.channel_index = 0
+
         if not self.channel_order:
             self.get_logger().warn(f'No channel route configured for {direction}')
 
@@ -337,6 +467,7 @@ class TaskManager(Node):
             self.avoid_active = False
             self.last_goal_reached = False
             self.last_published_goal_name = None
+            self.broadcast_green('🟢 避障结束，恢复当前目标跟踪')
             self.republish_current_goal()
             self.publish_track_enable(True)
 
@@ -345,8 +476,10 @@ class TaskManager(Node):
 
     def competition_started_callback(self, msg):
         self.competition_started = bool(msg.data)
+
         if not self.competition_started:
             self.debug_started = False
+            self.qr_already_used = False
 
     def odom_callback(self, msg):
         self.current_x = msg.pose.pose.position.x
@@ -355,11 +488,17 @@ class TaskManager(Node):
     def should_scan_qr(self):
         if self.current_x is None or self.current_y is None:
             return False
+
         task_station = self.points.get('task_station')
         if not task_station:
             return False
+
         pose = task_station.get('pose', [0.0, 0.0, 0.0])
-        distance = math.hypot(float(pose[0]) - self.current_x, float(pose[1]) - self.current_y)
+        distance = math.hypot(
+            float(pose[0]) - self.current_x,
+            float(pose[1]) - self.current_y,
+        )
+
         return distance <= self.qr_scan_start_dist_to_task_station
 
     def now_sec(self):
@@ -369,6 +508,7 @@ class TaskManager(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TaskManager()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
