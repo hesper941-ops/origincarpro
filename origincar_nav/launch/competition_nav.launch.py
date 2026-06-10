@@ -29,6 +29,7 @@ def generate_launch_description():
     debug_goal_name = LaunchConfiguration('debug_goal_name')
     debug_auto_start = LaunchConfiguration('debug_auto_start')
     enable_birdview_return = LaunchConfiguration('enable_birdview_return')
+    yaw_offset_deg = LaunchConfiguration('yaw_offset_deg')
 
     return LaunchDescription([
         DeclareLaunchArgument('semantic_map_file', default_value=default_map),
@@ -48,6 +49,7 @@ def generate_launch_description():
         DeclareLaunchArgument('debug_goal_name', default_value=''),
         DeclareLaunchArgument('debug_auto_start', default_value='false'),
         DeclareLaunchArgument('enable_birdview_return', default_value='false'),
+        DeclareLaunchArgument('yaw_offset_deg', default_value='0.0'),
         Node(
             package='origincar_nav',
             executable='task_manager',
@@ -74,6 +76,7 @@ def generate_launch_description():
                 'cmd_topic': '/track_cmd_vel',
                 'enable_topic': '/track_enable',
                 'semantic_map_file': semantic_map_file,
+                'yaw_offset_deg': yaw_offset_deg,
             }],
         ),
         Node(

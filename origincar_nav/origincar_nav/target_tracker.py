@@ -155,6 +155,9 @@ class TargetTracker(Node):
         # =========================
         self.declare_parameter('semantic_map_file', '')
         self.declare_parameter('odom_origin_mode', 'p_start_map')
+        # Compensates a fixed yaw bias between /odom_combined and the semantic map.
+        # Official placement: car nose points to map +X, so yaw should be 0 deg.
+        self.declare_parameter('yaw_offset_deg', 0.0)
         self.declare_parameter('control_rate_hz', 20.0)
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('goal_topic', '/current_goal')
@@ -208,6 +211,8 @@ class TargetTracker(Node):
         thresholds = self.semantic_map.get('thresholds', {})
         self.odom_origin_mode = str(self.get_parameter('odom_origin_mode').value)
         self.p_start_map = self.load_p_start_map()
+        self.yaw_offset_deg = float(self.get_parameter('yaw_offset_deg').value)
+        self.yaw_offset = math.radians(self.yaw_offset_deg)
         self.goal_reached_dist = float(
             self.get_parameter('goal_reached_dist').value
             or thresholds.get('goal_reached_dist', 0.15)
@@ -258,6 +263,7 @@ class TargetTracker(Node):
 
         self.last_drive_mode = None
         self.last_mode_log_time = 0.0
+        self.last_debug_log_time = 0.0
 
         self.create_subscription(
             Odometry,
@@ -319,7 +325,8 @@ class TargetTracker(Node):
         self.get_logger().info(
             'Target tracker odom alignment: '
             f'odom_origin_mode={self.odom_origin_mode}, '
-            f'p_start_map=({self.p_start_map[0]:.3f}, {self.p_start_map[1]:.3f}, {self.p_start_map[2]:.3f})'
+            f'p_start_map=({self.p_start_map[0]:.3f}, {self.p_start_map[1]:.3f}, {self.p_start_map[2]:.3f}), '
+            f'yaw_offset_deg={self.yaw_offset_deg:.2f}'
         )
 
     def load_semantic_map(self):
@@ -422,8 +429,9 @@ class TargetTracker(Node):
         else:
             target_heading = self.goal_yaw
 
-        heading_error = normalize_angle(target_heading - self.current_yaw)
-        target_yaw_error = normalize_angle(self.goal_yaw - self.current_yaw)
+        current_yaw_map = normalize_angle(self.current_yaw + self.yaw_offset)
+        heading_error = normalize_angle(target_heading - current_yaw_map)
+        target_yaw_error = normalize_angle(self.goal_yaw - current_yaw_map)
         abs_heading_error = abs(heading_error)
 
         self.error_pub.publish(
@@ -521,7 +529,7 @@ class TargetTracker(Node):
             # =====================================================
             if self.reverse_mode:
                 reverse_heading = normalize_angle(target_heading + math.pi)
-                reverse_error = normalize_angle(reverse_heading - self.current_yaw)
+                reverse_error = normalize_angle(reverse_heading - current_yaw_map)
                 abs_reverse_error = abs(reverse_error)
 
                 if abs_reverse_error < self.heading_deadzone:
@@ -719,8 +727,35 @@ class TargetTracker(Node):
         self.cmd_pub.publish(cmd)
         self.goal_reached_pub.publish(reached_msg)
         self.log_drive_mode(drive_mode, distance, heading_error, now)
+        self.log_tracking_debug(
+            now,
+            target_heading,
+            heading_error,
+            current_yaw_map,
+            cmd,
+        )
 
         self.last_cmd = cmd
+
+    def log_tracking_debug(self, now, desired_yaw, heading_error, current_yaw_map, cmd):
+        if now - self.last_debug_log_time < 1.0:
+            return
+
+        self.last_debug_log_time = now
+        self.get_logger().info(
+            'tracker debug: '
+            f'current_x={self.current_pose.position.x:.3f}, '
+            f'current_y={self.current_pose.position.y:.3f}, '
+            f'current_yaw_deg={math.degrees(self.current_yaw):.2f}, '
+            f'yaw_offset_deg={self.yaw_offset_deg:.2f}, '
+            f'current_yaw_map_deg={math.degrees(current_yaw_map):.2f}, '
+            f'goal_x={self.goal.position.x:.3f}, '
+            f'goal_y={self.goal.position.y:.3f}, '
+            f'desired_yaw_deg={math.degrees(desired_yaw):.2f}, '
+            f'heading_error_deg={math.degrees(heading_error):.2f}, '
+            f'linear_cmd={cmd.linear.x:.3f}, '
+            f'angular_cmd={cmd.angular.z:.3f}'
+        )
 
     def log_drive_mode(self, mode, distance, heading_error, now):
         # 只在模式变化时打印，避免终端刷屏。
