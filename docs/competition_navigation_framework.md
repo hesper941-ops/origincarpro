@@ -52,6 +52,19 @@ The semantic coordinate convention follows the official 500cm x 500cm field map:
 
 The current semantic coordinates are measured / manually confirmed values and can still be refined on the real car with `/odom_combined`.
 
+Current measured semantic points:
+
+| Point | x (m) | y (m) | yaw |
+|---|---:|---:|---:|
+| p_start | 0.55 | 0.20 | 0.0 |
+| task_station | 4.75 | 1.80 | 0.0 |
+| channel_entry / channel_entry_lower | 2.50 | 2.00 | 0.0 |
+| channel_entry_upper | 2.50 | 3.17 | 0.0 |
+| channel_p1 | 0.75 | 3.17 | 0.0 |
+| channel_p2 | 4.25 | 3.17 | 0.0 |
+| channel_p3 | 4.25 | 4.32 | 0.0 |
+| channel_p4 | 0.75 | 4.32 | 0.0 |
+
 Formal navigation still uses `/odom_combined` plus `semantic_map.yaml` plus `target_tracker`; the static field image does not drive decisions.
 
 ## Half-Route QR Scan

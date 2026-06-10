@@ -31,45 +31,45 @@ boundary:
 points:
   p_start:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [0.00, 0.00, 0.0]
+    pose: [0.55, 0.20, 0.0]
     description: "P point / start point"
 
   task_station:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [3.50, 1.20, 0.0]
+    pose: [4.75, 1.80, 0.0]
     description: "QR task publishing station"
 
   channel_entry:
     # Compatibility field for current task_manager; prefer channel_entry_lower / channel_entry_upper later.
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [1.70, 2.37, 0.0]
+    pose: [2.50, 2.00, 0.0]
     description: "Compatibility entrance point, currently equal to channel_entry_lower"
 
   channel_entry_lower:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [2.00, 2.37, 0.0]
+    pose: [2.50, 2.00, 0.0]
     description: "Lower entrance from blue hall to vertical yellow channel"
 
   channel_entry_upper:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [2.10, 3.17, 0.0]
+    pose: [2.50, 3.17, 0.0]
     description: "Upper transition from vertical entrance channel to yellow loop"
 
   channel_p1:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [0.25, 2.37, 0.0]
+    pose: [0.75, 3.17, 0.0]
 
   channel_p2:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [0.25, 3.87, 0.0]
+    pose: [4.25, 3.17, 0.0]
 
   channel_p3:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [4.05, 3.87, 0.0]
+    pose: [4.25, 4.32, 0.0]
 
   channel_p4:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [4.05, 2.37, 0.0]
+    pose: [0.75, 4.32, 0.0]
 
 routes:
   clockwise:
