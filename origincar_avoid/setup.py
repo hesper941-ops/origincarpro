@@ -28,7 +28,7 @@ setup(
             'cmd_vel_mux = origincar_avoid.cmd_vel_mux:main',
             'cmd_vel_gate = origincar_avoid.cmd_vel_gate:main',
             'yolo_avoid_controller = origincar_avoid.yolo_avoid_controller:main',
-            'yolo_box_viewer= origincar_avoid.yolo_box_viewer:main',
+            'yolo_box_viewer = origincar_avoid.yolo_box_viewer:main',
             'teleop_smooth_ros2 = origincar_avoid.teleop_smooth_ros2:main',
         ],
     },

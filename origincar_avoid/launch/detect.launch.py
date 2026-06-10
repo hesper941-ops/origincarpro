@@ -18,12 +18,6 @@ def generate_launch_description():
     detection_topic = LaunchConfiguration('detection_topic')
     output_compressed_topic = LaunchConfiguration('output_compressed_topic')
 
-    yolo_cmd_vel_topic = LaunchConfiguration('yolo_cmd_vel_topic')
-    yolo_avoid_active_topic = LaunchConfiguration('yolo_avoid_active_topic')
-
-    nav2_cmd_vel_topic = LaunchConfiguration('nav2_cmd_vel_topic')
-    output_cmd_vel_topic = LaunchConfiguration('output_cmd_vel_topic')
-
     return LaunchDescription([
         DeclareLaunchArgument(
             'config_file',
@@ -51,30 +45,6 @@ def generate_launch_description():
             description='Output compressed result topic'
         ),
 
-        DeclareLaunchArgument(
-            'yolo_cmd_vel_topic',
-            default_value=TextSubstitution(text='/yolo_cmd_vel'),
-            description='YOLO obstacle avoidance cmd_vel topic'
-        ),
-
-        DeclareLaunchArgument(
-            'yolo_avoid_active_topic',
-            default_value=TextSubstitution(text='/yolo_avoid_active'),
-            description='YOLO obstacle avoidance active topic'
-        ),
-
-        DeclareLaunchArgument(
-            'nav2_cmd_vel_topic',
-            default_value=TextSubstitution(text='/nav2_cmd_vel'),
-            description='NAV2 cmd_vel topic before mux'
-        ),
-
-        DeclareLaunchArgument(
-            'output_cmd_vel_topic',
-            default_value=TextSubstitution(text='/cmd_vel'),
-            description='Final cmd_vel topic to robot base'
-        ),
-
         # =========================
         # DNN YOLO 推理节点
         # =========================
@@ -93,8 +63,8 @@ def generate_launch_description():
         ),
 
         # =========================
-        # YOLO 画框 + 避障判断节点
-        # 输出 /yolo_cmd_vel 和 /yolo_avoid_active
+        # YOLO visualization only. Motion control is handled by
+        # yolo_avoid_controller in yolov8_detect.launch.py.
         # =========================
         Node(
             package='origincar_avoid',
@@ -105,44 +75,13 @@ def generate_launch_description():
                 {'detection_topic': detection_topic},
                 {'output_compressed_topic': output_compressed_topic},
 
-                {'yolo_cmd_vel_topic': yolo_cmd_vel_topic},
-                {'yolo_avoid_active_topic': yolo_avoid_active_topic},
-
-                # 避障触发线，越小越早避障
+                # Visualization reference line only.
                 {'avoid_start_y_ratio': 0.65},
 
-                # 中心死区，越大越不敏感
+                # Visualization center deadzone only.
                 {'center_deadzone_ratio': 0.08},
 
-                # YOLO 避障速度
-                {'linear_speed': 0.15},
-                {'turn_speed': 0.45},
-
-                # 和 NAV2 结合时，建议 False
-                # 没障碍物时不让 YOLO 自己前进，而是交给 NAV2
-                {'forward_when_no_roadblock': False},
+                {'obstacle_labels': ['roadblock']},
             ]
         ),
-
-        # =========================
-        # 速度仲裁节点
-        # 输入：
-        #   /nav2_cmd_vel
-        #   /yolo_cmd_vel
-        #   /yolo_avoid_active
-        # 输出：
-        #   /cmd_vel
-        # =========================
-        # Node(
-        #     package='origincar_avoid',
-        #     executable='cmd_vel_mux',
-        #     output='screen',
-        #     parameters=[
-        #         {'nav2_cmd_vel_topic': nav2_cmd_vel_topic},
-        #         {'yolo_cmd_vel_topic': yolo_cmd_vel_topic},
-        #         {'yolo_avoid_active_topic': yolo_avoid_active_topic},
-        #         {'output_cmd_vel_topic': output_cmd_vel_topic},
-        #         {'yolo_cmd_timeout': 0.5},
-        #     ]
-        # ),
     ])

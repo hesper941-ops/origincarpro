@@ -154,6 +154,7 @@ class TargetTracker(Node):
         # ROS 参数
         # =========================
         self.declare_parameter('semantic_map_file', '')
+        self.declare_parameter('odom_origin_mode', 'p_start_map')
         self.declare_parameter('control_rate_hz', 20.0)
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('goal_topic', '/current_goal')
@@ -203,8 +204,10 @@ class TargetTracker(Node):
         self.goal_reached_yaw = float(self.get_parameter('goal_reached_yaw').value)
         self.yaw_deadzone = float(self.get_parameter('yaw_deadzone').value)
 
-        thresholds = self.load_thresholds()
-
+        self.semantic_map = self.load_semantic_map()
+        thresholds = self.semantic_map.get('thresholds', {})
+        self.odom_origin_mode = str(self.get_parameter('odom_origin_mode').value)
+        self.p_start_map = self.load_p_start_map()
         self.goal_reached_dist = float(
             self.get_parameter('goal_reached_dist').value
             or thresholds.get('goal_reached_dist', 0.15)
@@ -235,6 +238,7 @@ class TargetTracker(Node):
         self.current_yaw_rate = 0.0
 
         self.goal = None
+        self.goal_map = None
         self.goal_yaw = 0.0
         self.goal_signature = None
 
@@ -312,8 +316,13 @@ class TargetTracker(Node):
         self.get_logger().info(f'full_speed_angle={self.full_speed_angle}')
         self.get_logger().info(f'large_turn_angle={self.large_turn_angle}')
         self.get_logger().info(f'align_final_yaw={self.align_final_yaw}')
+        self.get_logger().info(
+            'Target tracker odom alignment: '
+            f'odom_origin_mode={self.odom_origin_mode}, '
+            f'p_start_map=({self.p_start_map[0]:.3f}, {self.p_start_map[1]:.3f}, {self.p_start_map[2]:.3f})'
+        )
 
-    def load_thresholds(self):
+    def load_semantic_map(self):
         path = self.get_parameter('semantic_map_file').value
 
         if not path:
@@ -329,12 +338,16 @@ class TargetTracker(Node):
 
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                return (yaml.safe_load(f) or {}).get('thresholds', {})
+                return yaml.safe_load(f) or {}
         except Exception as exc:
-            self.get_logger().warn(
-                f'Failed to read tracker thresholds from semantic map: {exc}'
-            )
+            self.get_logger().warn(f'Failed to read tracker semantic map: {exc}')
             return {}
+
+    def load_p_start_map(self):
+        points = self.semantic_map.get('points', {})
+        pose = points.get('p_start', {}).get('pose', [0.0, 0.0, 0.0])
+        yaw = float(pose[2]) if len(pose) > 2 else 0.0
+        return float(pose[0]), float(pose[1]), yaw
 
     def odom_callback(self, msg):
         self.current_pose = msg.pose.pose
@@ -343,9 +356,9 @@ class TargetTracker(Node):
 
     def goal_callback(self, msg):
         signature = self.make_goal_signature(msg)
-
-        self.goal = msg.pose
-        self.goal_yaw = yaw_from_quaternion(msg.pose.orientation)
+        self.goal_map = msg.pose
+        self.goal = self.map_goal_to_odom_goal(msg.pose)
+        self.goal_yaw = yaw_from_quaternion(self.goal.orientation)
 
         if signature != self.goal_signature:
             self.goal_signature = signature
@@ -354,9 +367,11 @@ class TargetTracker(Node):
             self.reverse_mode_kind = None
             self.last_drive_mode = None
             self.last_cmd = Twist()
+            map_yaw = yaw_from_quaternion(msg.pose.orientation)
             self.get_logger().info(
-                f'New goal: x={self.goal.position.x:.3f}, '
-                f'y={self.goal.position.y:.3f}, yaw={self.goal_yaw:.3f}'
+                'Accepted current goal with map-to-odom alignment: '
+                f'goal_map=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, {map_yaw:.3f}), '
+                f'goal_odom=({self.goal.position.x:.3f}, {self.goal.position.y:.3f}, {self.goal_yaw:.3f})'
             )
 
     def enable_callback(self, msg):
@@ -755,6 +770,25 @@ class TargetTracker(Node):
             round(float(msg.pose.position.z), 3),
             round(float(yaw_from_quaternion(msg.pose.orientation)), 3),
         )
+
+    def map_goal_to_odom_goal(self, pose):
+        # semantic_map.yaml uses field/map coordinates. /odom_combined starts near
+        # (0, 0) at P, so formal goals are converted with: goal_odom = goal_map - p_start_map.
+        if self.odom_origin_mode != 'p_start_map':
+            return pose
+
+        converted = PoseStamped().pose
+        converted.position.x = float(pose.position.x) - self.p_start_map[0]
+        converted.position.y = float(pose.position.y) - self.p_start_map[1]
+        converted.position.z = float(pose.position.z)
+
+        goal_yaw_map = yaw_from_quaternion(pose.orientation)
+        goal_yaw_odom = normalize_angle(goal_yaw_map - self.p_start_map[2])
+        qz = math.sin(goal_yaw_odom * 0.5)
+        qw = math.cos(goal_yaw_odom * 0.5)
+        converted.orientation.z = qz
+        converted.orientation.w = qw
+        return converted
 
 
 def main(args=None):

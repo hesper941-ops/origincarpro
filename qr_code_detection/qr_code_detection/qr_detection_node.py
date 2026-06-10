@@ -62,9 +62,19 @@ class QrCodeDetection(Node):
     def parse_sign_data(self, qr_text):
         normalized = str(qr_text).strip()
         lowered = normalized.lower()
-        if lowered in ('clockwise', 'clock wise'):
+        if lowered in ('clockwise', 'clock wise') or normalized in ('顺时针', '順時針'):
             return 3
-        if lowered in ('anticlockwise', 'anti-clockwise', 'anti clockwise', 'counterclockwise'):
+        if (
+            lowered in (
+                'anticlockwise',
+                'anti-clockwise',
+                'anti clockwise',
+                'counterclockwise',
+                'counter-clockwise',
+                'counter clockwise',
+            )
+            or normalized in ('逆时针', '逆時針')
+        ):
             return 4
         if self.debug_allow_numeric_sign:
             try:

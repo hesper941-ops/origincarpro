@@ -28,6 +28,7 @@ def generate_launch_description():
     debug_channel_index = LaunchConfiguration('debug_channel_index')
     debug_goal_name = LaunchConfiguration('debug_goal_name')
     debug_auto_start = LaunchConfiguration('debug_auto_start')
+    enable_birdview_return = LaunchConfiguration('enable_birdview_return')
 
     return LaunchDescription([
         DeclareLaunchArgument('semantic_map_file', default_value=default_map),
@@ -46,6 +47,7 @@ def generate_launch_description():
         DeclareLaunchArgument('debug_channel_index', default_value='0'),
         DeclareLaunchArgument('debug_goal_name', default_value=''),
         DeclareLaunchArgument('debug_auto_start', default_value='false'),
+        DeclareLaunchArgument('enable_birdview_return', default_value='false'),
         Node(
             package='origincar_nav',
             executable='task_manager',
@@ -59,6 +61,7 @@ def generate_launch_description():
                 'debug_channel_index': debug_channel_index,
                 'debug_goal_name': debug_goal_name,
                 'debug_auto_start': debug_auto_start,
+                'enable_birdview_return': enable_birdview_return,
             }],
         ),
         Node(

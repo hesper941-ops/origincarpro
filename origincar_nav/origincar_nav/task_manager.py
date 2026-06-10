@@ -22,6 +22,8 @@ class MissionState(Enum):
     INIT = 'INIT'
     TRACK_TO_TASK_STATION = 'TRACK_TO_TASK_STATION'
     TRACK_TO_CHANNEL_ENTRY = 'TRACK_TO_CHANNEL_ENTRY'
+    TRACK_TO_CHANNEL_ENTRY_LOWER = 'TRACK_TO_CHANNEL_ENTRY_LOWER'
+    TRACK_TO_CHANNEL_ENTRY_UPPER = 'TRACK_TO_CHANNEL_ENTRY_UPPER'
     CHANNEL_NAV = 'CHANNEL_NAV'
     RETURN_PREPARE = 'RETURN_PREPARE'
     BIRDVIEW_RETURN = 'BIRDVIEW_RETURN'
@@ -51,6 +53,7 @@ class TaskManager(Node):
         self.declare_parameter('debug_channel_index', 0)
         self.declare_parameter('debug_goal_name', '')
         self.declare_parameter('debug_auto_start', False)
+        self.declare_parameter('enable_birdview_return', False)
 
         # 新增：二维码内容无法解析方向时，默认走哪个方向
         self.declare_parameter('default_route_direction', 'clockwise')
@@ -58,6 +61,7 @@ class TaskManager(Node):
         self.semantic_map = self.load_semantic_map()
         self.map_frame = self.semantic_map.get('map_frame', self.get_parameter('map_frame').value)
         self.points = self.semantic_map.get('points', {})
+        self.p_start_map = self.load_p_start_map()
         self.routes = self.semantic_map.get('routes', {})
 
         task_thresholds = self.semantic_map.get('task_manager', {})
@@ -77,6 +81,7 @@ class TaskManager(Node):
         self.debug_route_direction = str(self.get_parameter('debug_route_direction').value).lower()
         self.debug_channel_index = int(self.get_parameter('debug_channel_index').value)
         self.debug_goal_name = str(self.get_parameter('debug_goal_name').value)
+        self.enable_birdview_return = bool(self.get_parameter('enable_birdview_return').value)
 
         self.default_route_direction = str(
             self.get_parameter('default_route_direction').value
@@ -162,6 +167,10 @@ class TaskManager(Node):
                 'map_frame': self.get_parameter('map_frame').value,
             }
 
+    def load_p_start_map(self):
+        pose = self.points.get('p_start', {}).get('pose', [0.0, 0.0, 0.0])
+        return float(pose[0]), float(pose[1])
+
     def tick(self):
         if not self.competition_started:
             if self.state != MissionState.WAIT_START:
@@ -202,7 +211,14 @@ class TaskManager(Node):
             self.publish_named_goal(self.goal_name_for_state('channel_entry'))
             self.publish_track_enable(True)
             self.publish_status('target_track')
-
+        elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY_LOWER:
+            self.publish_named_goal(self.goal_name_for_state('channel_entry_lower'))
+            self.publish_track_enable(True)
+            self.publish_status('target_track')
+        elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY_UPPER:
+            self.publish_named_goal(self.goal_name_for_state('channel_entry_upper'))
+            self.publish_track_enable(True)
+            self.publish_status('target_track')
         elif self.state == MissionState.CHANNEL_NAV:
             self.publish_track_enable(True)
             self.publish_status('channel_visual_correction')
@@ -218,8 +234,7 @@ class TaskManager(Node):
             self.publish_status('target_track')
             self.publish_named_goal(self.goal_name_for_state('p_start'))
             self.publish_track_enable(True)
-
-            if self.birdview_valid:
+            if self.enable_birdview_return and self.birdview_valid:
                 self.set_state(MissionState.BIRDVIEW_RETURN)
 
         elif self.state == MissionState.BIRDVIEW_RETURN:
@@ -310,6 +325,8 @@ class TaskManager(Node):
         tracking_states = {
             MissionState.TRACK_TO_TASK_STATION,
             MissionState.TRACK_TO_CHANNEL_ENTRY,
+            MissionState.TRACK_TO_CHANNEL_ENTRY_LOWER,
+            MissionState.TRACK_TO_CHANNEL_ENTRY_UPPER,
             MissionState.CHANNEL_NAV,
             MissionState.RETURN_PREPARE,
         }
@@ -359,7 +376,11 @@ class TaskManager(Node):
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
             self.prepare_channel_route()
             self.set_state(MissionState.CHANNEL_NAV)
-
+        elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY_LOWER:
+            self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY_UPPER)
+        elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY_UPPER:
+            self.prepare_channel_route()
+            self.set_state(MissionState.CHANNEL_NAV)
         elif self.state == MissionState.CHANNEL_NAV:
             self.channel_index += 1
 
@@ -390,7 +411,9 @@ class TaskManager(Node):
 
         self.qr_already_used = True
 
-        self.broadcast_green(f'🔎 识别到二维码 -> {qr_text}，立即切换下一个目标')
+        self.broadcast_green(
+            f'QR detected -> {qr_text}; switch to next target'
+        )
 
         direction = self.parse_direction(qr_text)
 
@@ -404,12 +427,11 @@ class TaskManager(Node):
         self.route_direction = direction
         self.prepare_channel_route()
         self.broadcast_green(
-            f'🧭 路线方向 -> {direction}，通道顺序 -> {self.channel_order}'
+            f'Route direction -> {direction}; channel order -> {self.channel_order}'
         )
 
-        # 立刻切换到下一个目标点
-        self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY)
-        self.publish_named_goal('channel_entry')
+        self.set_state(MissionState.TRACK_TO_CHANNEL_ENTRY_LOWER)
+        self.publish_named_goal('channel_entry_lower')
         self.publish_track_enable(True)
         self.publish_status('target_track')
 
@@ -494,11 +516,11 @@ class TaskManager(Node):
             return False
 
         pose = task_station.get('pose', [0.0, 0.0, 0.0])
-        distance = math.hypot(
-            float(pose[0]) - self.current_x,
-            float(pose[1]) - self.current_y,
-        )
-
+        # /odom_combined starts near (0, 0) at P; semantic points are in field/map
+        # coordinates, so QR scan distance is checked in map coordinates.
+        current_map_x = self.current_x + self.p_start_map[0]
+        current_map_y = self.current_y + self.p_start_map[1]
+        distance = math.hypot(float(pose[0]) - current_map_x, float(pose[1]) - current_map_y)
         return distance <= self.qr_scan_start_dist_to_task_station
 
     def now_sec(self):

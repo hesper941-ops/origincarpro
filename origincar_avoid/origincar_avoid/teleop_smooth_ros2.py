@@ -50,7 +50,12 @@ class TeleopStepNode(Node):
     def __init__(self):
         super().__init__('teleop_step')
 
-        self.twist_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.declare_parameter('cmd_topic', '/cmd_vel_raw')
+        self.cmd_topic = self.get_parameter('cmd_topic').value
+        self.twist_pub = self.create_publisher(Twist, self.cmd_topic, 10)
+        self.get_logger().info(
+            f'teleop_step publishing to {self.cmd_topic}; use cmd_vel_gate for final /cmd_vel output'
+        )
 
         self.linear = 0.0
         self.angular = 0.0
