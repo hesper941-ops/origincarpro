@@ -14,30 +14,34 @@ class CompetitionButtonNode(Node):
         self.declare_parameter('reset_button_topic', '/competition/reset_button')
         self.declare_parameter('started_topic', '/competition/started')
         self.declare_parameter('emergency_stop_topic', '/competition/emergency_stop')
+        self.declare_parameter('emergency_stop_cmd_topic', '/competition/emergency_stop_cmd')
         self.declare_parameter('userkey_topic', '/UserKey_Value')
         self.declare_parameter('debug_auto_start', False)
         self.declare_parameter('publish_rate_hz', 5.0)
 
         self.button_backend = str(self.get_parameter('button_backend').value)
+        self.started_topic = self.get_parameter('started_topic').value
+        self.emergency_stop_topic = self.get_parameter('emergency_stop_topic').value
+        self.emergency_stop_cmd_topic = self.get_parameter('emergency_stop_cmd_topic').value
         self.started = bool(self.get_parameter('debug_auto_start').value)
         self.emergency_stop = False
 
         self.started_pub = self.create_publisher(
             Bool,
-            self.get_parameter('started_topic').value,
+            self.started_topic,
             10,
         )
 
         self.emergency_pub = self.create_publisher(
             Bool,
-            self.get_parameter('emergency_stop_topic').value,
+            self.emergency_stop_topic,
             10,
         )
 
         self.create_subscription(
             Bool,
-            self.get_parameter('emergency_stop_topic').value,
-            self.emergency_stop_callback,
+            self.emergency_stop_cmd_topic,
+            self.emergency_stop_cmd_callback,
             10,
         )
 
@@ -92,23 +96,29 @@ class CompetitionButtonNode(Node):
             self.emergency_stop = False
             self.get_logger().info('Competition reset by topic button.')
 
-    def emergency_stop_callback(self, msg):
-        self.emergency_stop = bool(msg.data)
-        if self.emergency_stop:
+    def emergency_stop_cmd_callback(self, msg):
+        if msg.data:
             self.started = False
-            self.get_logger().warn('Emergency stop received.')
+            self.emergency_stop = True
+            self.get_logger().warn('Emergency stop command received.')
+        else:
+            self.started = False
+            self.emergency_stop = False
+            self.get_logger().info(
+                'Emergency stop cleared; start_button must be pressed again to start.'
+            )
 
     def publish_state(self):
         self.safe_publish(
             self.started_pub,
             Bool(data=self.started),
-            '/competition/started',
+            self.started_topic,
         )
 
         self.safe_publish(
             self.emergency_pub,
             Bool(data=self.emergency_stop),
-            '/competition/emergency_stop',
+            self.emergency_stop_topic,
         )
 
 
@@ -130,12 +140,12 @@ def main(args=None):
             node.safe_publish(
                 node.started_pub,
                 Bool(data=False),
-                '/competition/started',
+                node.started_topic,
             )
             node.safe_publish(
                 node.emergency_pub,
                 Bool(data=True),
-                '/competition/emergency_stop',
+                node.emergency_stop_topic,
             )
         except Exception:
             pass

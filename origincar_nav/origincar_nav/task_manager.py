@@ -27,6 +27,8 @@ class MissionState(Enum):
     CHANNEL_NAV = 'CHANNEL_NAV'
     RETURN_PREPARE = 'RETURN_PREPARE'
     BIRDVIEW_RETURN = 'BIRDVIEW_RETURN'
+    SINGLE_GOAL_TRACK = 'SINGLE_GOAL_TRACK'
+    SINGLE_GOAL_REACHED = 'SINGLE_GOAL_REACHED'
     FINISH = 'FINISH'
 
 
@@ -54,6 +56,8 @@ class TaskManager(Node):
         self.declare_parameter('debug_goal_name', '')
         self.declare_parameter('debug_auto_start', False)
         self.declare_parameter('enable_birdview_return', False)
+        self.declare_parameter('single_goal_mode', False)
+        self.declare_parameter('single_goal_name', 'task_station')
 
         # 新增：二维码内容无法解析方向时，默认走哪个方向
         self.declare_parameter('default_route_direction', 'clockwise')
@@ -82,6 +86,10 @@ class TaskManager(Node):
         self.debug_channel_index = int(self.get_parameter('debug_channel_index').value)
         self.debug_goal_name = str(self.get_parameter('debug_goal_name').value)
         self.enable_birdview_return = bool(self.get_parameter('enable_birdview_return').value)
+        self.single_goal_mode = bool(self.get_parameter('single_goal_mode').value)
+        self.single_goal_name = str(self.get_parameter('single_goal_name').value)
+        self.single_goal_valid = (not self.single_goal_mode) or self.single_goal_name in self.points
+        self.single_goal_error_logged = False
 
         self.default_route_direction = str(
             self.get_parameter('default_route_direction').value
@@ -92,6 +100,15 @@ class TaskManager(Node):
                 f'Invalid default_route_direction={self.default_route_direction}, use clockwise'
             )
             self.default_route_direction = 'clockwise'
+
+        if self.single_goal_mode:
+            if self.single_goal_valid:
+                self.get_logger().info(f'Single goal calibration mode enabled: {self.single_goal_name}')
+            else:
+                self.get_logger().error(
+                    f'single_goal_name={self.single_goal_name} not found in semantic_map.yaml'
+                )
+                self.single_goal_error_logged = True
 
         self.state = MissionState.WAIT_START
         self.competition_started = bool(self.get_parameter('debug_auto_start').value)
@@ -185,10 +202,18 @@ class TaskManager(Node):
             return
 
         if self.state == MissionState.WAIT_START:
+            if self.single_goal_mode:
+                self.tick_single_goal()
+                return
+
             if self.debug_mode:
                 self.apply_debug_start()
             else:
                 self.set_state(MissionState.INIT)
+
+        if self.single_goal_mode:
+            self.tick_single_goal()
+            return
 
         if self.state == MissionState.INIT:
             self.qr_already_used = False
@@ -245,6 +270,30 @@ class TaskManager(Node):
             self.publish_track_enable(False)
             self.publish_status('idle')
 
+        self.maybe_republish_current_goal()
+
+    def tick_single_goal(self):
+        if not self.single_goal_valid:
+            if not self.single_goal_error_logged:
+                self.get_logger().error(
+                    f'single_goal_name={self.single_goal_name} not found in semantic_map.yaml'
+                )
+                self.single_goal_error_logged = True
+            self.publish_track_enable(False)
+            self.publish_status('single_goal_invalid')
+            return
+
+        if self.state == MissionState.SINGLE_GOAL_REACHED:
+            self.publish_track_enable(False)
+            self.publish_status('single_goal_reached')
+            return
+
+        if self.state != MissionState.SINGLE_GOAL_TRACK:
+            self.set_state(MissionState.SINGLE_GOAL_TRACK)
+
+        self.publish_named_goal(self.single_goal_name)
+        self.publish_track_enable(True)
+        self.publish_status('single_goal_track')
         self.maybe_republish_current_goal()
 
     def set_state(self, state):
@@ -329,6 +378,7 @@ class TaskManager(Node):
             MissionState.TRACK_TO_CHANNEL_ENTRY_UPPER,
             MissionState.CHANNEL_NAV,
             MissionState.RETURN_PREPARE,
+            MissionState.SINGLE_GOAL_TRACK,
         }
 
         if self.state not in tracking_states or not self.current_goal_name:
@@ -372,6 +422,10 @@ class TaskManager(Node):
             # 到达任务站但还没识别到二维码时，不切下一目标，继续等待二维码
             self.qr_scan_active = True
             self.last_goal_reached = False
+
+        elif self.state == MissionState.SINGLE_GOAL_TRACK:
+            self.publish_track_enable(False)
+            self.set_state(MissionState.SINGLE_GOAL_REACHED)
 
         elif self.state == MissionState.TRACK_TO_CHANNEL_ENTRY:
             self.prepare_channel_route()

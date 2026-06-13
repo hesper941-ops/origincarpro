@@ -33,6 +33,10 @@ def generate_launch_description():
     debug_channel_index = LaunchConfiguration('debug_channel_index')
     debug_goal_name = LaunchConfiguration('debug_goal_name')
     debug_auto_start = LaunchConfiguration('debug_auto_start')
+    yaw_offset_deg = LaunchConfiguration('yaw_offset_deg')
+    single_goal_mode = LaunchConfiguration('single_goal_mode')
+    single_goal_name = LaunchConfiguration('single_goal_name')
+    emergency_stop_cmd_topic = LaunchConfiguration('emergency_stop_cmd_topic')
 
     safety_note = (
         'Safety: if enable_base=true with navigation and cmd_vel_mux enabled, '
@@ -62,6 +66,10 @@ def generate_launch_description():
         DeclareLaunchArgument('debug_channel_index', default_value='0'),
         DeclareLaunchArgument('debug_goal_name', default_value=''),
         DeclareLaunchArgument('debug_auto_start', default_value='false'),
+        DeclareLaunchArgument('yaw_offset_deg', default_value='0.0'),
+        DeclareLaunchArgument('single_goal_mode', default_value='false'),
+        DeclareLaunchArgument('single_goal_name', default_value='task_station'),
+        DeclareLaunchArgument('emergency_stop_cmd_topic', default_value='/competition/emergency_stop_cmd'),
 
         LogInfo(msg=safety_note),
 
@@ -74,6 +82,8 @@ def generate_launch_description():
             parameters=[{
                 'button_backend': button_backend,
                 'debug_auto_start': debug_auto_start,
+                'emergency_stop_cmd_topic': emergency_stop_cmd_topic,
+                'emergency_stop_topic': '/competition/emergency_stop',
             }],
         ),
 
@@ -115,6 +125,9 @@ def generate_launch_description():
                 'debug_channel_index': debug_channel_index,
                 'debug_goal_name': debug_goal_name,
                 'debug_auto_start': debug_auto_start,
+                'yaw_offset_deg': yaw_offset_deg,
+                'single_goal_mode': single_goal_mode,
+                'single_goal_name': single_goal_name,
             }.items(),
         ),
         Node(
