@@ -75,7 +75,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 
-SCAN_BAND_RATIOS = (0.55, 0.68, 0.78, 0.88, 0.95)
+SCAN_BAND_RATIOS = (0.20, 0.35, 0.50, 0.65, 0.80)
 MORPHOLOGY_KERNEL_SIZE = 5
 STOP_PUBLISH_COUNT = 5
 STOP_PUBLISH_INTERVAL_SEC = 0.05
@@ -174,6 +174,7 @@ def extract_road_center(
     v_min: int,
     v_max: int,
     roi_y_start_ratio: float,
+    roi_y_end_ratio: float,
     scan_band_half_height: int,
     min_yellow_pixels: int,
     min_band_pixels: int,
@@ -181,9 +182,11 @@ def extract_road_center(
 ) -> VisionResult:
     """Segment yellow and estimate its center using weighted scan bands."""
     image_height, image_width = bgr.shape[:2]
-    roi_y_start = int(round(image_height * roi_y_start_ratio))
+    roi_y_start = int(image_height * roi_y_start_ratio)
     roi_y_start = min(max(roi_y_start, 0), image_height - 1)
-    roi = bgr[roi_y_start:, :]
+    roi_y_end = int(image_height * roi_y_end_ratio)
+    roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
+    roi = bgr[roi_y_start:roi_y_end, :]
     roi_height = roi.shape[0]
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -369,6 +372,7 @@ def render_debug_image(
     bgr: np.ndarray,
     result: VisionResult,
     roi_y_start_ratio: float,
+    roi_y_end_ratio: float,
     error: Optional[float],
     linear: float,
     angular: float,
@@ -381,8 +385,11 @@ def render_debug_image(
     """Draw road geometry and controller state on a BGR image."""
     debug = bgr.copy()
     image_height, image_width = debug.shape[:2]
-    roi_y_start = int(round(image_height * roi_y_start_ratio))
+    roi_y_start = int(image_height * roi_y_start_ratio)
     roi_y_start = min(max(roi_y_start, 0), image_height - 1)
+    roi_y_end = int(image_height * roi_y_end_ratio)
+    roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
+    roi_y_end_line = min(roi_y_end, image_height - 1)
 
     # BGR colors chosen to remain distinct from the yellow road.
     blue = (255, 0, 0)
@@ -398,6 +405,13 @@ def render_debug_image(
         debug,
         (0, roi_y_start),
         (image_width - 1, roi_y_start),
+        cyan,
+        2,
+    )
+    cv2.line(
+        debug,
+        (0, roi_y_end_line),
+        (image_width - 1, roi_y_end_line),
         cyan,
         2,
     )
@@ -505,6 +519,8 @@ def render_debug_image(
         f"kp={kp:.3f}",
         f"kd={kd:.3f}",
         f"smoothing_alpha={smoothing_alpha:.3f}",
+        f"roi_y_start_ratio={roi_y_start_ratio:.3f}",
+        f"roi_y_end_ratio={roi_y_end_ratio:.3f}",
     ]
     if result.used_fallback:
         status_lines.append("fallback=contour_centroid")
@@ -576,7 +592,8 @@ class YellowAreaFollower(Node):
             "s_max": 255,
             "v_min": 80,
             "v_max": 255,
-            "roi_y_start_ratio": 0.45,
+            "roi_y_start_ratio": 0.30,
+            "roi_y_end_ratio": 0.58,
             "scan_band_half_height": 8,
             "min_yellow_pixels": 800,
             "min_band_pixels": 40,
@@ -647,8 +664,24 @@ class YellowAreaFollower(Node):
             and 0 <= int(p["v_min"]) <= int(p["v_max"]) <= 255
         ):
             raise ValueError("invalid HSV threshold ranges")
-        if not 0.0 <= float(p["roi_y_start_ratio"]) < 1.0:
-            raise ValueError("roi_y_start_ratio must be in [0.0, 1.0)")
+        roi_y_start_ratio = float(p["roi_y_start_ratio"])
+        roi_y_end_ratio = float(p["roi_y_end_ratio"])
+        if not 0.0 <= roi_y_start_ratio <= 0.95:
+            raise ValueError("roi_y_start_ratio must be in [0.0, 0.95]")
+        if not 0.05 <= roi_y_end_ratio <= 1.0:
+            raise ValueError("roi_y_end_ratio must be in [0.05, 1.0]")
+        if roi_y_end_ratio <= roi_y_start_ratio + 0.10:
+            corrected_end_ratio = min(0.95, roi_y_start_ratio + 0.25)
+            self.get_logger().warning(
+                "roi_y_end_ratio is too close to roi_y_start_ratio; "
+                f"correcting {roi_y_end_ratio:.3f} to "
+                f"{corrected_end_ratio:.3f}"
+            )
+            if corrected_end_ratio <= roi_y_start_ratio:
+                raise ValueError(
+                    "unable to create a non-empty ROI from the supplied ratios"
+                )
+            p["roi_y_end_ratio"] = corrected_end_ratio
         for name in (
             "scan_band_half_height",
             "min_yellow_pixels",
@@ -693,7 +726,8 @@ class YellowAreaFollower(Node):
             f"H={p['h_min']}..{p['h_max']}, "
             f"S={p['s_min']}..{p['s_max']}, "
             f"V={p['v_min']}..{p['v_max']}; "
-            f"roi_y_start_ratio={p['roi_y_start_ratio']}"
+            f"roi_y_start_ratio={p['roi_y_start_ratio']}, "
+            f"roi_y_end_ratio={p['roi_y_end_ratio']}"
         )
         self.get_logger().info(
             "Control: "
@@ -719,6 +753,7 @@ class YellowAreaFollower(Node):
                 int(p["v_min"]),
                 int(p["v_max"]),
                 float(p["roi_y_start_ratio"]),
+                float(p["roi_y_end_ratio"]),
                 int(p["scan_band_half_height"]),
                 int(p["min_yellow_pixels"]),
                 int(p["min_band_pixels"]),
@@ -887,6 +922,7 @@ class YellowAreaFollower(Node):
             bgr,
             result,
             float(p["roi_y_start_ratio"]),
+            float(p["roi_y_end_ratio"]),
             error,
             linear,
             angular,
@@ -897,13 +933,13 @@ class YellowAreaFollower(Node):
             bool(p["dry_run"]),
         )
         image_height, image_width = debug.shape[:2]
-        roi_y_start = int(
-            round(image_height * float(p["roi_y_start_ratio"]))
-        )
+        roi_y_start = int(image_height * float(p["roi_y_start_ratio"]))
         roi_y_start = min(max(roi_y_start, 0), image_height - 1)
+        roi_y_end = int(image_height * float(p["roi_y_end_ratio"]))
+        roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
 
         full_mask = np.zeros((image_height, image_width), dtype=np.uint8)
-        full_mask[roi_y_start:, :] = result.mask
+        full_mask[roi_y_start:roi_y_end, :] = result.mask
         self.debug_image_publisher.publish(
             numpy_to_image_message(debug, "bgr8", source_msg)
         )
