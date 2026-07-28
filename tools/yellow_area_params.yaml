@@ -1,0 +1,29 @@
+yellow_area_follower:
+  ros__parameters:
+    image_topic: /image_out
+    cmd_topic: /cmd_vel_raw
+    h_min: 15
+    h_max: 40
+    s_min: 45
+    s_max: 255
+    v_min: 80
+    v_max: 255
+    roi_y_start_ratio: 0.45
+    scan_band_half_height: 8
+    min_yellow_pixels: 800
+    min_band_pixels: 40
+    min_valid_bands: 2
+    linear_speed: 0.08
+    min_linear_speed: 0.05
+    kp: 0.55
+    kd: 0.08
+    max_angular: 0.50
+    smoothing_alpha: 0.35
+    lost_stop_frames: 5
+    search_on_lost: false
+    search_angular: 0.25
+    publish_debug_image: false
+    debug_image_topic: /yellow_area/debug_image
+    debug_mask_topic: /yellow_area/debug_mask
+    log_interval_sec: 0.5
+    image_timeout_sec: 1.0
