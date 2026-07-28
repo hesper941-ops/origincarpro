@@ -33,6 +33,17 @@
       --ros-args \
       --params-file tools/yellow_area_params.yaml
 
+只看可视化、不让车运动时：
+
+    python3 tools/yellow_area_follow.py \
+      --ros-args \
+      --params-file tools/yellow_area_params.yaml \
+      -p publish_debug_image:=true \
+      -p dry_run:=true
+
+此时可在 CoStudio / Foxglove / RDK 面板中查看
+/yellow_area/debug_image（bgr8）和 /yellow_area/debug_mask（mono8）。
+
 3. 发车门锁：
 
     ros2 topic pub --once /competition/start_button \
@@ -71,16 +82,31 @@ STOP_PUBLISH_INTERVAL_SEC = 0.05
 
 
 @dataclass
+class ScanBandResult:
+    """Geometry extracted from one horizontal scan band in ROI coordinates."""
+
+    y0: int
+    y1: int
+    center_y: int
+    valid: bool
+    left: Optional[float] = None
+    right: Optional[float] = None
+    center: Optional[float] = None
+
+
+@dataclass
 class VisionResult:
     """Result of extracting the yellow road center from one image."""
 
     valid: bool
     road_center: Optional[float]
+    road_center_y: Optional[float]
     yellow_pixels: int
     valid_bands: int
     mask: np.ndarray
-    band_rows: List[Tuple[int, int, bool]]
+    scan_bands: List[ScanBandResult]
     used_fallback: bool
+    fallback_centroid: Optional[Tuple[float, float]]
 
 
 def image_message_to_bgr(msg: Image) -> np.ndarray:
@@ -173,8 +199,9 @@ def extract_road_center(
     yellow_pixels = int(cv2.countNonZero(mask))
 
     band_centers: List[float] = []
+    band_center_rows: List[float] = []
     band_weights: List[float] = []
-    band_rows: List[Tuple[int, int, bool]] = []
+    scan_bands: List[ScanBandResult] = []
     half_height = max(1, int(scan_band_half_height))
 
     for ratio in SCAN_BAND_RATIOS:
@@ -183,15 +210,30 @@ def extract_road_center(
         y1 = min(roi_height, center_y + half_height + 1)
         _, x_coordinates = np.nonzero(mask[y0:y1, :])
         is_valid = x_coordinates.size >= min_band_pixels
-        band_rows.append((y0, y1, is_valid))
         if not is_valid:
+            scan_bands.append(
+                ScanBandResult(y0, y1, center_y, False)
+            )
             continue
 
         left = float(np.percentile(x_coordinates, 5))
         right = float(np.percentile(x_coordinates, 95))
-        band_centers.append((left + right) * 0.5)
+        band_center = (left + right) * 0.5
+        band_centers.append(band_center)
+        band_center_rows.append(float(center_y))
         # Squaring the relative height gives near-field observations more weight.
         band_weights.append(float(ratio * ratio))
+        scan_bands.append(
+            ScanBandResult(
+                y0,
+                y1,
+                center_y,
+                True,
+                left,
+                right,
+                band_center,
+            )
+        )
 
     valid_bands = len(band_centers)
     if (
@@ -204,14 +246,22 @@ def extract_road_center(
                 weights=np.asarray(band_weights),
             )
         )
+        road_center_y = float(
+            np.average(
+                np.asarray(band_center_rows),
+                weights=np.asarray(band_weights),
+            )
+        )
         return VisionResult(
             True,
             road_center,
+            road_center_y,
             yellow_pixels,
             valid_bands,
             mask,
-            band_rows,
+            scan_bands,
             False,
+            None,
         )
 
     # If scan bands do not describe the road well enough, use the largest
@@ -230,27 +280,35 @@ def extract_road_center(
             moments = cv2.moments(component_mask, binaryImage=True)
             if moments["m00"] > 0.0:
                 road_center = float(moments["m10"] / moments["m00"])
+                road_center_y = float(moments["m01"] / moments["m00"])
                 road_center = float(
                     np.clip(road_center, 0.0, image_width - 1.0)
+                )
+                road_center_y = float(
+                    np.clip(road_center_y, 0.0, roi_height - 1.0)
                 )
                 return VisionResult(
                     True,
                     road_center,
+                    road_center_y,
                     yellow_pixels,
                     valid_bands,
                     mask,
-                    band_rows,
+                    scan_bands,
                     True,
+                    (road_center, road_center_y),
                 )
 
     return VisionResult(
         False,
         None,
+        None,
         yellow_pixels,
         valid_bands,
         mask,
-        band_rows,
+        scan_bands,
         False,
+        None,
     )
 
 
@@ -307,6 +365,203 @@ def numpy_to_image_message(
     return output
 
 
+def render_debug_image(
+    bgr: np.ndarray,
+    result: VisionResult,
+    roi_y_start_ratio: float,
+    error: Optional[float],
+    linear: float,
+    angular: float,
+    lost_frames: int,
+    kp: float,
+    kd: float,
+    smoothing_alpha: float,
+    dry_run: bool,
+) -> np.ndarray:
+    """Draw road geometry and controller state on a BGR image."""
+    debug = bgr.copy()
+    image_height, image_width = debug.shape[:2]
+    roi_y_start = int(round(image_height * roi_y_start_ratio))
+    roi_y_start = min(max(roi_y_start, 0), image_height - 1)
+
+    # BGR colors chosen to remain distinct from the yellow road.
+    blue = (255, 0, 0)
+    red = (0, 0, 255)
+    cyan = (255, 255, 0)
+    dim_cyan = (128, 128, 0)
+    green = (0, 255, 0)
+    purple = (255, 0, 255)
+    white = (255, 255, 255)
+
+    # ROI boundary and scan-band geometry.
+    cv2.line(
+        debug,
+        (0, roi_y_start),
+        (image_width - 1, roi_y_start),
+        cyan,
+        2,
+    )
+    for band in result.scan_bands:
+        y0 = roi_y_start + band.y0
+        y1 = roi_y_start + band.y1 - 1
+        color = cyan if band.valid else dim_cyan
+        cv2.rectangle(
+            debug,
+            (0, y0),
+            (image_width - 1, y1),
+            color,
+            1,
+        )
+        if (
+            band.valid
+            and band.left is not None
+            and band.right is not None
+            and band.center is not None
+        ):
+            point_y = roi_y_start + band.center_y
+            left_point = (int(round(band.left)), point_y)
+            right_point = (int(round(band.right)), point_y)
+            center_point = (int(round(band.center)), point_y)
+            cv2.circle(debug, left_point, 5, green, -1)
+            cv2.circle(debug, right_point, 5, green, -1)
+            cv2.circle(debug, center_point, 5, white, -1)
+            cv2.line(debug, left_point, right_point, green, 1)
+
+    # Vehicle/image center and the detected road-center geometry.
+    image_center_x = image_width // 2
+    cv2.line(
+        debug,
+        (image_center_x, roi_y_start),
+        (image_center_x, image_height - 1),
+        blue,
+        2,
+    )
+    if (
+        result.road_center is not None
+        and result.road_center_y is not None
+    ):
+        road_x = int(
+            np.clip(round(result.road_center), 0, image_width - 1)
+        )
+        target_y = int(
+            np.clip(
+                round(roi_y_start + result.road_center_y),
+                roi_y_start,
+                image_height - 1,
+            )
+        )
+        cv2.line(
+            debug,
+            (road_x, roi_y_start),
+            (road_x, image_height - 1),
+            red,
+            2,
+        )
+        cv2.arrowedLine(
+            debug,
+            (image_center_x, image_height - 1),
+            (road_x, target_y),
+            purple,
+            3,
+            cv2.LINE_AA,
+            tipLength=0.08,
+        )
+
+    if result.used_fallback and result.fallback_centroid is not None:
+        fallback_x, fallback_y = result.fallback_centroid
+        point = (
+            int(np.clip(round(fallback_x), 0, image_width - 1)),
+            int(
+                np.clip(
+                    round(roi_y_start + fallback_y),
+                    roi_y_start,
+                    image_height - 1,
+                )
+            ),
+        )
+        cv2.drawMarker(
+            debug,
+            point,
+            purple,
+            cv2.MARKER_CROSS,
+            24,
+            3,
+        )
+
+    road_center_text = (
+        f"{result.road_center:.1f}"
+        if result.road_center is not None
+        else "none"
+    )
+    error_text = f"{error:.3f}" if error is not None else "none"
+    status_lines = [
+        f"yellow_pixels={result.yellow_pixels}",
+        f"valid_bands={result.valid_bands}",
+        f"road_center={road_center_text}",
+        f"error={error_text}",
+        f"linear.x={linear:.3f}",
+        f"angular.z={angular:.3f}",
+        f"lost_frames={lost_frames}",
+        f"kp={kp:.3f}",
+        f"kd={kd:.3f}",
+        f"smoothing_alpha={smoothing_alpha:.3f}",
+    ]
+    if result.used_fallback:
+        status_lines.append("fallback=contour_centroid")
+    if dry_run:
+        status_lines.append("DRY RUN / ZERO CMD")
+
+    line_height = 20
+    lost_title_height = 28 if not result.valid else 0
+    panel_height = min(
+        image_height,
+        12 + lost_title_height + line_height * len(status_lines),
+    )
+    panel_width = min(image_width, 360)
+    overlay = debug.copy()
+    cv2.rectangle(
+        overlay,
+        (0, 0),
+        (panel_width - 1, panel_height - 1),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.58, debug, 0.42, 0.0, debug)
+
+    text_y = 20
+    if not result.valid:
+        cv2.putText(
+            debug,
+            "YELLOW LOST / STOP",
+            (8, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            red,
+            2,
+            cv2.LINE_AA,
+        )
+        text_y += lost_title_height
+    for line in status_lines:
+        if text_y >= image_height:
+            break
+        color = cyan if line.startswith("fallback=") else white
+        if line.startswith("DRY RUN"):
+            color = purple
+        cv2.putText(
+            debug,
+            line,
+            (8, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        text_y += line_height
+
+    return debug
+
+
 class YellowAreaFollower(Node):
     """ROS2 node for standalone yellow-area following tests."""
 
@@ -338,6 +593,8 @@ class YellowAreaFollower(Node):
             "publish_debug_image": False,
             "debug_image_topic": "/yellow_area/debug_image",
             "debug_mask_topic": "/yellow_area/debug_mask",
+            "control_only_when_started": False,
+            "dry_run": False,
             "log_interval_sec": 0.5,
             "image_timeout_sec": 1.0,
         }
@@ -424,6 +681,14 @@ class YellowAreaFollower(Node):
             f"cmd_topic={self.cmd_topic}"
         )
         self.get_logger().info(
+            "Debug: "
+            f"debug_image_topic={p['debug_image_topic']}, "
+            f"debug_mask_topic={p['debug_mask_topic']}, "
+            f"publish_debug_image={p['publish_debug_image']}, "
+            f"dry_run={p['dry_run']}, "
+            f"control_only_when_started={p['control_only_when_started']}"
+        )
+        self.get_logger().info(
             "HSV threshold: "
             f"H={p['h_min']}..{p['h_max']}, "
             f"S={p['s_min']}..{p['s_max']}, "
@@ -502,7 +767,12 @@ class YellowAreaFollower(Node):
             angular,
         )
         self._publish_debug(
-            bgr, source_msg, result, filtered_error
+            bgr,
+            source_msg,
+            result,
+            filtered_error,
+            linear,
+            angular,
         )
 
     def _handle_lost_result(
@@ -526,12 +796,18 @@ class YellowAreaFollower(Node):
         else:
             self._publish_stop()
         self._throttled_status_log(result, 0.0, 0.0, angular)
-        self._publish_debug(bgr, source_msg, result, None)
+        self._publish_debug(
+            bgr, source_msg, result, None, 0.0, angular
+        )
 
     def _publish_velocity(self, linear: float, angular: float) -> None:
         command = Twist()
-        command.linear.x = float(linear)
-        command.angular.z = float(angular)
+        if bool(self.params["dry_run"]):
+            command.linear.x = 0.0
+            command.angular.z = 0.0
+        else:
+            command.linear.x = float(linear)
+            command.angular.z = float(angular)
         self.cmd_publisher.publish(command)
 
     def _publish_stop(self) -> None:
@@ -597,6 +873,8 @@ class YellowAreaFollower(Node):
         source_msg: Image,
         result: VisionResult,
         error: Optional[float],
+        linear: float,
+        angular: float,
     ) -> None:
         if (
             self.debug_image_publisher is None
@@ -604,58 +882,25 @@ class YellowAreaFollower(Node):
         ):
             return
 
-        debug = bgr.copy()
+        p = self.params
+        debug = render_debug_image(
+            bgr,
+            result,
+            float(p["roi_y_start_ratio"]),
+            error,
+            linear,
+            angular,
+            self.lost_frames,
+            float(p["kp"]),
+            float(p["kd"]),
+            float(p["smoothing_alpha"]),
+            bool(p["dry_run"]),
+        )
         image_height, image_width = debug.shape[:2]
         roi_y_start = int(
-            round(
-                image_height
-                * float(self.params["roi_y_start_ratio"])
-            )
+            round(image_height * float(p["roi_y_start_ratio"]))
         )
         roi_y_start = min(max(roi_y_start, 0), image_height - 1)
-        cv2.line(
-            debug,
-            (0, roi_y_start),
-            (image_width - 1, roi_y_start),
-            (255, 0, 0),
-            1,
-        )
-        for y0, y1, valid in result.band_rows:
-            color = (0, 255, 0) if valid else (0, 0, 255)
-            cv2.rectangle(
-                debug,
-                (0, roi_y_start + y0),
-                (image_width - 1, roi_y_start + y1 - 1),
-                color,
-                1,
-            )
-        cv2.line(
-            debug,
-            (image_width // 2, roi_y_start),
-            (image_width // 2, image_height - 1),
-            (255, 255, 0),
-            2,
-        )
-        if result.road_center is not None:
-            road_x = int(round(result.road_center))
-            cv2.line(
-                debug,
-                (road_x, roi_y_start),
-                (road_x, image_height - 1),
-                (0, 255, 255),
-                2,
-            )
-        error_text = "lost" if error is None else f"error={error:.3f}"
-        cv2.putText(
-            debug,
-            error_text,
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
 
         full_mask = np.zeros((image_height, image_width), dtype=np.uint8)
         full_mask[roi_y_start:, :] = result.mask
