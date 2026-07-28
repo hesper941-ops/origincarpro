@@ -101,14 +101,19 @@ class VisionResult:
     """Boundary path, masks, look-ahead targets, and visibility metrics."""
 
     valid: bool
-    source: str
+    path_mode: str
     yellow_pixels: int
     green_pixels: int
     yellow_mask: np.ndarray
     green_mask: np.ndarray
     boundary_mask: np.ndarray
     bands: List[BoundaryBandResult]
-    path_points: List[Tuple[float, float]]
+    boundary_sequences: List[List[Tuple[float, float, float]]]
+    left_boundary_points: List[Tuple[float, float, float]]
+    right_boundary_points: List[Tuple[float, float, float]]
+    single_boundary_points: List[Tuple[float, float, float]]
+    target_path_points: List[Tuple[float, float]]
+    boundary_points_count: int
     valid_center_count: int
     left_visible_count: int
     right_visible_count: int
@@ -121,6 +126,8 @@ class VisionResult:
     far_error: float
     control_error: float
     fallback_centroid: Optional[Tuple[float, float]]
+    history_age: int
+    yellow_fallback_frames: int
 
 
 def image_message_to_bgr(msg: Image) -> np.ndarray:
@@ -370,7 +377,7 @@ def _largest_yellow_centroid(
     )
 
 
-def extract_boundary_path(
+def _extract_boundary_path_v3(
     bgr: np.ndarray,
     yellow_lower: Tuple[int, int, int],
     yellow_upper: Tuple[int, int, int],
@@ -646,6 +653,701 @@ def extract_boundary_path(
     )
 
 
+def extract_boundary_points_from_mask(
+    boundary_mask: np.ndarray,
+    component_min_area: int,
+    keep_component_ratio: float,
+    y_bucket_px: int,
+    min_bucket_points: int,
+    max_x_jump_px: float,
+    min_points: int,
+) -> List[List[Tuple[float, float, float]]]:
+    """Extract long, y-bucketed, continuous boundary point sequences."""
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        boundary_mask, connectivity=8
+    )
+    if component_count <= 1:
+        return []
+    component_areas = stats[1:, cv2.CC_STAT_AREA]
+    maximum_area = int(np.max(component_areas))
+    minimum_kept_area = max(
+        int(component_min_area),
+        int(round(maximum_area * keep_component_ratio)),
+    )
+    sequences: List[List[Tuple[float, float, float]]] = []
+
+    for label in range(1, component_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < minimum_kept_area:
+            continue
+        y_values, x_values = np.nonzero(labels == label)
+        buckets = y_values // max(1, int(y_bucket_px))
+        component_points: List[Tuple[float, float, float]] = []
+        for bucket in np.unique(buckets):
+            selected = buckets == bucket
+            count = int(np.count_nonzero(selected))
+            if count < min_bucket_points:
+                continue
+            bucket_x = x_values[selected]
+            bucket_y = y_values[selected]
+            confidence = min(
+                1.0,
+                count / max(float(min_bucket_points * 3), 1.0),
+            )
+            component_points.append(
+                (
+                    float(np.median(bucket_x)),
+                    float(np.median(bucket_y)),
+                    confidence,
+                )
+            )
+        component_points.sort(key=lambda point: point[1])
+        if not component_points:
+            continue
+
+        continuous_parts: List[List[Tuple[float, float, float]]] = [[]]
+        for point in component_points:
+            if (
+                continuous_parts[-1]
+                and abs(point[0] - continuous_parts[-1][-1][0])
+                > max_x_jump_px
+            ):
+                continuous_parts.append([])
+            continuous_parts[-1].append(point)
+        for part in continuous_parts:
+            if len(part) >= min_points:
+                sequences.append(part)
+
+    sequences.sort(
+        key=lambda points: (
+            len(points),
+            points[-1][1] - points[0][1],
+            sum(point[2] for point in points),
+        ),
+        reverse=True,
+    )
+    return sequences
+
+
+def _fit_x_of_y(
+    points: List[Tuple[float, float, float]],
+) -> Optional[np.ndarray]:
+    """Fit a robust x(y) curve to boundary or target points."""
+    if not points:
+        return None
+    x_values = np.asarray([point[0] for point in points], dtype=float)
+    y_values = np.asarray([point[1] for point in points], dtype=float)
+    confidence = np.asarray([point[2] for point in points], dtype=float)
+    degree = 2 if len(points) >= 5 and np.ptp(y_values) >= 24.0 else 1
+    degree = min(degree, len(points) - 1)
+    if degree <= 0:
+        return np.asarray([float(np.median(x_values))], dtype=float)
+    try:
+        coefficients = np.polyfit(
+            y_values,
+            x_values,
+            degree,
+            w=np.sqrt(np.clip(confidence, 0.05, None)),
+        )
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    if len(points) >= 6:
+        residuals = np.abs(np.polyval(coefficients, y_values) - x_values)
+        median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median)))
+        keep = residuals <= max(15.0, median + 2.5 * max(mad, 1.0))
+        if int(np.count_nonzero(keep)) >= degree + 2:
+            try:
+                coefficients = np.polyfit(
+                    y_values[keep],
+                    x_values[keep],
+                    degree,
+                    w=np.sqrt(np.clip(confidence[keep], 0.05, None)),
+                )
+            except (ValueError, np.linalg.LinAlgError):
+                pass
+    return coefficients
+
+
+def _choose_boundary_pair(
+    sequences: List[List[Tuple[float, float, float]]],
+    min_gap_px: float,
+    expected_width_px: float,
+) -> Optional[
+    Tuple[
+        List[Tuple[float, float, float]],
+        List[Tuple[float, float, float]],
+        np.ndarray,
+        np.ndarray,
+        float,
+        float,
+    ]
+]:
+    """Choose two overlapping continuous sequences as left/right boundaries."""
+    best = None
+    best_score = -float("inf")
+    candidates = sequences[:6]
+    for first_index, first in enumerate(candidates):
+        first_fit = _fit_x_of_y(first)
+        if first_fit is None:
+            continue
+        for second in candidates[first_index + 1:]:
+            second_fit = _fit_x_of_y(second)
+            if second_fit is None:
+                continue
+            overlap_start = max(first[0][1], second[0][1])
+            overlap_end = min(first[-1][1], second[-1][1])
+            if overlap_end - overlap_start < 24.0:
+                continue
+            middle_y = (overlap_start + overlap_end) * 0.5
+            first_x = float(np.polyval(first_fit, middle_y))
+            second_x = float(np.polyval(second_fit, middle_y))
+            gap = abs(second_x - first_x)
+            if gap < min_gap_px:
+                continue
+            if first_x <= second_x:
+                left, right = first, second
+                left_fit, right_fit = first_fit, second_fit
+            else:
+                left, right = second, first
+                left_fit, right_fit = second_fit, first_fit
+            width_penalty = abs(gap - expected_width_px) / max(
+                expected_width_px, 1.0
+            )
+            score = (
+                len(left)
+                + len(right)
+                + 0.03 * (overlap_end - overlap_start)
+                - 2.0 * width_penalty
+            )
+            if score > best_score:
+                best_score = score
+                best = (
+                    left,
+                    right,
+                    left_fit,
+                    right_fit,
+                    overlap_start,
+                    overlap_end,
+                )
+    return best
+
+
+def _yellow_vote(
+    yellow_mask: np.ndarray,
+    x: float,
+    y: float,
+    radius: int,
+) -> int:
+    """Count yellow pixels in a small square around a floating-point sample."""
+    height, width = yellow_mask.shape
+    center_x = int(round(x))
+    center_y = int(round(y))
+    x0 = max(0, center_x - radius)
+    x1 = min(width, center_x + radius + 1)
+    y0 = max(0, center_y - radius)
+    y1 = min(height, center_y + radius + 1)
+    if x0 >= x1 or y0 >= y1:
+        return 0
+    return int(cv2.countNonZero(yellow_mask[y0:y1, x0:x1]))
+
+
+def _single_boundary_offset_path(
+    boundary_points: List[Tuple[float, float, float]],
+    yellow_mask: np.ndarray,
+    offset_px: float,
+    sample_count: int,
+    y_min_ratio: float,
+    y_max_ratio: float,
+    normal_sample_px: float,
+    vote_radius: int,
+) -> Tuple[List[Tuple[float, float]], int]:
+    """Offset a single boundary along the normal pointing into yellow."""
+    coefficients = _fit_x_of_y(boundary_points)
+    if coefficients is None:
+        return [], 0
+    roi_height, roi_width = yellow_mask.shape
+    point_y_min = boundary_points[0][1]
+    point_y_max = boundary_points[-1][1]
+    sample_y_min = max(point_y_min, (roi_height - 1) * y_min_ratio)
+    sample_y_max = min(point_y_max, (roi_height - 1) * y_max_ratio)
+    if sample_y_max - sample_y_min < 8.0:
+        sample_y_min, sample_y_max = point_y_min, point_y_max
+    if sample_y_max <= sample_y_min:
+        return [], 0
+    sample_y_values = np.linspace(
+        sample_y_min,
+        sample_y_max,
+        max(2, int(sample_count)),
+    )
+    derivative_coefficients = np.polyder(coefficients)
+    vote_distance = max(float(normal_sample_px), vote_radius + 2.0)
+    plus_votes = 0
+    minus_votes = 0
+    geometry = []
+    for y in sample_y_values:
+        x = float(np.polyval(coefficients, y))
+        dx_dy = (
+            float(np.polyval(derivative_coefficients, y))
+            if derivative_coefficients.size
+            else 0.0
+        )
+        normal = np.asarray((1.0, -dx_dy), dtype=float)
+        normal /= max(float(np.linalg.norm(normal)), 1e-6)
+        plus_votes += _yellow_vote(
+            yellow_mask,
+            x + normal[0] * vote_distance,
+            y + normal[1] * vote_distance,
+            vote_radius,
+        )
+        minus_votes += _yellow_vote(
+            yellow_mask,
+            x - normal[0] * vote_distance,
+            y - normal[1] * vote_distance,
+            vote_radius,
+        )
+        geometry.append((x, float(y), normal))
+    if plus_votes == minus_votes:
+        return [], 0
+    inward_sign = 1 if plus_votes > minus_votes else -1
+    target_path = []
+    for x, y, normal in geometry:
+        target_x = float(
+            np.clip(x + inward_sign * normal[0] * offset_px, 0, roi_width - 1)
+        )
+        target_y = float(
+            np.clip(y + inward_sign * normal[1] * offset_px, 0, roi_height - 1)
+        )
+        target_path.append((target_x, target_y))
+    target_path.sort(key=lambda point: point[1])
+    return target_path, inward_sign
+
+
+def _target_path_lookahead(
+    target_path: List[Tuple[float, float]],
+    image_width: int,
+    image_height: int,
+    roi_y_start: int,
+    roi_y_end: int,
+    near_y_ratio: float,
+    far_y_ratio: float,
+    head_gain: float,
+    use_heading_error: bool,
+    heading_gain: float,
+) -> Tuple[float, float, float, float, float, float, float]:
+    """Evaluate one target path at image-relative near/far y positions."""
+    if not target_path:
+        raise ValueError("target_path must not be empty")
+    points = [(x, y, 1.0) for x, y in target_path]
+    coefficients = _fit_x_of_y(points)
+    if coefficients is None:
+        raise ValueError("failed to fit target path")
+    roi_height = roi_y_end - roi_y_start
+    near_y = float(
+        np.clip(
+            image_height * near_y_ratio - roi_y_start,
+            0.0,
+            roi_height - 1.0,
+        )
+    )
+    far_y = float(
+        np.clip(
+            image_height * far_y_ratio - roi_y_start,
+            0.0,
+            roi_height - 1.0,
+        )
+    )
+    near_x = float(
+        np.clip(np.polyval(coefficients, near_y), 0.0, image_width - 1.0)
+    )
+    far_x = float(
+        np.clip(np.polyval(coefficients, far_y), 0.0, image_width - 1.0)
+    )
+    image_center = image_width * 0.5
+    near_error = (near_x - image_center) / image_center
+    far_error = (far_x - image_center) / image_center
+    control_error = near_error + head_gain * (far_error - near_error)
+    if use_heading_error:
+        heading_error = (far_x - near_x) / image_center
+        control_error += heading_gain * heading_error
+    return (
+        near_x,
+        far_x,
+        near_y,
+        far_y,
+        near_error,
+        far_error,
+        control_error,
+    )
+
+
+def _make_v4_result(
+    path_mode: str,
+    target_path: List[Tuple[float, float]],
+    yellow_pixels: int,
+    green_pixels: int,
+    yellow_mask: np.ndarray,
+    green_mask: np.ndarray,
+    boundary_mask: np.ndarray,
+    sequences: List[List[Tuple[float, float, float]]],
+    left_points: List[Tuple[float, float, float]],
+    right_points: List[Tuple[float, float, float]],
+    single_points: List[Tuple[float, float, float]],
+    valid_center_count: int,
+    left_visible_count: int,
+    right_visible_count: int,
+    both_visible_count: int,
+    fallback_centroid: Optional[Tuple[float, float]],
+    image_width: int,
+    image_height: int,
+    roi_y_start: int,
+    roi_y_end: int,
+    params: dict,
+) -> VisionResult:
+    """Create a VisionResult and calculate common near/far look-ahead."""
+    if target_path:
+        (
+            near_x,
+            far_x,
+            near_y,
+            far_y,
+            near_error,
+            far_error,
+            control_error,
+        ) = _target_path_lookahead(
+            target_path,
+            image_width,
+            image_height,
+            roi_y_start,
+            roi_y_end,
+            float(params["near_y_ratio"]),
+            float(params["far_y_ratio"]),
+            float(params["head_gain"]),
+            bool(params["use_heading_error"]),
+            float(params["heading_gain"]),
+        )
+    else:
+        near_x = far_x = near_y = far_y = None
+        near_error = far_error = control_error = 0.0
+    return VisionResult(
+        bool(target_path),
+        path_mode,
+        yellow_pixels,
+        green_pixels,
+        yellow_mask,
+        green_mask,
+        boundary_mask,
+        [],
+        sequences,
+        left_points,
+        right_points,
+        single_points,
+        target_path,
+        sum(len(sequence) for sequence in sequences),
+        valid_center_count,
+        left_visible_count,
+        right_visible_count,
+        both_visible_count,
+        near_x,
+        far_x,
+        near_y,
+        far_y,
+        near_error,
+        far_error,
+        control_error,
+        fallback_centroid,
+        0,
+        0,
+    )
+
+
+def extract_boundary_path(
+    bgr: np.ndarray,
+    params: dict,
+) -> VisionResult:
+    """V4 path extraction with double, single-normal, and yellow fallback."""
+    image_height, image_width = bgr.shape[:2]
+    roi_y_start = int(image_height * float(params["roi_y_start_ratio"]))
+    roi_y_start = min(max(roi_y_start, 0), image_height - 1)
+    roi_y_end = int(image_height * float(params["roi_y_end_ratio"]))
+    roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
+    roi = bgr[roi_y_start:roi_y_end, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    yellow_mask = cv2.inRange(
+        hsv,
+        np.asarray(
+            (
+                int(params["h_min"]),
+                int(params["s_min"]),
+                int(params["v_min"]),
+            ),
+            dtype=np.uint8,
+        ),
+        np.asarray(
+            (
+                int(params["h_max"]),
+                int(params["s_max"]),
+                int(params["v_max"]),
+            ),
+            dtype=np.uint8,
+        ),
+    )
+    green_mask = cv2.inRange(
+        hsv,
+        np.asarray(
+            (
+                int(params["green_h_min"]),
+                int(params["green_s_min"]),
+                int(params["green_v_min"]),
+            ),
+            dtype=np.uint8,
+        ),
+        np.asarray(
+            (
+                int(params["green_h_max"]),
+                int(params["green_s_max"]),
+                int(params["green_v_max"]),
+            ),
+            dtype=np.uint8,
+        ),
+    )
+    # The configurable hue ranges may overlap (the recommended defaults do).
+    # Assign overlapping pixels to the nearer hue-range center so the contact
+    # mask remains a yellow/green interface instead of covering a whole region.
+    overlap = (yellow_mask > 0) & (green_mask > 0)
+    if np.any(overlap):
+        hue = hsv[:, :, 0].astype(np.float32)
+        yellow_center = (
+            float(params["h_min"]) + float(params["h_max"])
+        ) * 0.5
+        green_center = (
+            float(params["green_h_min"]) + float(params["green_h_max"])
+        ) * 0.5
+        yellow_distance = np.abs(hue - yellow_center)
+        green_distance = np.abs(hue - green_center)
+        assign_yellow = overlap & (yellow_distance <= green_distance)
+        assign_green = overlap & ~assign_yellow
+        green_mask[assign_yellow] = 0
+        yellow_mask[assign_green] = 0
+
+    open_size = max(1, int(params["mask_open_kernel_size"]))
+    close_size = max(1, int(params["mask_close_kernel_size"]))
+    if open_size % 2 == 0:
+        open_size += 1
+    if close_size % 2 == 0:
+        close_size += 1
+    open_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (open_size, open_size)
+    )
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (close_size, close_size)
+    )
+    for mask in (yellow_mask, green_mask):
+        cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, dst=mask)
+        cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, dst=mask)
+
+    contact_size = max(1, int(params["boundary_contact_kernel_size"]))
+    if contact_size % 2 == 0:
+        contact_size += 1
+    contact_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (contact_size, contact_size)
+    )
+    yellow_contact = cv2.bitwise_and(
+        cv2.dilate(yellow_mask, contact_kernel), green_mask
+    )
+    green_contact = cv2.bitwise_and(
+        cv2.dilate(green_mask, contact_kernel), yellow_mask
+    )
+    boundary_mask = cv2.bitwise_or(yellow_contact, green_contact)
+    boundary_mask = cv2.dilate(
+        boundary_mask,
+        contact_kernel,
+        iterations=max(0, int(params["boundary_dilate_iterations"])),
+    )
+
+    yellow_pixels = int(cv2.countNonZero(yellow_mask))
+    green_pixels = int(cv2.countNonZero(green_mask))
+    sequences = extract_boundary_points_from_mask(
+        boundary_mask,
+        int(params["boundary_component_min_area"]),
+        float(params["boundary_keep_component_ratio"]),
+        int(params["boundary_y_bucket_px"]),
+        int(params["boundary_min_bucket_points"]),
+        float(params["boundary_max_x_jump_px"]),
+        int(params["boundary_min_points"]),
+    )
+
+    pair = _choose_boundary_pair(
+        sequences,
+        float(params["min_boundary_gap_px"]),
+        float(params["expected_lane_width_px"]),
+    )
+    if pair is not None:
+        left, right, left_fit, right_fit, y0, y1 = pair
+        sample_count = max(
+            int(params["boundary_scan_count"]),
+            int(params["min_left_right_visible_rows"]),
+        )
+        sample_y_values = np.linspace(y0, y1, sample_count)
+        target_path = [
+            (
+                float(
+                    np.clip(
+                        (
+                            np.polyval(left_fit, y)
+                            + np.polyval(right_fit, y)
+                        )
+                        * 0.5,
+                        0.0,
+                        image_width - 1.0,
+                    )
+                ),
+                float(y),
+            )
+            for y in sample_y_values
+        ]
+        return _make_v4_result(
+            "both_boundary_center",
+            target_path,
+            yellow_pixels,
+            green_pixels,
+            yellow_mask,
+            green_mask,
+            boundary_mask,
+            sequences,
+            left,
+            right,
+            [],
+            len(target_path),
+            len(left),
+            len(right),
+            len(target_path),
+            None,
+            image_width,
+            image_height,
+            roi_y_start,
+            roi_y_end,
+            params,
+        )
+
+    single_points: List[Tuple[float, float, float]] = []
+    if sequences:
+        single_points = max(
+            sequences,
+            key=lambda points: (
+                len(points),
+                points[-1][1] - points[0][1],
+            ),
+        )
+    single_span = (
+        single_points[-1][1] - single_points[0][1]
+        if single_points
+        else 0.0
+    )
+    if (
+        bool(params["single_boundary_enable"])
+        and len(single_points) >= int(params["single_boundary_min_points"])
+        and single_span >= float(params["single_boundary_min_y_span_px"])
+    ):
+        target_path, inward_sign = _single_boundary_offset_path(
+            single_points,
+            yellow_mask,
+            float(params["single_boundary_offset_px"]),
+            int(params["single_boundary_sample_count"]),
+            float(params["single_boundary_y_min_ratio"]),
+            float(params["single_boundary_y_max_ratio"]),
+            float(params["single_boundary_normal_sample_px"]),
+            int(params["single_boundary_yellow_vote_radius"]),
+        )
+        if target_path:
+            left_count = len(single_points) if inward_sign > 0 else 0
+            right_count = len(single_points) if inward_sign < 0 else 0
+            return _make_v4_result(
+                "single_boundary_offset",
+                target_path,
+                yellow_pixels,
+                green_pixels,
+                yellow_mask,
+                green_mask,
+                boundary_mask,
+                sequences,
+                single_points if inward_sign > 0 else [],
+                single_points if inward_sign < 0 else [],
+                single_points,
+                len(target_path),
+                left_count,
+                right_count,
+                0,
+                None,
+                image_width,
+                image_height,
+                roi_y_start,
+                roi_y_end,
+                params,
+            )
+
+    fallback_centroid = None
+    if (
+        bool(params["yellow_fallback_enable"])
+        and yellow_pixels >= int(params["yellow_fallback_min_pixels"])
+    ):
+        fallback_centroid = _largest_yellow_centroid(yellow_mask)
+    if fallback_centroid is not None:
+        fallback_x, fallback_y = fallback_centroid
+        roi_height = roi_y_end - roi_y_start
+        target_path = [
+            (fallback_x, max(0.0, fallback_y - roi_height * 0.15)),
+            (fallback_x, min(roi_height - 1.0, fallback_y + roi_height * 0.15)),
+        ]
+        return _make_v4_result(
+            "yellow_area_center_fallback",
+            target_path,
+            yellow_pixels,
+            green_pixels,
+            yellow_mask,
+            green_mask,
+            boundary_mask,
+            sequences,
+            [],
+            [],
+            single_points,
+            0,
+            0,
+            0,
+            0,
+            fallback_centroid,
+            image_width,
+            image_height,
+            roi_y_start,
+            roi_y_end,
+            params,
+        )
+
+    return _make_v4_result(
+        "lost_stop",
+        [],
+        yellow_pixels,
+        green_pixels,
+        yellow_mask,
+        green_mask,
+        boundary_mask,
+        sequences,
+        [],
+        [],
+        single_points,
+        0,
+        0,
+        0,
+        0,
+        None,
+        image_width,
+        image_height,
+        roi_y_start,
+        roi_y_end,
+        params,
+    )
+
+
 def compute_control(
     raw_error: float,
     previous_error: Optional[float],
@@ -742,6 +1444,7 @@ def render_debug_image(
     kp: float,
     kd: float,
     head_gain: float,
+    single_boundary_offset_px: float,
     dry_run: bool,
 ) -> np.ndarray:
     """Draw V3 masks, boundary points, center path, and controller state."""
@@ -824,6 +1527,38 @@ def render_debug_image(
             cv2.circle(debug, center_point, 6, (0, 0, 0), -1)
             cv2.circle(debug, center_point, 4, white, -1)
 
+    # Actual boundary-mask points and their continuous sequences.
+    for sequence in result.boundary_sequences:
+        if not sequence:
+            continue
+        boundary_polyline = np.asarray(
+            [
+                (
+                    int(np.clip(round(x), 0, image_width - 1)),
+                    int(
+                        np.clip(
+                            round(roi_y_start + y),
+                            roi_y_start,
+                            roi_y_end - 1,
+                        )
+                    ),
+                )
+                for x, y, _ in sequence
+            ],
+            dtype=np.int32,
+        )
+        if len(boundary_polyline) >= 2:
+            cv2.polylines(
+                debug,
+                [boundary_polyline],
+                False,
+                green,
+                2,
+                cv2.LINE_AA,
+            )
+        for point in boundary_polyline:
+            cv2.circle(debug, tuple(point), 3, green, -1)
+
     # Vehicle center, fitted center trajectory, and near/far look-ahead points.
     image_center_x = image_width // 2
     cv2.line(
@@ -833,7 +1568,7 @@ def render_debug_image(
         blue,
         2,
     )
-    if len(result.path_points) >= 2:
+    if len(result.target_path_points) >= 2:
         path = np.asarray(
             [
                 (
@@ -846,7 +1581,7 @@ def render_debug_image(
                         )
                     ),
                 )
-                for x, y in result.path_points
+                for x, y in result.target_path_points
             ],
             dtype=np.int32,
         )
@@ -910,7 +1645,10 @@ def render_debug_image(
             cv2.LINE_AA,
         )
 
-    if result.source == "yellow_area_center" and result.fallback_centroid:
+    if (
+        result.path_mode == "yellow_area_center_fallback"
+        and result.fallback_centroid
+    ):
         fallback_x, fallback_y = result.fallback_centroid
         point = (
             int(np.clip(round(fallback_x), 0, image_width - 1)),
@@ -932,8 +1670,11 @@ def render_debug_image(
         )
 
     status_lines = [
+        f"path_mode={result.path_mode}",
         f"yellow_pixels={result.yellow_pixels}",
         f"green_pixels={result.green_pixels}",
+        f"boundary_points_count={result.boundary_points_count}",
+        f"target_path_points_count={len(result.target_path_points)}",
         f"valid_center_count={result.valid_center_count}",
         f"left_visible_count={result.left_visible_count}",
         f"right_visible_count={result.right_visible_count}",
@@ -945,17 +1686,20 @@ def render_debug_image(
         f"angular.z={angular:.3f}",
         f"lost_frames={lost_frames}",
         f"single_boundary_frames={single_boundary_frames}",
+        f"history_age={result.history_age}",
+        f"yellow_fallback_frames={result.yellow_fallback_frames}",
+        f"single_boundary_offset_px={single_boundary_offset_px:.1f}",
         f"kp={kp:.3f}",
         f"kd={kd:.3f}",
         f"head_gain={head_gain:.3f}",
     ]
-    if result.source == "yellow_area_center":
+    if result.path_mode == "yellow_area_center_fallback":
         status_lines.append("fallback=yellow_area_center")
     if dry_run:
         status_lines.append("DRY RUN / ZERO CMD")
 
     line_height = 20
-    lost_title_height = 28 if result.source == "lost" else 0
+    lost_title_height = 28 if result.path_mode == "lost_stop" else 0
     panel_height = min(
         image_height,
         12 + lost_title_height + line_height * len(status_lines),
@@ -972,10 +1716,10 @@ def render_debug_image(
     cv2.addWeighted(overlay, 0.58, debug, 0.42, 0.0, debug)
 
     text_y = 20
-    if result.source == "lost":
+    if result.path_mode == "lost_stop":
         cv2.putText(
             debug,
-            "BOUNDARIES LOST / STOP",
+            "LOST / STOP",
             (8, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
@@ -1013,11 +1757,11 @@ class YellowAreaFollower(Node):
         defaults = {
             "image_topic": "/image_out",
             "cmd_topic": "/cmd_vel_raw",
-            "h_min": 15,
-            "h_max": 40,
-            "s_min": 45,
+            "h_min": 5,
+            "h_max": 55,
+            "s_min": 18,
             "s_max": 255,
-            "v_min": 80,
+            "v_min": 35,
             "v_max": 255,
             "green_h_min": 35,
             "green_h_max": 95,
@@ -1033,6 +1777,16 @@ class YellowAreaFollower(Node):
             "min_valid_bands": 2,
             "boundary_scan_count": 10,
             "boundary_band_half_height": 6,
+            "mask_open_kernel_size": 5,
+            "mask_close_kernel_size": 5,
+            "boundary_contact_kernel_size": 5,
+            "boundary_dilate_iterations": 1,
+            "boundary_component_min_area": 80,
+            "boundary_keep_component_ratio": 0.20,
+            "boundary_y_bucket_px": 8,
+            "boundary_min_bucket_points": 3,
+            "boundary_max_x_jump_px": 100,
+            "boundary_min_points": 5,
             "min_boundary_gap_px": 40,
             "max_boundary_jump_px": 80,
             "expected_lane_width_px": 260,
@@ -1043,13 +1797,34 @@ class YellowAreaFollower(Node):
             "boundary_loss_slowdown": 0.5,
             "min_left_right_visible_rows": 2,
             "single_boundary_max_frames": 10,
+            "both_boundary_speed_scale": 1.0,
+            "single_boundary_enable": True,
+            "single_boundary_offset_px": 110,
+            "single_boundary_min_points": 5,
+            "single_boundary_min_y_span_px": 60,
+            "single_boundary_sample_count": 8,
+            "single_boundary_y_min_ratio": 0.35,
+            "single_boundary_y_max_ratio": 0.85,
+            "single_boundary_normal_sample_px": 12,
+            "single_boundary_yellow_vote_radius": 5,
+            "single_boundary_speed_scale": 0.75,
+            "history_enable": True,
+            "history_max_frames": 5,
+            "history_speed_scale": 0.45,
+            "history_confidence_decay": 0.75,
+            "yellow_fallback_enable": True,
+            "yellow_fallback_speed_scale": 0.30,
+            "yellow_fallback_max_frames": 6,
+            "yellow_fallback_min_pixels": 3000,
+            "use_heading_error": False,
+            "heading_gain": 0.20,
             "linear_speed": 0.04,
             "min_linear_speed": 0.02,
             "kp": 0.22,
             "kd": 0.12,
             "max_angular": 0.25,
             "smoothing_alpha": 0.20,
-            "error_deadband": 0.02,
+            "error_deadband": 0.03,
             "angular_smoothing_alpha": 0.35,
             "max_angular_delta_per_sec": 0.60,
             "lost_stop_frames": 5,
@@ -1108,6 +1883,10 @@ class YellowAreaFollower(Node):
         self.last_turn_direction = 1.0
         self.lost_frames = 0
         self.single_boundary_frames = 0
+        self.last_good_path: List[Tuple[float, float]] = []
+        self.last_good_roi_shape: Optional[Tuple[int, int]] = None
+        self.history_age = 0
+        self.yellow_fallback_frames = 0
         self.last_image_time = time.monotonic()
         self.last_log_time = 0.0
         self.last_error_log_time = 0.0
@@ -1157,11 +1936,28 @@ class YellowAreaFollower(Node):
             "min_valid_bands",
             "boundary_scan_count",
             "boundary_band_half_height",
+            "mask_open_kernel_size",
+            "mask_close_kernel_size",
+            "boundary_contact_kernel_size",
+            "boundary_component_min_area",
+            "boundary_y_bucket_px",
+            "boundary_min_bucket_points",
+            "boundary_max_x_jump_px",
+            "boundary_min_points",
             "min_boundary_gap_px",
             "max_boundary_jump_px",
             "expected_lane_width_px",
             "min_left_right_visible_rows",
             "single_boundary_max_frames",
+            "single_boundary_offset_px",
+            "single_boundary_min_points",
+            "single_boundary_min_y_span_px",
+            "single_boundary_sample_count",
+            "single_boundary_normal_sample_px",
+            "single_boundary_yellow_vote_radius",
+            "history_max_frames",
+            "yellow_fallback_max_frames",
+            "yellow_fallback_min_pixels",
             "lost_stop_frames",
         ):
             if int(p[name]) <= 0:
@@ -1178,6 +1974,7 @@ class YellowAreaFollower(Node):
             "max_angular",
             "search_angular",
             "head_gain",
+            "heading_gain",
             "max_angular_delta_per_sec",
         ):
             if float(p[name]) < 0.0:
@@ -1195,8 +1992,30 @@ class YellowAreaFollower(Node):
             raise ValueError(
                 "look-ahead ratios must satisfy 0 <= far < near <= 1"
             )
-        if not 0.0 <= float(p["boundary_loss_slowdown"]) <= 1.0:
-            raise ValueError("boundary_loss_slowdown must be in [0.0, 1.0]")
+        for name in (
+            "boundary_loss_slowdown",
+            "both_boundary_speed_scale",
+            "single_boundary_speed_scale",
+            "history_speed_scale",
+            "history_confidence_decay",
+            "yellow_fallback_speed_scale",
+            "boundary_keep_component_ratio",
+        ):
+            if not 0.0 <= float(p[name]) <= 1.0:
+                raise ValueError(f"{name} must be in [0.0, 1.0]")
+        if not (
+            0.0 <= float(p["single_boundary_y_min_ratio"]) < 1.0
+            and 0.0 < float(p["single_boundary_y_max_ratio"]) <= 1.0
+            and float(p["single_boundary_y_min_ratio"])
+            < float(p["single_boundary_y_max_ratio"])
+        ):
+            raise ValueError(
+                "single-boundary y ratios must satisfy 0 <= min < max <= 1"
+            )
+        if int(p["boundary_dilate_iterations"]) < 0:
+            raise ValueError(
+                "boundary_dilate_iterations must not be negative"
+            )
         if int(p["min_valid_bands"]) > int(p["boundary_scan_count"]):
             raise ValueError(
                 "min_valid_bands must not exceed boundary_scan_count"
@@ -1262,42 +2081,8 @@ class YellowAreaFollower(Node):
         try:
             bgr = image_message_to_bgr(msg)
             p = self.params
-            result = extract_boundary_path(
-                bgr,
-                (
-                    int(p["h_min"]),
-                    int(p["s_min"]),
-                    int(p["v_min"]),
-                ),
-                (
-                    int(p["h_max"]),
-                    int(p["s_max"]),
-                    int(p["v_max"]),
-                ),
-                (
-                    int(p["green_h_min"]),
-                    int(p["green_s_min"]),
-                    int(p["green_v_min"]),
-                ),
-                (
-                    int(p["green_h_max"]),
-                    int(p["green_s_max"]),
-                    int(p["green_v_max"]),
-                ),
-                float(p["roi_y_start_ratio"]),
-                float(p["roi_y_end_ratio"]),
-                int(p["boundary_scan_count"]),
-                int(p["boundary_band_half_height"]),
-                float(p["min_boundary_gap_px"]),
-                float(p["max_boundary_jump_px"]),
-                float(p["expected_lane_width_px"]),
-                bool(p["use_virtual_boundary"]),
-                int(p["min_valid_bands"]),
-                int(p["min_yellow_pixels"]),
-                float(p["near_y_ratio"]),
-                float(p["far_y_ratio"]),
-                float(p["head_gain"]),
-            )
+            result = extract_boundary_path(bgr, p)
+            result = self._apply_path_priority(result, bgr.shape[:2])
             if result.valid:
                 self._handle_valid_result(bgr, msg, result)
             else:
@@ -1312,6 +2097,105 @@ class YellowAreaFollower(Node):
                 f"Image processing failed; stopping: {exc}"
             )
 
+    def _apply_path_priority(
+        self,
+        observation: VisionResult,
+        image_shape: Tuple[int, int],
+    ) -> VisionResult:
+        """Apply boundary, history, yellow-fallback, then lost priority."""
+        image_height, image_width = image_shape
+        p = self.params
+        roi_y_start = int(image_height * float(p["roi_y_start_ratio"]))
+        roi_y_start = min(max(roi_y_start, 0), image_height - 1)
+        roi_y_end = int(image_height * float(p["roi_y_end_ratio"]))
+        roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
+        roi_shape = (roi_y_end - roi_y_start, image_width)
+
+        if observation.path_mode in (
+            "both_boundary_center",
+            "single_boundary_offset",
+        ):
+            self.last_good_path = list(observation.target_path_points)
+            self.last_good_roi_shape = roi_shape
+            self.history_age = 0
+            self.yellow_fallback_frames = 0
+            observation.history_age = 0
+            observation.yellow_fallback_frames = 0
+            return observation
+
+        history_available = (
+            bool(p["history_enable"])
+            and bool(self.last_good_path)
+            and self.last_good_roi_shape == roi_shape
+            and self.history_age < int(p["history_max_frames"])
+        )
+        if history_available:
+            self.history_age += 1
+            self.yellow_fallback_frames = 0
+            history_result = _make_v4_result(
+                "history_prediction",
+                list(self.last_good_path),
+                observation.yellow_pixels,
+                observation.green_pixels,
+                observation.yellow_mask,
+                observation.green_mask,
+                observation.boundary_mask,
+                observation.boundary_sequences,
+                observation.left_boundary_points,
+                observation.right_boundary_points,
+                observation.single_boundary_points,
+                len(self.last_good_path),
+                observation.left_visible_count,
+                observation.right_visible_count,
+                observation.both_visible_count,
+                None,
+                image_width,
+                image_height,
+                roi_y_start,
+                roi_y_end,
+                p,
+            )
+            history_result.history_age = self.history_age
+            return history_result
+
+        if observation.path_mode == "yellow_area_center_fallback":
+            self.yellow_fallback_frames += 1
+            observation.history_age = self.history_age
+            observation.yellow_fallback_frames = self.yellow_fallback_frames
+            if self.yellow_fallback_frames <= int(
+                p["yellow_fallback_max_frames"]
+            ):
+                return observation
+        else:
+            self.yellow_fallback_frames = 0
+
+        lost_result = _make_v4_result(
+            "lost_stop",
+            [],
+            observation.yellow_pixels,
+            observation.green_pixels,
+            observation.yellow_mask,
+            observation.green_mask,
+            observation.boundary_mask,
+            observation.boundary_sequences,
+            observation.left_boundary_points,
+            observation.right_boundary_points,
+            observation.single_boundary_points,
+            0,
+            observation.left_visible_count,
+            observation.right_visible_count,
+            observation.both_visible_count,
+            None,
+            image_width,
+            image_height,
+            roi_y_start,
+            roi_y_end,
+            p,
+        )
+        lost_result.history_age = self.history_age
+        lost_result.yellow_fallback_frames = self.yellow_fallback_frames
+        return lost_result
+
     def _handle_valid_result(
         self,
         bgr: np.ndarray,
@@ -1319,33 +2203,23 @@ class YellowAreaFollower(Node):
         result: VisionResult,
     ) -> None:
         p = self.params
-        speed_scale = 1.0
-        enough_both = (
-            result.both_visible_count
-            >= int(p["min_left_right_visible_rows"])
-        )
-        if result.source == "yellow_area_center":
-            self.lost_frames += 1
+        self.lost_frames = 0
+        if result.path_mode == "both_boundary_center":
+            speed_scale = float(p["both_boundary_speed_scale"])
             self.single_boundary_frames = 0
-            speed_scale = float(p["boundary_loss_slowdown"])
-            if self.lost_frames > int(p["lost_stop_frames"]):
-                self.previous_error = None
-                self.previous_angular = 0.0
-                self._publish_stop()
-                self._throttled_status_log(result, 0.0, 0.0)
-                self._publish_debug(bgr, source_msg, result, 0.0, 0.0)
-                return
+        elif result.path_mode == "single_boundary_offset":
+            speed_scale = float(p["single_boundary_speed_scale"])
+            self.single_boundary_frames += 1
+        elif result.path_mode == "history_prediction":
+            speed_scale = float(p["history_speed_scale"]) * (
+                float(p["history_confidence_decay"]) ** result.history_age
+            )
+            self.single_boundary_frames = 0
+        elif result.path_mode == "yellow_area_center_fallback":
+            speed_scale = float(p["yellow_fallback_speed_scale"])
+            self.single_boundary_frames = 0
         else:
-            self.lost_frames = 0
-            if enough_both:
-                self.single_boundary_frames = 0
-            else:
-                self.single_boundary_frames += 1
-                speed_scale = float(p["boundary_loss_slowdown"])
-                if self.single_boundary_frames > int(
-                    p["single_boundary_max_frames"]
-                ):
-                    speed_scale *= float(p["boundary_loss_slowdown"])
+            speed_scale = 0.0
 
         now = time.monotonic()
         elapsed = now - self.last_control_time
@@ -1458,7 +2332,9 @@ class YellowAreaFollower(Node):
             f"linear.x={linear:.3f}, angular.z={angular:.3f}, "
             f"lost_frames={self.lost_frames}, "
             f"single_boundary_frames={self.single_boundary_frames}, "
-            f"source={result.source}"
+            f"history_age={result.history_age}, "
+            f"yellow_fallback_frames={result.yellow_fallback_frames}, "
+            f"path_mode={result.path_mode}"
         )
 
     def _throttled_error(self, message: str) -> None:
@@ -1512,6 +2388,7 @@ class YellowAreaFollower(Node):
                 float(p["kp"]),
                 float(p["kd"]),
                 float(p["head_gain"]),
+                float(p["single_boundary_offset_px"]),
                 bool(p["dry_run"]),
             )
             full_yellow_mask = np.zeros(
