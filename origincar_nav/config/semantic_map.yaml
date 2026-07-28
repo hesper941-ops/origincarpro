@@ -36,7 +36,7 @@ points:
 
   task_station:
     # Measured / manually confirmed coordinate; fine-tune on car if needed.
-    pose: [4.20, 1.60, 0.0]
+    pose: [3.40, 1.00, 0.0]
     description: "QR task publishing station"
 
   channel_entry:
