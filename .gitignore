@@ -2,6 +2,7 @@
 build/
 install/
 log/
+runs/
 *.log
 
 # Python cache
@@ -16,6 +17,10 @@ __pycache__/
 # temp
 *.tmp
 *.swp
+*.bak
+*.bak_*
+*_old_*
+*_before_*
 .DS_Store
 Thumbs.db
 
@@ -48,3 +53,18 @@ auth.bin
 *.deb
 *.so
 *.a
+*.pyc
+__pycache__/
+.vscode/
+.DS_Store
+
+# Local third-party source trees
+/3rdparty/deptrum-ros-driver/
+
+# local secrets
+racing_vision_ai/config/vision_ai_config.yaml.bak_local_secret
+*.local_secret
+.env
+
+# local third-party source trees
+/3rdparty/deptrum-ros-driver/

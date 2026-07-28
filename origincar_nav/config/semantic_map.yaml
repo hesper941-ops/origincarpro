@@ -1,0 +1,84 @@
+# Coordinates use the 5m x 5m official field convention:
+# origin at the lower-left corner, x to the right, y upward, units in meters.
+# Current point values are measured / manually confirmed coordinates.
+# They can still be fine-tuned on the real car with /odom_combined.
+map_frame: map
+odom_frame: odom_combined
+base_frame: base_footprint
+
+task_manager:
+  qr_scan_start_dist_to_task_station: 1.0
+
+visualization:
+  frame_id: map
+  path_max_length: 500
+  show_text_labels: true
+  show_routes: true
+  show_boundary: true
+
+yolo_labels:
+  qr: QR_code
+  line: line
+  p_point: end
+  obstacle: roadblock
+
+boundary:
+  x_min: 0.0
+  x_max: 5.0
+  y_min: 0.0
+  y_max: 5.0
+
+points:
+  p_start:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [0, 0, 0.0]
+    description: "P point / start point"
+
+  task_station:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [3.40, 1.00, 0.0]
+    description: "QR task publishing station"
+
+  channel_entry:
+    # Compatibility field for current task_manager; prefer channel_entry_lower / channel_entry_upper later.
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [1.95, 1.80, 0.0]
+    description: "Compatibility entrance point, currently equal to channel_entry_lower"
+
+  channel_entry_lower:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [1.95, 1.80, 0.0]
+    description: "Lower entrance from blue hall to vertical yellow channel"
+
+  channel_entry_upper:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [1.95, 2.97, 0.0]
+    description: "Upper transition from vertical entrance channel to yellow loop"
+
+  channel_p1:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [0.20, 2.97, 0.0]
+
+  channel_p2:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [3.70, 2.97, 0.0]
+
+  channel_p3:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [3.70, 4.12, 0.0]
+
+  channel_p4:
+    # Measured / manually confirmed coordinate; fine-tune on car if needed.
+    pose: [0.20, 4.12, 0.0]
+
+routes:
+  clockwise:
+    channel_order: [channel_p1, channel_p2, channel_p3, channel_p4]
+
+  anticlockwise:
+    channel_order: [channel_p1, channel_p4, channel_p3, channel_p2]
+
+thresholds:
+  goal_reached_dist: 0.15
+  goal_reached_yaw: 0.35
+  channel_goal_reached_dist: 0.12
