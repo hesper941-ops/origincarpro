@@ -54,7 +54,6 @@ DEFAULT_IMAGE_WIDTH = 640
 DEFAULT_IMAGE_HEIGHT = 480
 POINT_NAMES = ("P1 TL", "P2 TR", "P3 BL", "P4 BR")
 POINT_KEYS = ("top_left", "top_right", "bottom_left", "bottom_right")
-POINT_COLORS = ((70, 210, 255), (80, 255, 100), (255, 150, 50), (255, 80, 220))
 PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -80,6 +79,8 @@ class IpmCalibrationConfig:
     meter_per_pixel: float = 0.005
     vehicle_center_x_px: float = 300.0
     vehicle_origin_y_px: float = 799.0
+    # 仅保存坐标语义，不查询 TF。必须与未来第四阶段采用的车辆参考原点一致。
+    vehicle_reference_point_name: str = "base_link"
     expected_lane_width_m: float = 0.50  # 仅供未来阶段使用，待实车验证。
     single_boundary_center_offset_m: float = 0.25  # 仅供未来阶段使用。
     min_source_quad_area_px: float = 5000.0  # 待实车验证。
@@ -114,6 +115,17 @@ class IpmCalibrationConfig:
             raise CalibrationError("vehicle_center_x_px 超出鸟瞰图范围")
         if not (0 <= self.vehicle_origin_y_px < self.output_height_px):
             raise CalibrationError("vehicle_origin_y_px 超出鸟瞰图范围")
+        if (
+            not self.vehicle_reference_point_name
+            or len(self.vehicle_reference_point_name) > 128
+            or ".." in self.vehicle_reference_point_name
+            or not re.fullmatch(
+                r"[A-Za-z0-9_/]+", self.vehicle_reference_point_name
+            )
+        ):
+            raise CalibrationError(
+                "vehicle_reference_point_name 只能包含字母、数字、下划线和斜杠"
+            )
         if not (1 <= self.web_gui_port <= 65535):
             raise CalibrationError("Web 端口必须位于 1 到 65535")
         if not (1 <= self.web_gui_jpeg_quality <= 100):
@@ -464,6 +476,7 @@ class IpmConfigManager:
                 "vehicle_forward": "up_in_birdview",
                 "vehicle_left": "left_in_birdview",
                 "vehicle_origin": "configured_reference_point",
+                "vehicle_reference_point_name": config.vehicle_reference_point_name,
                 "forward_formula": "(vehicle_origin_y_px - birdview_y_px) * meter_per_pixel",
                 "left_formula": "(vehicle_center_x_px - birdview_x_px) * meter_per_pixel",
             },
@@ -620,15 +633,17 @@ pre{white-space:pre-wrap;background:#0d131d;padding:8px;border-radius:5px;max-he
 <li>相机固定为 640×480；标定板完全平铺，不能翘起、卷曲或折叠。</li>
 <li>0.50 m 短边沿车辆横向，0.70 m 长边沿车辆前进方向，中心尽量对准车辆中心轴。</li>
 <li>四个外角必须全部可见，板覆盖画面下部至中部；内部无需小方格，只标注四个角点。</li>
-<li>现场测量近边到车辆参考原点距离，不要长期照用默认 0.20 m。</li>
-<li>依次点击 TL、TR、BL、BR，检查鸟瞰外框约为 100×140 px 的 5∶7 长方形，而不是正方形。</li>
-<li>用测距确认 100 px≈0.50 m、140 px≈0.70 m；保存后不可移动相机。</li>
+<li>必须核对车辆实际 TF 定义；近边距离必须从未来第四阶段使用的同一个车辆参考原点测量，不要长期照用默认 0.20 m。</li>
+<li>依次点击 TL、TR、BL、BR。四角会被程序强制映射为 100×140 px，因此测量这四个目标角只能验证目的点和米像素比例计算，不能独立证明标定精度。</li>
+<li>真正的人工验证应使用未参与四点计算的已知距离，例如矩形边缘中点标记、另一条已知长度，以及逆透视后近场和中场的固定 0.50 m 赛道宽度。</li>
+<li>确认鸟瞰外框为 5∶7 长方形而非正方形；保存后不可移动相机。</li>
 </ol></section></main><aside class="panel"><h3>参数</h3><div id="params"></div><h3>四点原图坐标</h3><div id="pointInputs"></div>
 <button onclick="applyPoints()">应用四点</button><pre id="status"></pre></aside></div>
 <script>
 const fields=['calibration_board_width_m','calibration_board_length_m','calibration_grid_size_m',
 'board_near_edge_distance_m','board_center_lateral_offset_m','output_width_px','output_height_px',
-'meter_per_pixel','vehicle_center_x_px','vehicle_origin_y_px','expected_lane_width_m','single_boundary_center_offset_m'];
+'meter_per_pixel','vehicle_center_x_px','vehicle_origin_y_px','vehicle_reference_point_name',
+'expected_lane_width_m','single_boundary_center_offset_m'];
 let state={},drag=-1;
 function el(id){return document.getElementById(id)}
 function build(){
@@ -684,6 +699,7 @@ class IpmCalibrationNode(Node):
         "meter_per_pixel",
         "vehicle_center_x_px",
         "vehicle_origin_y_px",
+        "vehicle_reference_point_name",
         "expected_lane_width_m",
         "single_boundary_center_offset_m",
     }
@@ -714,6 +730,17 @@ class IpmCalibrationNode(Node):
             "green": None,
         }
         self.mask_messages: Dict[str, Optional[Image]] = {
+            "boundary": None,
+            "yellow": None,
+            "green": None,
+        }
+        # 冻结快照与实时缓存完全分离；缺失的 mask 合法地保持为 None。
+        self.frozen_masks: Dict[str, Optional[np.ndarray]] = {
+            "boundary": None,
+            "yellow": None,
+            "green": None,
+        }
+        self.frozen_mask_messages: Dict[str, Optional[Image]] = {
             "boundary": None,
             "yellow": None,
             "green": None,
@@ -776,6 +803,25 @@ class IpmCalibrationNode(Node):
             if self.frozen_image is not None
             else self.latest_image_message
         )
+
+    def _display_masks(self) -> Dict[str, Optional[np.ndarray]]:
+        return self.frozen_masks if self.frozen_image is not None else self.masks
+
+    def _display_mask_messages(self) -> Dict[str, Optional[Image]]:
+        return (
+            self.frozen_mask_messages
+            if self.frozen_image is not None
+            else self.mask_messages
+        )
+
+    @staticmethod
+    def _header_snapshot(message: Optional[Image]) -> Optional[Image]:
+        """只复制发布所需的消息头，避免冻结快照引用后续可变状态。"""
+        if message is None:
+            return None
+        snapshot = Image()
+        snapshot.header = copy.deepcopy(message.header)
+        return snapshot
 
     def _initialize_placeholders(self) -> None:
         """让无相机、无第二阶段时 Web 流仍能给出明确文字。"""
@@ -915,27 +961,6 @@ class IpmCalibrationNode(Node):
         with self.lock:
             self.status.segmentation_status_received = True
 
-    def _annotate_raw(self, image: np.ndarray) -> np.ndarray:
-        overlay = image.copy()
-        points = np.asarray(self.points.points, dtype=np.int32)
-        if len(points) > 1:
-            order = [0, 1, 3, 2, 0] if len(points) == 4 else list(range(len(points)))
-            cv2.polylines(overlay, [points[order]], False, (255, 255, 255), 2, cv2.LINE_AA)
-        for index, point in enumerate(points):
-            color = POINT_COLORS[index]
-            cv2.circle(overlay, tuple(point), 7, color, -1, cv2.LINE_AA)
-            cv2.putText(
-                overlay,
-                POINT_NAMES[index],
-                (int(point[0]) + 10, int(point[1]) - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-        return overlay
-
     def _annotate_birdview(self, image: np.ndarray) -> np.ndarray:
         """仅画坐标轴、车辆原点和标定板外框；不画内部小方格。"""
         overlay = image.copy()
@@ -969,9 +994,15 @@ class IpmCalibrationNode(Node):
             if image is None:
                 return
             source_message = self._display_image_message()
-            raw = self._annotate_raw(image)
-            masks = {name: None if value is None else value.copy() for name, value in self.masks.items()}
-            mask_messages = self.mask_messages.copy()
+            # /stream/raw 始终是未画角点的原始 BGR；交互标注只由浏览器 Canvas 绘制。
+            raw = image.copy()
+            selected_masks = self._display_masks()
+            selected_messages = self._display_mask_messages()
+            masks = {
+                name: None if value is None else value.copy()
+                for name, value in selected_masks.items()
+            }
+            mask_messages = selected_messages.copy()
         self.frames.update("raw", raw, self.config.web_gui_jpeg_quality)
         if matrix is None:
             blank = np.zeros((480, 600, 3), dtype=np.uint8)
@@ -979,10 +1010,14 @@ class IpmCalibrationNode(Node):
             self.frames.update("birdview", blank, self.config.web_gui_jpeg_quality)
             return
         size = (self.config.output_width_px, self.config.output_height_px)
-        birdview = self._annotate_birdview(IpmTransformer.color(image, matrix, size))
-        self.frames.update("birdview", birdview, self.config.web_gui_jpeg_quality)
+        pure_birdview = IpmTransformer.color(image, matrix, size)
+        web_birdview = self._annotate_birdview(pure_birdview)
+        self.frames.update("birdview", web_birdview, self.config.web_gui_jpeg_quality)
         if self.publishers:
-            self.publishers["raw"].publish(ImageCodec.to_message(birdview, "bgr8", source_message))
+            # ROS raw_birdview 是纯透视结果，不混入 Web 调试标注。
+            self.publishers["raw"].publish(
+                ImageCodec.to_message(pure_birdview, "bgr8", source_message)
+            )
         for name, mask in masks.items():
             if mask is None:
                 continue
@@ -1030,6 +1065,7 @@ class IpmCalibrationNode(Node):
                 "meter_per_pixel": self.config.meter_per_pixel,
                 "vehicle_center_x_px": self.config.vehicle_center_x_px,
                 "vehicle_origin_y_px": self.config.vehicle_origin_y_px,
+                "vehicle_reference_point_name": self.config.vehicle_reference_point_name,
                 "board_near_edge_distance_m": self.config.board_near_edge_distance_m,
                 "board_center_lateral_offset_m": self.config.board_center_lateral_offset_m,
                 "expected_lane_width_m": self.config.expected_lane_width_m,
@@ -1070,8 +1106,10 @@ class IpmCalibrationNode(Node):
             if name not in self.WEB_EDITABLE_FIELDS:
                 raise CalibrationError(f"不允许通过 Web 修改参数: {name}")
             current = getattr(candidate, name)
-            if isinstance(current, int) and not isinstance(current, bool):
-                converted: Any = int(float(value))
+            if isinstance(current, str):
+                converted: Any = str(value).strip()
+            elif isinstance(current, int) and not isinstance(current, bool):
+                converted = int(float(value))
             else:
                 converted = float(value)
             setattr(candidate, name, converted)
@@ -1086,14 +1124,35 @@ class IpmCalibrationNode(Node):
     def _freeze(self) -> None:
         if self.latest_image is None:
             raise CalibrationError("尚未收到相机图像，无法冻结当前帧")
+        # 调用者持有同一把 RLock，因此原图、三种 mask 和消息头构成原子快照。
         self.frozen_image = self.latest_image.copy()
-        self.frozen_image_message = self.latest_image_message
+        self.frozen_image_message = self._header_snapshot(
+            self.latest_image_message
+        )
+        self.frozen_masks = {
+            name: None if value is None else value.copy()
+            for name, value in self.masks.items()
+        }
+        self.frozen_mask_messages = {
+            name: self._header_snapshot(message)
+            for name, message in self.mask_messages.items()
+        }
         self.status.frozen_frame_active = True
         self._refresh_previews(force=True)
 
     def _resume(self) -> None:
         self.frozen_image = None
         self.frozen_image_message = None
+        self.frozen_masks = {
+            "boundary": None,
+            "yellow": None,
+            "green": None,
+        }
+        self.frozen_mask_messages = {
+            "boundary": None,
+            "yellow": None,
+            "green": None,
+        }
         self.status.frozen_frame_active = False
         self._refresh_previews(force=True)
 
@@ -1135,6 +1194,10 @@ class IpmCalibrationNode(Node):
         candidate.meter_per_pixel = float(output["meter_per_pixel"])
         candidate.vehicle_center_x_px = float(output["vehicle_center_x_px"])
         candidate.vehicle_origin_y_px = float(output["vehicle_origin_y_px"])
+        convention = document.get("coordinate_convention", {})
+        candidate.vehicle_reference_point_name = str(
+            convention.get("vehicle_reference_point_name", "base_link")
+        )
         candidate.expected_lane_width_m = float(roads["expected_lane_width_m"])
         candidate.single_boundary_center_offset_m = float(roads["single_boundary_center_offset_m"])
         candidate.validate()
