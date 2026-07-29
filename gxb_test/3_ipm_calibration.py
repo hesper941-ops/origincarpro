@@ -13,9 +13,9 @@
 3. 本版标定板内部不需要小方格，只在四个外角做清楚标记。四角必须全部进入画面，
    标定板尽量覆盖画面下部到中部，不要全部挤在画面上半部。
 4. 实测标定板近边到车辆鸟瞰参考原点的距离，并填写横向中心偏移。
-5. 浏览器打开 ``http://小车IP:8091``，冻结画面，依次点击：
+5. 浏览器打开 ``http://小车IP:8091``，点击“采集标定帧”，在后端保存的静态图中依次点击：
    P1 TL 远端左角、P2 TR 远端右角、P3 BL 近端左角、P4 BR 近端右角。
-6. 页面只标注这四个点和标定板外框；可拖动点或输入原图像素坐标进行微调。
+6. 角点和外框由后端绘制；本工具不支持拖动，点错后撤销，或一次性输入四点坐标。
 7. 验证彩色鸟瞰图、车辆原点/中心轴及米制测距后保存配置。
 
 为何使用 0.50 m × 0.70 m：它比 1 m 方板更适合当前 USB 相机的近场和中场，
@@ -162,7 +162,6 @@ class IpmRuntimeStatus:
     yellow_mask_received: bool = False
     green_mask_received: bool = False
     segmentation_status_received: bool = False
-    frozen_frame_active: bool = False
     selected_point_count: int = 0
     next_point_name: str = POINT_NAMES[0]
     fps: float = 0.0
@@ -591,96 +590,100 @@ class WebFrameStore:
 
 WEB_PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>固定相机 IPM 标定</title>
+<title>固定相机 IPM 静态帧标定</title>
 <style>
 body{margin:0;background:#10151d;color:#e7edf5;font:14px system-ui}.top{padding:12px 18px;background:#172131;position:sticky;top:0;z-index:2}
 h1{margin:0 0 6px;font-size:21px}.warn{color:#ffcc66}.bad{color:#ff6b6b}.good{color:#6fe29b}
-.layout{display:grid;grid-template-columns:minmax(600px,2fr) minmax(300px,1fr);gap:12px;padding:12px}
-.panel{background:#182231;border:1px solid #2b3a50;border-radius:8px;padding:12px}.views{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.view{min-width:0}.view h3{margin:4px 0}.canvasbox{position:relative;background:#05080c;line-height:0}
-canvas,img{width:100%;height:auto;display:block}.rawbase{visibility:hidden}.overlay{position:absolute;inset:0;cursor:crosshair}
+.page{padding:12px}.row{display:grid;grid-template-columns:minmax(0,2fr) minmax(320px,1fr);gap:12px;margin-bottom:12px}
+.panel{background:#182231;border:1px solid #2b3a50;border-radius:8px;padding:12px;min-width:0}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:10px}.view h3{margin:4px 0}
+img{width:100%;height:auto;display:block;background:#05080c}.clickable{cursor:crosshair}
 .buttons{display:flex;flex-wrap:wrap;gap:7px;margin:9px 0}button{padding:7px 10px;background:#31577f;color:white;border:0;border-radius:5px;cursor:pointer}
-button.danger{background:#893c49}label{display:grid;grid-template-columns:1fr 110px;gap:8px;margin:5px 0}
+button.danger{background:#893c49}label{display:grid;grid-template-columns:1fr 120px;gap:8px;margin:5px 0}
 input{background:#0f1722;color:#eef;border:1px solid #40516a;border-radius:4px;padding:5px}
 .points{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.small{font-size:12px;color:#aab8ca}
-pre{white-space:pre-wrap;background:#0d131d;padding:8px;border-radius:5px;max-height:260px;overflow:auto}
-@media(max-width:1000px){.layout{grid-template-columns:1fr}.views{grid-template-columns:1fr}}
+pre{white-space:pre-wrap;background:#0d131d;padding:8px;border-radius:5px;max-height:300px;overflow:auto}
+@media(max-width:1000px){.row,.pair{grid-template-columns:1fr}}
 </style></head><body>
-<div class="top"><h1>第三阶段：固定相机 IPM 标定（gxb_ipm_v1）</h1>
-<div id="summary">等待状态……</div><div class="warn">无身份认证：仅在可信现场网络使用。标定板内部没有小方格，只标注并选择四个外角。</div></div>
-<div class="layout"><main>
-<section class="panel"><div class="views">
-<div class="view"><h3>完整原始图（点击/拖动四点）</h3><div class="canvasbox">
-<img id="raw" class="rawbase" src="/stream/raw"><canvas id="canvas" class="overlay"></canvas></div>
-<div id="next" class="warn"></div></div>
-<div class="view"><h3>彩色鸟瞰预览（点击两点测距）</h3><div class="canvasbox">
-<img id="bird" class="rawbase" src="/stream/birdview"><canvas id="birdCanvas" class="overlay"></canvas></div></div>
-</div><div class="buttons">
-<button onclick="post('/api/freeze')">冻结当前帧</button><button onclick="post('/api/resume')">恢复实时</button>
-<button onclick="post('/api/undo_point')">撤销上一个点</button><button class="danger" onclick="post('/api/clear_points')">清空四点</button>
-<button onclick="post('/api/recompute')">重新计算</button><button onclick="post('/api/validate')">验证标定</button>
-<button onclick="post('/api/save')">保存配置</button><button onclick="post('/api/load')">加载配置</button>
-<button onclick="post('/api/reset_defaults')">恢复默认参数</button></div></section>
-<section class="panel"><div class="views"><div><h3>原始 boundary mask</h3><img src="/stream/boundary_raw"></div>
-<div><h3>鸟瞰 boundary mask</h3><img src="/stream/boundary_birdview"></div>
-<div><h3>鸟瞰 yellow mask</h3><img src="/stream/yellow_birdview"></div>
-<div><h3>鸟瞰 green mask</h3><img src="/stream/green_birdview"></div></div>
-<p class="small">第二阶段未运行时，对应区域会等待输出；不影响四点 IPM 标定和配置保存。</p></section>
-<section class="panel"><h3>鸟瞰测距</h3><p>在鸟瞰图坐标中输入两点。距离按 meter_per_pixel 计算。</p>
+<div class="top"><h1>第三阶段：固定相机 IPM 静态帧标定（gxb_ipm_v1）</h1>
+<div id="summary">等待状态……</div>
+<div class="warn">请先点击“采集标定帧”，随后只在下方静态图片中依次点击 TL、TR、BL、BR。实时图仅用于观察。</div></div>
+<div class="page">
+<section class="panel row"><div class="view"><h3>实时相机预览（不可点击）</h3><img id="liveImage" src="/stream/raw"></div>
+<div class="view"><h3>静态鸟瞰结果</h3><img id="birdviewImage" src="/image/calibration_birdview.jpg"></div></section>
+<section class="row"><div class="panel"><h3>静态标定图（依次点击四角）</h3>
+<img id="calibrationImage" class="clickable" src="/image/calibration_annotated.jpg">
+<p id="next" class="warn"></p><div class="buttons">
+<button onclick="captureFrame()">采集标定帧</button><button onclick="captureFrame()">重新采集</button>
+<button onclick="post('/api/undo_point')">撤销上一个点</button>
+<button class="danger" onclick="post('/api/clear_points')">清空四点</button>
+<button onclick="applyPoints()">应用手工坐标</button><button onclick="post('/api/recompute')">重新计算</button>
+<button onclick="post('/api/validate')">验证标定</button><button onclick="post('/api/save')">保存配置</button>
+<button onclick="post('/api/load')">加载配置</button><button onclick="post('/api/reset_defaults')">恢复默认参数</button>
+</div><h3>四点原图坐标</h3><div id="pointInputs"></div></div>
+<aside class="panel"><h3>参数</h3><div id="params"></div><pre id="status"></pre></aside></section>
+<section class="panel"><h3>鸟瞰测距</h3><p>输入鸟瞰像素坐标测量未参与四角强制映射的已知距离。</p>
 <div class="points"><input id="mx1" placeholder="x1"><input id="my1" placeholder="y1"><input id="mx2" placeholder="x2"><input id="my2" placeholder="y2"></div>
-<button onclick="measure()">测量</button><button onclick="post('/api/clear_measurement')">清除测量</button><span id="measure"></span></section>
+<div class="buttons"><button onclick="measure()">测量</button><button onclick="post('/api/clear_measurement')">清除测量</button><span id="measure"></span></div></section>
+<details id="maskPanel" class="panel"><summary>第二阶段 mask 鸟瞰预览（可选）</summary><div class="pair">
+<div><h3>原始 boundary</h3><img src="/stream/boundary_raw"></div><div><h3>鸟瞰 boundary</h3><img src="/stream/boundary_birdview"></div>
+<div><h3>鸟瞰 yellow</h3><img src="/stream/yellow_birdview"></div><div><h3>鸟瞰 green</h3><img src="/stream/green_birdview"></div></div>
+<p class="small">第二阶段不是四点标定的必要条件。</p></details>
 <section class="panel"><h3>摆放与验收</h3><ol>
-<li>相机固定为 640×480；标定板完全平铺，不能翘起、卷曲或折叠。</li>
-<li>0.50 m 短边沿车辆横向，0.70 m 长边沿车辆前进方向，中心尽量对准车辆中心轴。</li>
-<li>四个外角必须全部可见，板覆盖画面下部至中部；内部无需小方格，只标注四个角点。</li>
-<li>必须核对车辆实际 TF 定义；近边距离必须从未来第四阶段使用的同一个车辆参考原点测量，不要长期照用默认 0.20 m。</li>
-<li>依次点击 TL、TR、BL、BR。四角会被程序强制映射为 100×140 px，因此测量这四个目标角只能验证目的点和米像素比例计算，不能独立证明标定精度。</li>
-<li>真正的人工验证应使用未参与四点计算的已知距离，例如矩形边缘中点标记、另一条已知长度，以及逆透视后近场和中场的固定 0.50 m 赛道宽度。</li>
-<li>确认鸟瞰外框为 5∶7 长方形而非正方形；保存后不可移动相机。</li>
-</ol></section></main><aside class="panel"><h3>参数</h3><div id="params"></div><h3>四点原图坐标</h3><div id="pointInputs"></div>
-<button onclick="applyPoints()">应用四点</button><pre id="status"></pre></aside></div>
+<li>相机固定为 640×480；0.50 m × 0.70 m 标定板完全平铺，内部没有实体网格，只标注四个外角。</li>
+<li>短边沿车辆横向，长边沿前进方向；核对车辆实际 TF，近边距离从未来阶段使用的同一个车辆参考原点测量。</li>
+<li>四个目标角被强制映射为 100×140 px，只能验证目的点和米像素比例，不能单独证明标定精度。</li>
+<li>使用未参与四点计算的边缘中点标记、另一条已知长度或近/中场固定 0.50 m 赛道宽度进行人工验证。</li>
+</ol></section></div>
 <script>
 const fields=['calibration_board_width_m','calibration_board_length_m','calibration_grid_size_m',
 'board_near_edge_distance_m','board_center_lateral_offset_m','output_width_px','output_height_px',
 'meter_per_pixel','vehicle_center_x_px','vehicle_origin_y_px','vehicle_reference_point_name',
 'expected_lane_width_m','single_boundary_center_offset_m'];
-let state={},drag=-1;
+let state={};
 function el(id){return document.getElementById(id)}
 function build(){
  el('params').innerHTML=fields.map(k=>`<label>${k}<input id="p_${k}"></label>`).join('');
  el('pointInputs').innerHTML=['P1 TL','P2 TR','P3 BL','P4 BR'].map((n,i)=>`<label>${n}<span><input id="x${i}" style="width:65px"> <input id="y${i}" style="width:65px"></span></label>`).join('');
  fields.forEach(k=>el('p_'+k).onchange=()=>post('/api/set',{[k]:el('p_'+k).value}));
 }
-async function post(url,data={}){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let j=await r.json();if(!r.ok)alert(j.error||'操作失败');await refresh();return j}
-async function refresh(){
- try{state=await (await fetch('/api/status')).json();let cfg=await (await fetch('/api/config')).json();
- fields.forEach(k=>{if(document.activeElement!==el('p_'+k))el('p_'+k).value=cfg[k]});
- (state.source_points||[]).forEach((p,i)=>{if(document.activeElement!==el('x'+i))el('x'+i).value=p[0].toFixed(1);if(document.activeElement!==el('y'+i))el('y'+i).value=p[1].toFixed(1)});
- el('summary').innerHTML=`topic=${state.image_topic} | ${state.image_width}×${state.image_height} | FPS=${state.fps.toFixed(1)} | profile=${state.profile_name} | ${state.frozen_frame_active?'冻结帧':'实时画面'} | <span class="${state.calibration_valid?'good':'bad'}">${state.calibration_valid?'标定有效':state.calibration_reason}</span>`;
- el('next').textContent='当前等待点击：'+state.next_point_name;el('status').textContent=JSON.stringify(state,null,2);draw();
- }catch(e){el('summary').textContent='状态读取失败: '+e}
+function refreshStaticImages(){
+ const stamp=Date.now();
+ el('calibrationImage').src=`/image/calibration_annotated.jpg?t=${stamp}`;
+ el('birdviewImage').src=`/image/calibration_birdview.jpg?t=${stamp}`;
 }
-function imageGeometry(id='raw',canvasId='canvas'){
- let img=el(id),c=el(canvasId),r=img.getBoundingClientRect();c.width=Math.max(1,img.naturalWidth||(id==='raw'?(state.image_width||640):(state.output_width||600)));c.height=Math.max(1,img.naturalHeight||(id==='raw'?(state.image_height||480):(state.output_height||800)));
- return {c:c,rx:c.width/r.width,ry:c.height/r.height,rect:r}
+async function post(url,data={}){
+ const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+ const result=await response.json();if(!response.ok){await refresh(true);alert(result.error||'操作失败');throw new Error(result.error||'操作失败')}
+ await refresh(true);return result;
 }
-function draw(){
- let g=imageGeometry(),ctx=g.c.getContext('2d'),pts=state.source_points||[];ctx.clearRect(0,0,g.c.width,g.c.height);
- let img=el('raw');if(img.complete&&img.naturalWidth)ctx.drawImage(img,0,0,g.c.width,g.c.height);
- if(pts.length>1){ctx.strokeStyle='#ffffff';ctx.lineWidth=2;ctx.beginPath();let order=pts.length===4?[0,1,3,2,0]:pts.map((_,i)=>i);order.forEach((i,j)=>{let p=pts[i];j?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1])});ctx.stroke()}
- const colors=['#ffd246','#64ff78','#4aa6ff','#ff55d8'];pts.forEach((p,i)=>{ctx.fillStyle=colors[i];ctx.beginPath();ctx.arc(p[0],p[1],7,0,Math.PI*2);ctx.fill();ctx.font='bold 15px sans-serif';ctx.fillText(['P1 TL','P2 TR','P3 BL','P4 BR'][i],p[0]+10,p[1]-8)});
- drawBird();
+async function captureFrame(){await post('/api/capture_calibration_frame')}
+async function refresh(updateImages=false){
+ try{
+  state=await (await fetch('/api/status',{cache:'no-store'})).json();
+  const cfg=await (await fetch('/api/config',{cache:'no-store'})).json();
+  fields.forEach(k=>{if(document.activeElement!==el('p_'+k))el('p_'+k).value=cfg[k]});
+  for(let i=0;i<4;i++){const p=(state.source_points||[])[i];if(document.activeElement!==el('x'+i))el('x'+i).value=p?p[0].toFixed(1):'';if(document.activeElement!==el('y'+i))el('y'+i).value=p?p[1].toFixed(1):''}
+  el('summary').innerHTML=`image_received=${state.image_received} | calibration_frame_captured=${state.calibration_frame_captured} | sequence=${state.calibration_frame_sequence} | points=${state.selected_point_count} | <span class="${state.calibration_valid?'good':'bad'}">${state.calibration_valid?'标定有效':state.calibration_reason}</span>`;
+  el('next').textContent=state.calibration_frame_captured?'当前等待点击：'+state.next_point_name:'请先采集标定帧';
+  el('status').textContent=JSON.stringify(state,null,2);el('maskPanel').style.display=cfg.subscribe_segmentation_topics?'block':'none';
+  if(updateImages)refreshStaticImages();
+ }catch(error){el('summary').textContent='状态读取失败: '+error}
 }
-function drawBird(){let g=imageGeometry('bird','birdCanvas'),ctx=g.c.getContext('2d'),img=el('bird');ctx.clearRect(0,0,g.c.width,g.c.height);if(img.complete&&img.naturalWidth)ctx.drawImage(img,0,0,g.c.width,g.c.height);
- let m=state.measurement;if(m){ctx.strokeStyle='#fff';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(m.x1,m.y1);ctx.lineTo(m.x2,m.y2);ctx.stroke();for(let p of [[m.x1,m.y1],[m.x2,m.y2]]){ctx.fillStyle='#ff55d8';ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fill()}}}
-function pos(e,id='raw',canvasId='canvas'){let g=imageGeometry(id,canvasId);return [(e.clientX-g.rect.left)*g.rx,(e.clientY-g.rect.top)*g.ry]}
-el('canvas').onpointerdown=e=>{let p=pos(e),pts=state.source_points||[];drag=pts.findIndex(q=>Math.hypot(q[0]-p[0],q[1]-p[1])<14);el('canvas').setPointerCapture(e.pointerId);if(drag<0&&pts.length<4)post('/api/set_point',{index:pts.length,x:p[0],y:p[1]})}
-el('canvas').onpointermove=e=>{if(drag>=0){let p=pos(e);state.source_points[drag]=p;draw()}}
-el('canvas').onpointerup=e=>{if(drag>=0){let p=pos(e),i=drag;drag=-1;post('/api/set_point',{index:i,x:p[0],y:p[1]})}}
-async function applyPoints(){for(let i=0;i<4;i++)await post('/api/set_point',{index:i,x:+el('x'+i).value,y:+el('y'+i).value})}
-async function measure(){let j=await post('/api/measure_point',{x1:+el('mx1').value,y1:+el('my1').value,x2:+el('mx2').value,y2:+el('my2').value});el('measure').textContent=`直线 ${j.distance_m.toFixed(4)} m；横向 ${j.lateral_distance_m.toFixed(4)} m；纵向 ${j.forward_distance_m.toFixed(4)} m；像素 ${j.pixel_distance.toFixed(2)} px`}
-let birdPoints=[];el('birdCanvas').onpointerdown=async e=>{let p=pos(e,'bird','birdCanvas');birdPoints.push(p);if(birdPoints.length===2){let a=birdPoints[0],b=birdPoints[1];el('mx1').value=a[0].toFixed(1);el('my1').value=a[1].toFixed(1);el('mx2').value=b[0].toFixed(1);el('my2').value=b[1].toFixed(1);birdPoints=[];await measure()}};
-build();el('raw').onload=draw;el('bird').onload=drawBird;setInterval(refresh,700);refresh();
+el('calibrationImage').addEventListener('click',async event=>{
+ if(!state.calibration_frame_captured){alert('请先采集标定帧');return}
+ const image=event.currentTarget,rect=image.getBoundingClientRect();
+ if(!image.naturalWidth||rect.width<=0||rect.height<=0)return;
+ const x=Math.max(0,Math.min(image.naturalWidth-1,Math.round((event.clientX-rect.left)*image.naturalWidth/rect.width)));
+ const y=Math.max(0,Math.min(image.naturalHeight-1,Math.round((event.clientY-rect.top)*image.naturalHeight/rect.height)));
+ await post('/api/add_point',{x:x,y:y});
+});
+async function applyPoints(){
+ const points=[];for(let i=0;i<4;i++)points.push([Number(el('x'+i).value),Number(el('y'+i).value)]);
+ await post('/api/set_points',{points:points});
+}
+async function measure(){const result=await post('/api/measure_point',{x1:+el('mx1').value,y1:+el('my1').value,x2:+el('mx2').value,y2:+el('my2').value});el('measure').textContent=`直线 ${result.distance_m.toFixed(4)} m；横向 ${result.lateral_distance_m.toFixed(4)} m；纵向 ${result.forward_distance_m.toFixed(4)} m`}
+build();setInterval(()=>refresh(false),1000);refresh(true);
 </script></body></html>"""
 
 
@@ -722,25 +725,28 @@ class IpmCalibrationNode(Node):
         self.inverse_matrix: Optional[np.ndarray] = None
         self.latest_image: Optional[np.ndarray] = None
         self.latest_image_message: Optional[Image] = None
-        self.frozen_image: Optional[np.ndarray] = None
-        self.frozen_image_message: Optional[Image] = None
+        # 静态标定状态与持续更新的实时相机缓存严格分离。
+        self.calibration_frame_bgr: Optional[np.ndarray] = None
+        self.calibration_frame_header: Optional[Any] = None
+        self.calibration_frame_captured = False
+        self.calibration_frame_sequence = 0
+        self.calibration_frame_captured_at = ""
+        self.calibration_masks: Dict[str, Optional[np.ndarray]] = {
+            "boundary": None,
+            "yellow": None,
+            "green": None,
+        }
+        self.calibration_mask_messages: Dict[str, Optional[Image]] = {
+            "boundary": None,
+            "yellow": None,
+            "green": None,
+        }
         self.masks: Dict[str, Optional[np.ndarray]] = {
             "boundary": None,
             "yellow": None,
             "green": None,
         }
         self.mask_messages: Dict[str, Optional[Image]] = {
-            "boundary": None,
-            "yellow": None,
-            "green": None,
-        }
-        # 冻结快照与实时缓存完全分离；缺失的 mask 合法地保持为 None。
-        self.frozen_masks: Dict[str, Optional[np.ndarray]] = {
-            "boundary": None,
-            "yellow": None,
-            "green": None,
-        }
-        self.frozen_mask_messages: Dict[str, Optional[Image]] = {
             "boundary": None,
             "yellow": None,
             "green": None,
@@ -795,28 +801,25 @@ class IpmCalibrationNode(Node):
         )
 
     def _display_image(self) -> Optional[np.ndarray]:
-        return self.frozen_image if self.frozen_image is not None else self.latest_image
+        """所有标定计算只使用人工采集的静态帧。"""
+        return self.calibration_frame_bgr
 
     def _display_image_message(self) -> Optional[Image]:
-        return (
-            self.frozen_image_message
-            if self.frozen_image is not None
-            else self.latest_image_message
-        )
+        if self.calibration_frame_header is None:
+            return None
+        snapshot = Image()
+        snapshot.header = copy.deepcopy(self.calibration_frame_header)
+        return snapshot
 
     def _display_masks(self) -> Dict[str, Optional[np.ndarray]]:
-        return self.frozen_masks if self.frozen_image is not None else self.masks
+        return self.calibration_masks
 
     def _display_mask_messages(self) -> Dict[str, Optional[Image]]:
-        return (
-            self.frozen_mask_messages
-            if self.frozen_image is not None
-            else self.mask_messages
-        )
+        return self.calibration_mask_messages
 
     @staticmethod
     def _header_snapshot(message: Optional[Image]) -> Optional[Image]:
-        """只复制发布所需的消息头，避免冻结快照引用后续可变状态。"""
+        """只复制发布所需的消息头，避免静态快照引用后续可变状态。"""
         if message is None:
             return None
         snapshot = Image()
@@ -858,8 +861,10 @@ class IpmCalibrationNode(Node):
             2,
             cv2.LINE_AA,
         )
-        self.frames.update("raw", raw, 90)
-        self.frames.update("birdview", bird, 90)
+        self.frames.update("live_raw", raw, 90)
+        self.frames.update("calibration_frame", raw, 90)
+        self.frames.update("calibration_annotated", raw, 90)
+        self.frames.update("calibration_birdview", bird, 90)
         for name in (
             "boundary_raw",
             "boundary_birdview",
@@ -878,7 +883,7 @@ class IpmCalibrationNode(Node):
     def _recompute(self) -> ValidationResult:
         image = self._display_image()
         if image is None:
-            raise CalibrationError("尚未收到相机图像")
+            raise CalibrationError("尚未采集静态标定帧")
         try:
             destination = DestinationPointCalculator.calculate(self.config)
             matrix, inverse, validation = HomographyValidator.compute(
@@ -893,7 +898,7 @@ class IpmCalibrationNode(Node):
         self.matrix, self.inverse_matrix, self.validation = matrix, inverse, validation
         self.status.calibration_valid = True
         self.status.calibration_reason = validation.reason
-        self._refresh_previews(force=True)
+        self._refresh_static_previews()
         return validation
 
     def _on_image(self, msg: Image) -> None:
@@ -926,7 +931,12 @@ class IpmCalibrationNode(Node):
                 self._set_validation_error(
                     f"输入分辨率必须为 {DEFAULT_IMAGE_WIDTH}x{DEFAULT_IMAGE_HEIGHT}"
                 )
-        self._refresh_previews()
+        # 实时回调只更新观察用 MJPEG；不执行 Homography 或静态标注。
+        if now - self.last_encode_time >= 1.0 / self.config.web_gui_max_fps:
+            self.frames.update(
+                "live_raw", bgr, self.config.web_gui_jpeg_quality
+            )
+            self.last_encode_time = now
 
     def _on_mask(self, name: str, msg: Image) -> None:
         with self.lock:
@@ -955,11 +965,83 @@ class IpmCalibrationNode(Node):
             self.masks[name] = mask
             self.mask_messages[name] = msg
             setattr(self.status, f"{name}_mask_received", True)
-        self._refresh_previews(force=True)
+        # 实时 mask 只更新最新缓存；静态标定预览在采集时一次性快照。
 
     def _on_segmentation_status(self, _msg: String) -> None:
         with self.lock:
             self.status.segmentation_status_received = True
+
+    def _annotate_calibration_frame(self, image: np.ndarray) -> np.ndarray:
+        """在静态帧副本上由后端绘制角点，绝不修改原始快照。"""
+        annotated = image.copy()
+        points = np.asarray(self.points.points, dtype=np.int32)
+        if len(points) >= 2:
+            if len(points) == 4:
+                order = points[[0, 1, 3, 2]]
+                cv2.polylines(
+                    annotated, [order], True, (255, 255, 255), 2, cv2.LINE_AA
+                )
+            else:
+                cv2.polylines(
+                    annotated, [points], False, (255, 255, 255), 2, cv2.LINE_AA
+                )
+        colors = (
+            (0, 0, 255),      # P1 TL 红
+            (0, 255, 0),      # P2 TR 绿
+            (255, 0, 0),      # P3 BL 蓝
+            (255, 0, 255),    # P4 BR 紫红
+        )
+        for index, point in enumerate(points):
+            location = (int(point[0]), int(point[1]))
+            cv2.circle(annotated, location, 7, colors[index], -1, cv2.LINE_AA)
+            label_position = (location[0] + 10, max(18, location[1] - 8))
+            # 黑色描边保证标签在浅色或高亮背景上仍清楚。
+            cv2.putText(
+                annotated,
+                POINT_NAMES[index],
+                label_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (0, 0, 0),
+                4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated,
+                POINT_NAMES[index],
+                label_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                colors[index],
+                2,
+                cv2.LINE_AA,
+            )
+        progress_text = (
+            f"Next: {self.points.next_name()}"
+            if len(points) < 4
+            else "Four points complete"
+        )
+        cv2.putText(
+            annotated,
+            progress_text,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            annotated,
+            progress_text,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return annotated
 
     def _annotate_birdview(self, image: np.ndarray) -> np.ndarray:
         """仅画坐标轴、车辆原点和标定板外框；不画内部小方格。"""
@@ -984,18 +1066,16 @@ class IpmCalibrationNode(Node):
         )
         return overlay
 
-    def _refresh_previews(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self.last_encode_time < 1.0 / self.config.web_gui_max_fps:
-            return
+    def _refresh_static_previews(self) -> None:
+        """仅在静态状态变化时重新编码标定图、鸟瞰图和可选 mask。"""
         with self.lock:
             image = self._display_image()
             matrix = None if self.matrix is None else self.matrix.copy()
             if image is None:
                 return
             source_message = self._display_image_message()
-            # /stream/raw 始终是未画角点的原始 BGR；交互标注只由浏览器 Canvas 绘制。
-            raw = image.copy()
+            calibration_frame = image.copy()
+            annotated = self._annotate_calibration_frame(image)
             selected_masks = self._display_masks()
             selected_messages = self._display_mask_messages()
             masks = {
@@ -1003,16 +1083,41 @@ class IpmCalibrationNode(Node):
                 for name, value in selected_masks.items()
             }
             mask_messages = selected_messages.copy()
-        self.frames.update("raw", raw, self.config.web_gui_jpeg_quality)
+        self.frames.update(
+            "calibration_frame",
+            calibration_frame,
+            self.config.web_gui_jpeg_quality,
+        )
+        self.frames.update(
+            "calibration_annotated",
+            annotated,
+            self.config.web_gui_jpeg_quality,
+        )
         if matrix is None:
             blank = np.zeros((480, 600, 3), dtype=np.uint8)
-            cv2.putText(blank, "Select TL TR BL BR", (90, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            self.frames.update("birdview", blank, self.config.web_gui_jpeg_quality)
+            cv2.putText(
+                blank,
+                "Select TL TR BL BR",
+                (90, 240),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 255, 255),
+                2,
+            )
+            self.frames.update(
+                "calibration_birdview",
+                blank,
+                self.config.web_gui_jpeg_quality,
+            )
             return
         size = (self.config.output_width_px, self.config.output_height_px)
         pure_birdview = IpmTransformer.color(image, matrix, size)
         web_birdview = self._annotate_birdview(pure_birdview)
-        self.frames.update("birdview", web_birdview, self.config.web_gui_jpeg_quality)
+        self.frames.update(
+            "calibration_birdview",
+            web_birdview,
+            self.config.web_gui_jpeg_quality,
+        )
         if self.publishers:
             # ROS raw_birdview 是纯透视结果，不混入 Web 调试标注。
             self.publishers["raw"].publish(
@@ -1029,7 +1134,6 @@ class IpmCalibrationNode(Node):
                 self.publishers[name].publish(
                     ImageCodec.to_message(warped, "mono8", mask_messages[name])
                 )
-        self.last_encode_time = now
 
     def _status_document(self) -> Dict[str, Any]:
         with self.lock:
@@ -1078,7 +1182,11 @@ class IpmCalibrationNode(Node):
                 "boundary_mask_received": self.status.boundary_mask_received,
                 "yellow_mask_received": self.status.yellow_mask_received,
                 "green_mask_received": self.status.green_mask_received,
-                "frozen_frame_active": self.status.frozen_frame_active,
+                "calibration_frame_captured": self.calibration_frame_captured,
+                "calibration_frame_sequence": self.calibration_frame_sequence,
+                "calibration_frame_captured_at": self.calibration_frame_captured_at,
+                "homography_valid": self.matrix is not None
+                and self.inverse_matrix is not None,
                 "selected_point_count": len(self.points.points),
                 "next_point_name": self.points.next_name(),
                 "fps": self.status.fps,
@@ -1116,45 +1224,104 @@ class IpmCalibrationNode(Node):
         candidate.validate()
         DestinationPointCalculator.validate(DestinationPointCalculator.calculate(candidate), candidate)
         self.config = candidate
-        if len(self.points.points) == 4:
+        if (
+            self.calibration_frame_captured
+            and len(self.points.points) == 4
+        ):
             self._recompute()
+        elif self.calibration_frame_captured:
+            self._refresh_static_previews()
         else:
-            self._refresh_previews(force=True)
+            self._set_validation_error("参数已修改，请采集静态标定帧")
 
-    def _freeze(self) -> None:
+    def _capture_calibration_frame(self) -> None:
+        """原子采集原图、可选 mask 与消息头，并重置旧标定。"""
         if self.latest_image is None:
-            raise CalibrationError("尚未收到相机图像，无法冻结当前帧")
-        # 调用者持有同一把 RLock，因此原图、三种 mask 和消息头构成原子快照。
-        self.frozen_image = self.latest_image.copy()
-        self.frozen_image_message = self._header_snapshot(
-            self.latest_image_message
+            raise CalibrationError("尚未收到相机图像，无法采集标定帧")
+        self.calibration_frame_bgr = self.latest_image.copy()
+        self.calibration_frame_header = (
+            copy.deepcopy(self.latest_image_message.header)
+            if self.latest_image_message is not None
+            else None
         )
-        self.frozen_masks = {
+        self.calibration_masks = {
             name: None if value is None else value.copy()
             for name, value in self.masks.items()
         }
-        self.frozen_mask_messages = {
+        self.calibration_mask_messages = {
             name: self._header_snapshot(message)
             for name, message in self.mask_messages.items()
         }
-        self.status.frozen_frame_active = True
-        self._refresh_previews(force=True)
+        self.calibration_frame_captured = True
+        self.calibration_frame_sequence += 1
+        self.calibration_frame_captured_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+        self.points.clear()
+        self.measurement = None
+        self._set_validation_error("静态标定帧已采集，请依次点击 TL、TR、BL、BR")
+        self.status.selected_point_count = 0
+        self.status.next_point_name = self.points.next_name()
+        self._refresh_static_previews()
 
-    def _resume(self) -> None:
-        self.frozen_image = None
-        self.frozen_image_message = None
-        self.frozen_masks = {
-            "boundary": None,
-            "yellow": None,
-            "green": None,
-        }
-        self.frozen_mask_messages = {
-            "boundary": None,
-            "yellow": None,
-            "green": None,
-        }
-        self.status.frozen_frame_active = False
-        self._refresh_previews(force=True)
+    def _add_point(self, x: float, y: float) -> None:
+        if not self.calibration_frame_captured or self.calibration_frame_bgr is None:
+            raise CalibrationError("请先采集静态标定帧")
+        if len(self.points.points) >= 4:
+            raise CalibrationError("四个点已经完整，请先撤销或清空")
+        self.points.set_point(
+            len(self.points.points),
+            x,
+            y,
+            self.calibration_frame_bgr.shape[1],
+            self.calibration_frame_bgr.shape[0],
+        )
+        if len(self.points.points) == 4:
+            try:
+                self._recompute()
+            except CalibrationError:
+                self._refresh_static_previews()
+                raise
+        else:
+            self._set_validation_error("四点尚未完整")
+            self._refresh_static_previews()
+
+    def _set_points_once(self, values: Any) -> None:
+        """一次性校验并应用四个手工坐标，失败时不破坏原状态。"""
+        if not self.calibration_frame_captured or self.calibration_frame_bgr is None:
+            raise CalibrationError("请先采集静态标定帧")
+        if not isinstance(values, list) or len(values) != 4:
+            raise CalibrationError("手工坐标必须正好包含 TL、TR、BL、BR 四点")
+        candidate_points = CalibrationPointManager()
+        for index, value in enumerate(values):
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise CalibrationError(f"{POINT_NAMES[index]} 坐标格式错误")
+            candidate_points.set_point(
+                index,
+                float(value[0]),
+                float(value[1]),
+                self.calibration_frame_bgr.shape[1],
+                self.calibration_frame_bgr.shape[0],
+            )
+        destination = DestinationPointCalculator.calculate(self.config)
+        matrix, inverse, validation = HomographyValidator.compute(
+            candidate_points.points,
+            destination,
+            self.config,
+            (
+                self.calibration_frame_bgr.shape[1],
+                self.calibration_frame_bgr.shape[0],
+            ),
+        )
+        self.points = candidate_points
+        self.matrix, self.inverse_matrix, self.validation = (
+            matrix,
+            inverse,
+            validation,
+        )
+        self.status.calibration_valid = True
+        self.status.calibration_reason = validation.reason
+        self._refresh_static_previews()
 
     def _save_config(self) -> Tuple[Path, Path]:
         self._recompute()
@@ -1227,41 +1394,32 @@ class IpmCalibrationNode(Node):
             else ""
         )
         self.get_logger().info(f"已加载 IPM 配置: {path}")
-        self._refresh_previews(force=True)
+        if self.calibration_frame_captured:
+            self._refresh_static_previews()
 
     def _handle_api(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
-            if path == "/api/freeze":
-                self._freeze()
-            elif path == "/api/resume":
-                self._resume()
+            if path == "/api/capture_calibration_frame":
+                self._capture_calibration_frame()
             elif path == "/api/undo_point":
+                if not self.calibration_frame_captured:
+                    raise CalibrationError("请先采集静态标定帧")
                 self.points.undo()
                 self._set_validation_error("四点已修改，请重新计算")
-                self._refresh_previews(force=True)
+                self._refresh_static_previews()
             elif path == "/api/clear_points":
+                if not self.calibration_frame_captured:
+                    raise CalibrationError("请先采集静态标定帧")
                 self.points.clear()
                 self._set_validation_error("等待选择四个角点")
-                self._refresh_previews(force=True)
-            elif path == "/api/set_point":
-                image = self._display_image()
-                if image is None:
-                    raise CalibrationError("尚未收到相机图像")
-                self.points.set_point(
-                    int(payload["index"]),
+                self._refresh_static_previews()
+            elif path == "/api/add_point":
+                self._add_point(
                     float(payload["x"]),
                     float(payload["y"]),
-                    image.shape[1],
-                    image.shape[0],
                 )
-                if len(self.points.points) == 4:
-                    try:
-                        self._recompute()
-                    except CalibrationError:
-                        pass
-                else:
-                    self._set_validation_error("四点尚未完整")
-                    self._refresh_previews(force=True)
+            elif path == "/api/set_points":
+                self._set_points_once(payload.get("points"))
             elif path == "/api/set":
                 self._apply_config_values(payload)
             elif path in ("/api/recompute", "/api/validate"):
@@ -1281,7 +1439,8 @@ class IpmCalibrationNode(Node):
                 self.config = copy.deepcopy(self.defaults)
                 self.points.clear()
                 self._set_validation_error("已恢复默认参数，请重新选择四点")
-                self._refresh_previews(force=True)
+                if self.calibration_frame_captured:
+                    self._refresh_static_previews()
             elif path == "/api/measure_point":
                 x1, y1 = float(payload["x1"]), float(payload["y1"])
                 x2, y2 = float(payload["x2"]), float(payload["y2"])
@@ -1322,7 +1481,8 @@ class IpmCalibrationNode(Node):
                         "left_m": second_left,
                     },
                 }
-                self._refresh_previews(force=True)
+                if self.calibration_frame_captured:
+                    self._refresh_static_previews()
                 return {
                     "ok": True,
                     "success": True,
@@ -1331,7 +1491,8 @@ class IpmCalibrationNode(Node):
                 }
             elif path == "/api/clear_measurement":
                 self.measurement = None
-                self._refresh_previews(force=True)
+                if self.calibration_frame_captured:
+                    self._refresh_static_previews()
             else:
                 raise CalibrationError(f"未知 API: {path}")
             self.status.selected_point_count = len(self.points.points)
@@ -1370,9 +1531,18 @@ class IpmCalibrationNode(Node):
                 if path == "/api/config":
                     self._json(200, node._config_document())
                     return
+                static_images = {
+                    "/image/calibration_frame.jpg": "calibration_frame",
+                    "/image/calibration_annotated.jpg": "calibration_annotated",
+                    "/image/calibration_birdview.jpg": "calibration_birdview",
+                }
+                if path in static_images:
+                    self._image(static_images[path])
+                    return
                 if path.startswith("/stream/"):
                     stream = path.removeprefix("/stream/")
                     aliases = {
+                        "raw": "live_raw",
                         "boundary_raw": "boundary_raw",
                         "boundary_birdview": "boundary_birdview",
                         "yellow_birdview": "yellow_birdview",
@@ -1382,6 +1552,22 @@ class IpmCalibrationNode(Node):
                     self._stream(name)
                     return
                 self.send_error(404)
+
+            def _image(self, name: str) -> None:
+                frame, _sequence = node.frames.get(name)
+                if frame is None:
+                    self.send_error(404, "image not available")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(frame)))
+                self.send_header(
+                    "Cache-Control", "no-store, no-cache, must-revalidate"
+                )
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.end_headers()
+                self.wfile.write(frame)
 
             def _stream(self, name: str) -> None:
                 self.send_response(200)
