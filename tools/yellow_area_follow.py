@@ -90,11 +90,23 @@ from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 
 
 MORPHOLOGY_KERNEL_SIZE = 5
 STOP_PUBLISH_COUNT = 5
 STOP_PUBLISH_INTERVAL_SEC = 0.05
+
+
+class WebAPIError(ValueError):
+    """Error returned by the Web API with a stable HTTP status."""
+
+    def __init__(
+        self, message: str, parameter: str = "", status: int = 400
+    ) -> None:
+        super().__init__(message)
+        self.parameter = parameter
+        self.status = status
 
 
 # name: (group, minimum, maximum, step, widget/options)
@@ -105,6 +117,9 @@ WEB_PARAMETER_SCHEMA = {
     "path_geometry_mode": ("MODE", None, None, None, ["image", "birdview"]),
     "ipm_enable": ("MODE", None, None, None, "bool"),
     "safe_corridor_enable": ("MODE", None, None, None, "bool"),
+    "web_gui_allow_remote_control": (
+        "MODE", None, None, None, "bool"
+    ),
     "linear_speed": ("SPEED", 0.0, 0.15, 0.005, "number"),
     "min_linear_speed": ("SPEED", 0.0, 0.10, 0.005, "number"),
     "max_linear_speed": ("SPEED", 0.0, 0.20, 0.005, "number"),
@@ -198,6 +213,8 @@ pre{white-space:pre-wrap}.hint{color:#bbb;line-height:1.45}
 <label>dry_run <input id="dry" type="checkbox" onchange="setv('dry_run',this.checked)"></label>
 <b id="mode">waiting for image</b><span id="motion">0.000 / 0.000</span>
 <span id="scale">scale 0.00</span><button onclick="copyArgs()">Copy args</button></header>
+<div class="card" style="margin:10px;color:#ffb347">Web GUI has no
+authentication. Use only on a trusted robot network.</div>
 <main><section class="video"><div class="card"><img src="/stream"
 alt="waiting for image"></div><div class="card hint">调参顺序：先 HSV，再 ROI，
 再调 IPM 四点；随后调 offset / desired offset、安全边距，最后调速度、
@@ -224,9 +241,10 @@ let root=document.getElementById('controls');root.innerHTML='';
 Object.keys(groups).forEach(g=>{let c=document.createElement('div');c.className='card';
 c.innerHTML='<b>'+g+'</b>';groups[g].forEach(n=>c.appendChild(field(n,params[n],schema[n])));
 root.appendChild(c)});document.getElementById('dry').checked=!!params.dry_run}
-async function setv(n,v){await fetch('/api/set?name='+encodeURIComponent(n)+'&value='+
-encodeURIComponent(v),{method:'POST'});await load()}
-async function stopNow(){await fetch('/api/stop',{method:'POST'});await load()}
+async function setv(n,v){let r=await fetch('/api/set?name='+encodeURIComponent(n)+'&value='+
+encodeURIComponent(v),{method:'POST'}),x=await r.json();if(!r.ok)alert(x.error);await load()}
+async function stopNow(){let r=await fetch('/api/stop',{method:'POST'}),x=await r.json();
+if(!r.ok)alert(x.error);await load()}
 async function copyArgs(){let t=await (await fetch('/api/launch_args')).text();
 await navigator.clipboard.writeText(t);alert('Copied')}
 async function tick(){try{let s=await getj('/api/status');document.getElementById('status').
@@ -2429,14 +2447,27 @@ def render_debug_image(
         compact_lines.append(
             f"{result.path_geometry_mode} | {result.path_mode}"
         )
-    if result.edge_risk:
-        compact_lines.append("EDGE RISK")
-    if result.black_edge_risk:
-        compact_lines.append("BLACK EDGE RISK")
-    if result.rejected_extreme_error:
-        compact_lines.append("REJECTED EXTREME ERROR")
-    if not result.ipm_valid:
-        compact_lines.append("IPM_INVALID / IMAGE FALLBACK")
+        if bool(params.get("_gui_stop_latched", False)):
+            compact_lines.append("GUI STOP LATCHED")
+        if result.path_mode == "lost_stop":
+            compact_lines.append("LOST / STOP")
+        if (
+            params.get("_control_gate_reason")
+            == "waiting_for_competition_start"
+        ):
+            compact_lines.append("WAITING FOR START")
+        if bool(params.get("_configuration_transition", False)):
+            compact_lines.append("CONFIG RESET")
+        if result.edge_risk:
+            compact_lines.append("EDGE RISK")
+        if bool(params["dry_run"]):
+            compact_lines.append("DRY RUN")
+        if result.black_edge_risk:
+            compact_lines.append("BLACK EDGE RISK")
+        if result.rejected_extreme_error:
+            compact_lines.append("REJECTED EXTREME ERROR")
+        if not result.ipm_valid:
+            compact_lines.append("IPM INVALID")
     for index, text in enumerate(compact_lines):
         color = orange if "RISK" in text or "REJECTED" in text else white
         cv2.putText(
@@ -2592,13 +2623,15 @@ class YellowAreaFollower(Node):
             "debug_path_interpolate_count": 40,
             "debug_yellow_overlay_alpha": 0.18,
             "debug_green_overlay_alpha": 0.10,
-            "control_only_when_started": False,
+            "control_only_when_started": True,
+            "competition_started_topic": "/competition/started",
             "dry_run": False,
             "web_gui_enable": False,
             "web_gui_host": "0.0.0.0",
             "web_gui_port": 8088,
             "web_gui_jpeg_quality": 75,
             "web_gui_max_fps": 8.0,
+            "web_gui_allow_remote_control": True,
             "path_geometry_mode": "image",
             "ipm_enable": False,
             "ipm_width": 640,
@@ -2648,16 +2681,66 @@ class YellowAreaFollower(Node):
         self.web_status = {
             "path_mode": "waiting_for_image",
             "path_geometry_mode": str(self.cfg["path_geometry_mode"]),
+            "ipm_active": False,
+            "ipm_valid": True,
+            "competition_started": False,
+            "control_only_when_started": bool(
+                self.cfg["control_only_when_started"]
+            ),
+            "control_gate_open": False,
+            "control_gate_reason": (
+                "waiting_for_competition_start"
+                if bool(self.cfg["control_only_when_started"])
+                else "lost_stop"
+            ),
+            "dry_run": bool(self.cfg["dry_run"]),
+            "gui_stop_latched": False,
+            "configuration_transition": False,
+            "reset_reason": "",
+            "planned_linear_x": 0.0,
+            "planned_angular_z": 0.0,
+            "published_linear_x": 0.0,
+            "published_angular_z": 0.0,
             "linear_x": 0.0,
             "angular_z": 0.0,
             "speed_scale": 0.0,
-            "dry_run": bool(self.cfg["dry_run"]),
+            "near_error": 0.0,
+            "far_error": 0.0,
+            "control_error": 0.0,
+            "edge_risk": False,
+            "black_edge_risk": False,
+            "rejected_extreme_error": False,
+            "yellow_pixels": 0,
+            "green_pixels": 0,
+            "boundary_points": 0,
+            "target_points": 0,
+            "lost_frames": 0,
+            "history_age": 0,
+            "yellow_fallback_frames": 0,
         }
         self.web_jpeg: Optional[bytes] = None
         self.last_web_frame_time = 0.0
         self.web_server: Optional[ThreadingHTTPServer] = None
         self.web_thread: Optional[threading.Thread] = None
         self.gui_stopped = False
+        self.competition_started = False
+        self.control_gate_open = False
+        self.control_gate_reason = (
+            "waiting_for_competition_start"
+            if bool(self.cfg["control_only_when_started"])
+            else "lost_stop"
+        )
+        self.last_planned_linear = 0.0
+        self.last_planned_angular = 0.0
+        self.last_published_linear = 0.0
+        self.last_published_angular = 0.0
+        self.current_path_mode = "lost_stop"
+        self.current_edge_risk_stop = False
+        self.configuration_transition = False
+        self.reset_reason = ""
+        self.geometry_config_version = 0
+        self.last_good_geometry_mode: Optional[str] = None
+        self.last_good_geometry_config_version = -1
 
         self.image_topic = str(self.params["image_topic"])
         self.cmd_topic = str(self.params["cmd_topic"])
@@ -2669,6 +2752,12 @@ class YellowAreaFollower(Node):
             self.image_topic,
             self._image_callback,
             qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            Bool,
+            str(self.params["competition_started_topic"]),
+            self._competition_started_callback,
+            10,
         )
 
         # Publishers are cheap to keep available; the runtime flags below
@@ -2707,6 +2796,8 @@ class YellowAreaFollower(Node):
         p = self.params
         if not str(p["image_topic"]) or not str(p["cmd_topic"]):
             raise ValueError("image_topic and cmd_topic must not be empty")
+        if not str(p["competition_started_topic"]):
+            raise ValueError("competition_started_topic must not be empty")
         if not (
             0 <= int(p["h_min"]) <= int(p["h_max"]) <= 179
             and 0 <= int(p["s_min"]) <= int(p["s_max"]) <= 255
@@ -2869,39 +2960,353 @@ class YellowAreaFollower(Node):
             raise ValueError("web_gui_max_fps must be greater than zero")
         if not 1 <= int(p["web_gui_port"]) <= 65535:
             raise ValueError("web_gui_port must be in [1, 65535]")
+        self._validate_and_normalize_cfg(p)
 
     def _cfg_snapshot(self) -> dict:
         with self.cfg_lock:
             return dict(self.cfg)
 
-    def _set_runtime_parameter(self, name: str, raw_value: str) -> object:
+    @staticmethod
+    def _validate_and_normalize_cfg(
+        candidate: dict, changed_name: Optional[str] = None
+    ) -> dict:
+        """Validate cross-parameter invariants before atomically applying cfg."""
+        cfg = dict(candidate)
+
+        def require(condition: bool, message: str, parameter: str) -> None:
+            if not condition:
+                raise WebAPIError(message, parameter)
+
+        for prefix in ("", "green_"):
+            require(
+                int(cfg[f"{prefix}h_min"]) <= int(cfg[f"{prefix}h_max"]),
+                f"{prefix}h_min must not exceed {prefix}h_max",
+                changed_name or f"{prefix}h_min",
+            )
+            require(
+                int(cfg[f"{prefix}s_min"]) <= int(cfg[f"{prefix}s_max"]),
+                f"{prefix}s_min must not exceed {prefix}s_max",
+                changed_name or f"{prefix}s_min",
+            )
+            require(
+                int(cfg[f"{prefix}v_min"]) <= int(cfg[f"{prefix}v_max"]),
+                f"{prefix}v_min must not exceed {prefix}v_max",
+                changed_name or f"{prefix}v_min",
+            )
+        roi_start = float(cfg["roi_y_start_ratio"])
+        roi_end = float(cfg["roi_y_end_ratio"])
+        require(
+            0.0 <= roi_start < roi_end <= 1.0,
+            "ROI must satisfy 0.0 <= start < end <= 1.0",
+            changed_name or "roi_y_start_ratio",
+        )
+        require(
+            roi_end - roi_start >= 0.10 - 1e-9,
+            "roi_y_end_ratio must be at least 0.10 greater than "
+            "roi_y_start_ratio",
+            changed_name or "roi_y_end_ratio",
+        )
+        far = float(cfg["far_y_ratio"])
+        near = float(cfg["near_y_ratio"])
+        require(
+            0.0 < far < near < 1.0,
+            "near_y_ratio must be greater than far_y_ratio, with both "
+            "strictly inside (0, 1)",
+            changed_name or "near_y_ratio",
+        )
+        require(
+            near - far >= 0.05 - 1e-9,
+            "near_y_ratio must be at least 0.05 greater than far_y_ratio",
+            changed_name or "near_y_ratio",
+        )
+        min_speed = float(cfg["min_linear_speed"])
+        speed = float(cfg["linear_speed"])
+        max_speed = float(cfg["max_linear_speed"])
+        require(
+            0.0 <= min_speed <= speed <= max_speed,
+            "speeds must satisfy 0 <= min_linear_speed <= linear_speed "
+            "<= max_linear_speed",
+            changed_name or "linear_speed",
+        )
+        for name in (
+            "both_boundary_speed_scale",
+            "single_boundary_speed_scale",
+            "history_speed_scale",
+            "yellow_fallback_speed_scale",
+            "edge_risk_slowdown",
+        ):
+            require(
+                float(cfg[name]) >= 0.0,
+                f"{name} must not be negative",
+                changed_name or name,
+            )
+        for name in ("kp", "kd", "max_angular", "error_deadband"):
+            require(
+                float(cfg[name]) >= 0.0,
+                f"{name} must not be negative",
+                changed_name or name,
+            )
+        for name in ("smoothing_alpha", "angular_smoothing_alpha"):
+            require(
+                0.0 < float(cfg[name]) <= 1.0,
+                f"{name} must be in (0, 1]",
+                changed_name or name,
+            )
+        stop_px = float(cfg["stop_yellow_margin_px"])
+        safe_px = float(cfg["min_yellow_margin_px"])
+        warn_px = float(cfg["warn_yellow_margin_px"])
+        require(
+            0.0 <= stop_px <= safe_px <= warn_px,
+            "yellow margins must satisfy stop <= min <= warn",
+            changed_name or "min_yellow_margin_px",
+        )
+        stop_m = float(cfg["ipm_stop_margin_m"])
+        safe_m = float(cfg["ipm_safe_margin_m"])
+        warn_m = float(cfg["ipm_warn_margin_m"])
+        require(
+            0.0 <= stop_m <= safe_m <= warn_m,
+            "IPM margins must satisfy stop <= safe <= warn",
+            changed_name or "ipm_safe_margin_m",
+        )
+        require(
+            float(cfg["ipm_meter_per_px"]) > 0.0,
+            "ipm_meter_per_px must be greater than zero",
+            changed_name or "ipm_meter_per_px",
+        )
+        require(
+            float(cfg["ipm_desired_offset_m"]) >= 0.0,
+            "ipm_desired_offset_m must not be negative",
+            changed_name or "ipm_desired_offset_m",
+        )
+        require(
+            int(cfg["ipm_width"]) >= 64 and int(cfg["ipm_height"]) >= 64,
+            "ipm_width and ipm_height must be at least 64",
+            changed_name or "ipm_width",
+        )
+        for name, lower, strict in (
+            ("single_boundary_sample_count", 2, False),
+            ("single_boundary_min_points", 2, False),
+            ("boundary_y_bucket_px", 1, False),
+            ("boundary_min_bucket_points", 1, False),
+            ("boundary_max_x_jump_px", 0, True),
+            ("single_boundary_offset_px", 0, False),
+        ):
+            value = float(cfg[name])
+            require(
+                value > lower if strict else value >= lower,
+                f"{name} must be {'greater than' if strict else 'at least'} "
+                f"{lower}",
+                changed_name or name,
+            )
+        if (
+            str(cfg["path_geometry_mode"]) == "birdview"
+            or bool(cfg["ipm_enable"])
+        ):
+            YellowAreaFollower._validate_ipm_cfg(cfg, changed_name)
+        return cfg
+
+    @staticmethod
+    def _validate_ipm_cfg(
+        cfg: dict,
+        changed_name: Optional[str] = None,
+        image_shape: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        points = np.float32([
+            [cfg["ipm_src_top_left_x"], cfg["ipm_src_top_left_y"]],
+            [cfg["ipm_src_top_right_x"], cfg["ipm_src_top_right_y"]],
+            [cfg["ipm_src_bottom_right_x"], cfg["ipm_src_bottom_right_y"]],
+            [cfg["ipm_src_bottom_left_x"], cfg["ipm_src_bottom_left_y"]],
+        ])
+
+        def reject(message: str) -> None:
+            raise WebAPIError(
+                message, changed_name or "path_geometry_mode"
+            )
+
+        if not np.all(np.isfinite(points)) or np.any(points < 0):
+            reject("IPM source points must be finite and non-negative")
+        if image_shape is not None:
+            height, width = image_shape
+            if np.any(points[:, 0] >= width) or np.any(points[:, 1] >= height):
+                reject("IPM source points must be inside the current image")
+        elif np.any(points > 4096):
+            reject("IPM source points exceed the reasonable coordinate range")
+        if len(np.unique(points, axis=0)) != 4:
+            reject("IPM source points must not overlap")
+        polygon = np.round(points).astype(np.int32)
+        if not cv2.isContourConvex(polygon):
+            reject("IPM source points must form a non-crossing convex quad")
+        if abs(cv2.contourArea(polygon)) < 100.0:
+            reject("IPM source quadrilateral area is too small")
+        if not (
+            points[0, 0] < points[1, 0]
+            and points[3, 0] < points[2, 0]
+            and max(points[0, 1], points[1, 1])
+            < min(points[2, 1], points[3, 1])
+        ):
+            reject("IPM point order must be left/right with top above bottom")
+        dst = np.float32([
+            [0, 0], [int(cfg["ipm_width"]) - 1, 0],
+            [int(cfg["ipm_width"]) - 1, int(cfg["ipm_height"]) - 1],
+            [0, int(cfg["ipm_height"]) - 1],
+        ])
+        matrix = cv2.getPerspectiveTransform(points, dst)
+        if not np.all(np.isfinite(matrix)):
+            reject("IPM transform matrix contains NaN or Inf")
+
+    def _set_runtime_parameter(self, name: str, raw_value: str) -> dict:
         if name not in WEB_PARAMETER_SCHEMA:
-            raise ValueError(f"parameter is not adjustable: {name}")
+            raise WebAPIError(
+                f"parameter is not adjustable: {name}", name
+            )
         schema = WEB_PARAMETER_SCHEMA[name]
         with self.cfg_lock:
+            if (
+                self.gui_stopped
+                and name == "dry_run"
+                and str(raw_value).strip().lower() in ("false", "0", "no")
+            ):
+                raise WebAPIError(
+                    "GUI STOP is latched; restart is required",
+                    name,
+                    status=409,
+                )
+            candidate = dict(self.cfg)
             current = self.cfg[name]
-            if schema[4] == "bool":
-                lowered = str(raw_value).strip().lower()
-                if lowered not in ("true", "false", "1", "0", "yes", "no"):
-                    raise ValueError(f"invalid boolean: {raw_value}")
-                value = lowered in ("true", "1", "yes")
-            elif isinstance(schema[4], list):
-                value = str(raw_value)
-                if value not in schema[4]:
-                    raise ValueError(f"invalid choice: {value}")
-            elif isinstance(current, int) and not isinstance(current, bool):
-                value = int(round(float(raw_value)))
-            else:
-                value = float(raw_value)
+            try:
+                if schema[4] == "bool":
+                    lowered = str(raw_value).strip().lower()
+                    if lowered not in (
+                        "true", "false", "1", "0", "yes", "no"
+                    ):
+                        raise WebAPIError(
+                            f"invalid boolean: {raw_value}", name
+                        )
+                    value = lowered in ("true", "1", "yes")
+                elif isinstance(schema[4], list):
+                    value = str(raw_value)
+                    if value not in schema[4]:
+                        raise WebAPIError(
+                            f"invalid choice: {value}", name
+                        )
+                elif isinstance(current, int) and not isinstance(
+                    current, bool
+                ):
+                    value = int(round(float(raw_value)))
+                else:
+                    value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                if isinstance(exc, WebAPIError):
+                    raise
+                raise WebAPIError(
+                    f"invalid value for {name}: {raw_value}", name
+                ) from exc
+            if name == "ipm_meter_per_px" and float(value) <= 0.0:
+                raise WebAPIError(
+                    "ipm_meter_per_px must be greater than zero", name
+                )
             if schema[1] is not None:
                 value = max(schema[1], min(schema[2], value))
-            self.cfg[name] = value
-            if name in ("roi_y_start_ratio", "roi_y_end_ratio"):
-                start = float(self.cfg["roi_y_start_ratio"])
-                end = float(self.cfg["roi_y_end_ratio"])
-                if end <= start + 0.10:
-                    self.cfg["roi_y_end_ratio"] = min(1.0, start + 0.25)
-            return self.cfg[name]
+            candidate[name] = value
+            candidate = self._validate_and_normalize_cfg(candidate, name)
+            value_changed = candidate[name] != current
+            self.cfg = candidate
+            self.params = self.cfg
+
+        geometry_names = {
+            "path_geometry_mode", "ipm_enable", "ipm_width", "ipm_height",
+            "ipm_meter_per_px", "roi_y_start_ratio", "roi_y_end_ratio",
+            "near_y_ratio", "far_y_ratio",
+        }
+        geometry_names.update(
+            name for name in WEB_PARAMETER_SCHEMA
+            if name.startswith("ipm_src_")
+        )
+        tracking_names = {
+            "single_boundary_offset_px", "ipm_desired_offset_m",
+            "min_yellow_margin_px", "warn_yellow_margin_px",
+            "stop_yellow_margin_px", "ipm_safe_margin_m",
+            "ipm_warn_margin_m", "ipm_stop_margin_m",
+            "boundary_y_bucket_px", "boundary_max_x_jump_px",
+        }
+        control_names = {
+            "kp", "kd", "max_angular", "smoothing_alpha",
+            "angular_smoothing_alpha", "head_gain",
+        }
+        history_reset = False
+        reset_reason = ""
+        if value_changed and name in geometry_names:
+            history_reset = True
+            reset_reason = (
+                "geometry_mode_changed"
+                if name in ("path_geometry_mode", "ipm_enable")
+                else "roi_changed"
+                if name.startswith("roi_")
+                else "geometry_config_changed"
+            )
+            self._reset_tracking_history(reset_reason, True)
+        elif value_changed and name in tracking_names:
+            history_reset = True
+            reset_reason = "path_config_changed"
+            self._reset_tracking_history(reset_reason, True)
+        elif value_changed and name in control_names:
+            self._reset_control_history()
+        return {
+            "ok": True,
+            "name": name,
+            "value": value,
+            "history_reset": history_reset,
+            "reset_reason": reset_reason,
+        }
+
+    def _reset_control_history(self) -> None:
+        self.previous_error = None
+        self.previous_angular = 0.0
+        self.last_control_time = time.monotonic()
+
+    def _reset_tracking_history(
+        self, reason: str, publish_stop: bool = True
+    ) -> None:
+        self.last_good_path = []
+        self.last_good_roi_shape = None
+        self.last_good_geometry_mode = None
+        self.last_good_geometry_config_version = -1
+        self.history_age = 0
+        self.yellow_fallback_frames = 0
+        self.single_boundary_frames = 0
+        self.lost_frames = 0
+        self.geometry_config_version += 1
+        self.configuration_transition = True
+        self.reset_reason = reason
+        self._reset_control_history()
+        if publish_stop:
+            self._publish_zero_repeated(3)
+
+    def _competition_started_callback(self, msg: Bool) -> None:
+        started = bool(msg.data)
+        if started == self.competition_started:
+            return
+        self.competition_started = started
+        self._reset_control_history()
+        if not started:
+            self._publish_zero_repeated(3)
+            self.get_logger().warning(
+                "Competition start gate closed; zero velocity published."
+            )
+        else:
+            self.get_logger().info(
+                "Competition start gate opened; control history reset."
+            )
+        with self.status_lock:
+            self.web_status["competition_started"] = started
+            self.web_status["control_gate_open"] = self.control_gate_open
+            self.web_status["control_gate_reason"] = self.control_gate_reason
+            if (
+                started
+                and not self.gui_stopped
+                and not self.configuration_transition
+            ):
+                self.web_status.pop("stop_state", None)
 
     def _web_payload_params(self) -> dict:
         p = self._cfg_snapshot()
@@ -2969,12 +3374,19 @@ class YellowAreaFollower(Node):
                             "text/plain; charset=utf-8",
                         )
                     elif parsed.path == "/api/set":
+                        if not bool(
+                            node._cfg_snapshot()[
+                                "web_gui_allow_remote_control"
+                            ]
+                        ):
+                            raise WebAPIError(
+                                "remote parameter changes are disabled",
+                                query.get("name", [""])[0],
+                                status=403,
+                            )
                         name = query.get("name", [""])[0]
                         value = query.get("value", [""])[0]
-                        self._json(
-                            {"ok": True, "name": name,
-                             "value": node._set_runtime_parameter(name, value)}
-                        )
+                        self._json(node._set_runtime_parameter(name, value))
                     elif parsed.path == "/api/stop":
                         node._gui_emergency_stop()
                         self._json({"ok": True, "state": "STOPPED_BY_GUI"})
@@ -3006,8 +3418,20 @@ class YellowAreaFollower(Node):
                         self._json({"error": "not found"}, 404)
                 except (BrokenPipeError, ConnectionResetError):
                     return
+                except WebAPIError as exc:
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "parameter": exc.parameter,
+                        },
+                        exc.status,
+                    )
                 except Exception as exc:
-                    self._json({"error": str(exc)}, 400)
+                    self._json(
+                        {"ok": False, "error": str(exc), "parameter": ""},
+                        400,
+                    )
 
             def do_GET(self) -> None:
                 self._route()
@@ -3029,6 +3453,11 @@ class YellowAreaFollower(Node):
         self.get_logger().info(
             f"Web GUI: http://{p['web_gui_host']}:{p['web_gui_port']}"
         )
+        if str(p["web_gui_host"]) == "0.0.0.0":
+            self.get_logger().warning(
+                "Web GUI is exposed to the local network without "
+                "authentication."
+            )
 
     def shutdown_web_server(self) -> None:
         server = self.web_server
@@ -3046,7 +3475,10 @@ class YellowAreaFollower(Node):
         with self.status_lock:
             self.web_status["stop_state"] = "STOPPED_BY_GUI"
             self.web_status["dry_run"] = True
-        self.publish_stop_repeated()
+            self.web_status["gui_stop_latched"] = True
+            self.web_status["control_gate_open"] = False
+            self.web_status["control_gate_reason"] = "gui_stop_latched"
+        self._publish_zero_repeated(STOP_PUBLISH_COUNT)
         self.get_logger().warning("STOPPED_BY_GUI: dry_run enabled, zero sent.")
 
     @staticmethod
@@ -3289,6 +3721,7 @@ class YellowAreaFollower(Node):
             f"debug_info_panel_width={p['debug_info_panel_width']}, "
             f"dry_run={p['dry_run']}, "
             f"control_only_when_started={p['control_only_when_started']}, "
+            f"competition_started_topic={p['competition_started_topic']}, "
             f"web_gui_enable={p['web_gui_enable']}, "
             f"web_gui={p['web_gui_host']}:{p['web_gui_port']}"
         )
@@ -3358,6 +3791,8 @@ class YellowAreaFollower(Node):
                     result = self._yellow_fallback_after_reject(
                         result, frame.shape[:2], effective
                     )
+            result.path_geometry_mode = geometry_mode
+            result.ipm_valid = ipm_valid
             result = self._apply_path_priority(
                 result, frame.shape[:2], effective
             )
@@ -3397,11 +3832,12 @@ class YellowAreaFollower(Node):
                     result.path_mode = "lost_stop"
             if result.safety_stop:
                 result.valid = False
-                result.path_mode = "lost_stop"
             if result.valid:
                 self._handle_valid_result(
                     frame, msg, result, effective
                 )
+                if self.configuration_transition:
+                    self.configuration_transition = False
             else:
                 self._handle_lost_result(
                     frame, msg, result, effective
@@ -3437,6 +3873,10 @@ class YellowAreaFollower(Node):
         ):
             self.last_good_path = list(observation.target_path_points)
             self.last_good_roi_shape = roi_shape
+            self.last_good_geometry_mode = observation.path_geometry_mode
+            self.last_good_geometry_config_version = (
+                self.geometry_config_version
+            )
             self.history_age = 0
             self.yellow_fallback_frames = 0
             observation.history_age = 0
@@ -3447,7 +3887,12 @@ class YellowAreaFollower(Node):
             bool(p["history_enable"])
             and bool(self.last_good_path)
             and self.last_good_roi_shape == roi_shape
+            and self.last_good_geometry_mode
+            == observation.path_geometry_mode
+            and self.last_good_geometry_config_version
+            == self.geometry_config_version
             and self.history_age < int(p["history_max_frames"])
+            and not self.configuration_transition
         )
         if history_available:
             self.history_age += 1
@@ -3580,7 +4025,13 @@ class YellowAreaFollower(Node):
         linear = min(linear, float(p["max_linear_speed"]))
         if abs(filtered_error) > 1e-6:
             self.last_turn_direction = -1.0 if filtered_error > 0.0 else 1.0
-        self._publish_velocity(linear, angular, p)
+        self._publish_velocity(
+            linear,
+            angular,
+            p,
+            path_mode=result.path_mode,
+            edge_risk_stop=result.safety_stop,
+        )
         self._update_web_status(result, linear, angular, p)
         self._throttled_status_log(result, linear, angular)
         self._publish_debug(bgr, source_msg, result, linear, angular, p)
@@ -3606,38 +4057,127 @@ class YellowAreaFollower(Node):
             angular = (
                 self.last_turn_direction * float(p["search_angular"])
             )
-            self._publish_velocity(0.0, angular, p)
+            self._publish_velocity(
+                0.0,
+                angular,
+                p,
+                path_mode=result.path_mode,
+                edge_risk_stop=result.safety_stop,
+            )
         else:
             if self.lost_frames == 1:
-                self.publish_stop_repeated()
+                self._publish_zero_repeated(
+                    STOP_PUBLISH_COUNT,
+                    result.path_mode,
+                    result.safety_stop,
+                )
             else:
-                self._publish_stop()
+                self._publish_velocity(
+                    0.0,
+                    0.0,
+                    p,
+                    path_mode=result.path_mode,
+                    edge_risk_stop=result.safety_stop,
+                )
         result.speed_scale = 0.0
         self._update_web_status(result, 0.0, angular, p)
         self._throttled_status_log(result, 0.0, angular)
         self._publish_debug(bgr, source_msg, result, 0.0, angular, p)
 
     def _publish_velocity(
-        self, linear: float, angular: float, params: Optional[dict] = None
-    ) -> None:
+        self,
+        linear: float,
+        angular: float,
+        params: Optional[dict] = None,
+        path_mode: Optional[str] = None,
+        edge_risk_stop: bool = False,
+    ) -> Tuple[float, float]:
+        """Apply the final safety gate; this is the only Twist publish path."""
         command = Twist()
         p = params if params is not None else self._cfg_snapshot()
-        if bool(p["dry_run"]) or self.gui_stopped:
-            command.linear.x = 0.0
-            command.angular.z = 0.0
+        mode = path_mode if path_mode is not None else self.current_path_mode
+        self.current_path_mode = mode
+        self.current_edge_risk_stop = bool(edge_risk_stop)
+        self.last_planned_linear = float(linear)
+        self.last_planned_angular = float(angular)
+        if self.gui_stopped:
+            reason = "gui_stop_latched"
+        elif bool(p["dry_run"]):
+            reason = "dry_run"
+        elif (
+            bool(p["control_only_when_started"])
+            and not self.competition_started
+        ):
+            reason = "waiting_for_competition_start"
+        elif mode == "lost_stop":
+            reason = "lost_stop"
+        elif edge_risk_stop:
+            reason = "edge_risk_stop"
+        elif self.configuration_transition:
+            reason = "configuration_transition"
         else:
-            command.linear.x = float(linear)
-            command.angular.z = float(angular)
+            reason = "running"
+        gate_open = reason == "running"
+        published_linear = float(linear) if gate_open else 0.0
+        published_angular = float(angular) if gate_open else 0.0
+        command.linear.x = published_linear
+        command.angular.z = published_angular
         self.cmd_publisher.publish(command)
+        self.control_gate_open = gate_open
+        self.control_gate_reason = reason
+        self.last_published_linear = published_linear
+        self.last_published_angular = published_angular
+        if hasattr(self, "status_lock"):
+            with self.status_lock:
+                immediate_status = {
+                    "competition_started": bool(
+                        self.competition_started
+                    ),
+                    "control_gate_open": gate_open,
+                    "control_gate_reason": reason,
+                    "planned_linear_x": float(linear),
+                    "planned_angular_z": float(angular),
+                    "published_linear_x": published_linear,
+                    "published_angular_z": published_angular,
+                    "gui_stop_latched": bool(self.gui_stopped),
+                    "configuration_transition": bool(
+                        self.configuration_transition
+                    ),
+                    "reset_reason": self.reset_reason,
+                    "dry_run": bool(p["dry_run"]),
+                }
+                if self.gui_stopped:
+                    immediate_status["stop_state"] = (
+                        "GUI STOP LATCHED - RESTART REQUIRED"
+                    )
+                elif self.configuration_transition:
+                    immediate_status["stop_state"] = "CONFIG RESET"
+                elif reason == "waiting_for_competition_start":
+                    immediate_status["stop_state"] = "WAITING FOR START"
+                self.web_status.update(immediate_status)
+        return published_linear, published_angular
 
     def _publish_stop(self) -> None:
         self._publish_velocity(0.0, 0.0)
 
+    def _publish_zero_repeated(
+        self,
+        count: int,
+        path_mode: Optional[str] = None,
+        edge_risk_stop: bool = False,
+    ) -> None:
+        for _ in range(max(1, int(count))):
+            self._publish_velocity(
+                0.0,
+                0.0,
+                path_mode=path_mode,
+                edge_risk_stop=edge_risk_stop,
+            )
+            time.sleep(STOP_PUBLISH_INTERVAL_SEC)
+
     def publish_stop_repeated(self) -> None:
         """Publish several stop messages before shutdown."""
-        for _ in range(STOP_PUBLISH_COUNT):
-            self._publish_stop()
-            time.sleep(STOP_PUBLISH_INTERVAL_SEC)
+        self._publish_zero_repeated(STOP_PUBLISH_COUNT)
 
     def _watchdog_callback(self) -> None:
         elapsed = time.monotonic() - self.last_image_time
@@ -3663,11 +4203,27 @@ class YellowAreaFollower(Node):
         status = {
             "path_mode": result.path_mode,
             "path_geometry_mode": result.path_geometry_mode,
+            "ipm_active": result.path_geometry_mode == "birdview",
             "ipm_enable": bool(params["ipm_enable"]),
             "ipm_valid": bool(result.ipm_valid),
+            "competition_started": bool(self.competition_started),
+            "control_only_when_started": bool(
+                params["control_only_when_started"]
+            ),
+            "control_gate_open": bool(self.control_gate_open),
+            "control_gate_reason": self.control_gate_reason,
+            "gui_stop_latched": bool(self.gui_stopped),
+            "configuration_transition": bool(
+                self.configuration_transition
+            ),
+            "reset_reason": self.reset_reason,
             "near_error": float(result.near_error),
             "far_error": float(result.far_error),
             "control_error": float(result.control_error),
+            "planned_linear_x": float(linear),
+            "planned_angular_z": float(angular),
+            "published_linear_x": float(self.last_published_linear),
+            "published_angular_z": float(self.last_published_angular),
             "linear_x": float(linear),
             "angular_z": float(angular),
             "speed_scale": float(result.speed_scale),
@@ -3689,10 +4245,20 @@ class YellowAreaFollower(Node):
                 result.rejected_extreme_error
             ),
             "lost_frames": int(self.lost_frames),
+            "history_age": int(result.history_age),
+            "yellow_fallback_frames": int(
+                result.yellow_fallback_frames
+            ),
             "dry_run": bool(params["dry_run"]),
         }
         if self.gui_stopped:
-            status["stop_state"] = "STOPPED_BY_GUI"
+            status["stop_state"] = (
+                "GUI STOP LATCHED - RESTART REQUIRED"
+            )
+        elif self.control_gate_reason == "waiting_for_competition_start":
+            status["stop_state"] = "WAITING FOR START"
+        elif self.configuration_transition:
+            status["stop_state"] = "CONFIG RESET"
         elif not result.ipm_valid:
             status["stop_state"] = "IPM_INVALID / IMAGE_FALLBACK"
         with self.status_lock:
@@ -3751,6 +4317,12 @@ class YellowAreaFollower(Node):
         params: Optional[dict] = None,
     ) -> None:
         p = params if params is not None else self._cfg_snapshot()
+        render_params = dict(p)
+        render_params["_gui_stop_latched"] = self.gui_stopped
+        render_params["_control_gate_reason"] = self.control_gate_reason
+        render_params["_configuration_transition"] = (
+            self.configuration_transition
+        )
         ros_image_enabled = bool(p["publish_debug_image"])
         ros_boundary_enabled = bool(p["publish_boundary_debug_mask"])
         web_enabled = bool(p["web_gui_enable"]) and self.web_server is not None
@@ -3788,7 +4360,7 @@ class YellowAreaFollower(Node):
                 angular,
                 result.speed_scale,
                 self.lost_frames,
-                p,
+                render_params,
             )
             full_yellow_mask = np.zeros(
                 (image_height, image_width), dtype=np.uint8
@@ -3817,7 +4389,7 @@ class YellowAreaFollower(Node):
             )
 
         if web_due:
-            web_params = dict(p)
+            web_params = dict(render_params)
             web_params["debug_side_panel"] = False
             web_params["debug_embed_info_panel"] = False
             if debug is None or bool(p["debug_side_panel"]):
