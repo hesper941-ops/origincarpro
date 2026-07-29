@@ -3,7 +3,7 @@
 """
 黄绿道路区域分割与公共边界提取工具。
 
-本程序只负责黄绿道路区域分割与公共边界提取，不包含路径规划和运动控制功能。
+本程序只负责黄绿道路区域分割与分界线提取，不包含中心线规划、路径规划和运动控制功能。
 程序独立读取第一阶段保存的 JSON，不导入第一阶段脚本，也不会修改阈值 JSON。
 
 USB 相机启动示例：
@@ -62,6 +62,12 @@ PROFILE_ALLOWED_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 )
 BOUNDARY_OVERLAY_COLOR = (255, 0, 255)
+INTERFACE_VERSION = "gxb_boundary_v1"
+THIRD_STAGE_BOUNDARY_TOPIC = "/gxb_test/final_boundary_mask"
+THIRD_STAGE_YELLOW_TOPIC = "/gxb_test/yellow_mask_final"
+THIRD_STAGE_GREEN_TOPIC = "/gxb_test/green_mask_final"
+THIRD_STAGE_STATUS_TOPIC = "/gxb_test/segmentation_status"
+BOUNDARY_REGION_TOPIC = "/gxb_test/boundary_region_mask"
 
 
 # 第二阶段参数不包含 HSV；HSV 始终来自第一阶段 JSON。
@@ -78,6 +84,7 @@ DEFAULT_SEGMENTATION_CONFIG: Dict[str, object] = {
     "boundary_min_span_px": 20,
     "boundary_min_valid_pixels": 40,
     "boundary_overlay_thickness": 3,
+    "final_boundary_thickness_px": 1,
     "prefer_center_connected_yellow": True,
     "center_seed_x_min_ratio": 0.30,
     "center_seed_x_max_ratio": 0.70,
@@ -111,6 +118,7 @@ PARAMETER_SCHEMA: Dict[str, Tuple[str, object, object, object, str]] = {
     "boundary_min_span_px": ("边界清理", 1, 500, 1, "number"),
     "boundary_min_valid_pixels": ("边界清理", 1, 10000, 5, "number"),
     "boundary_overlay_thickness": ("边界清理", 1, 10, 1, "number"),
+    "final_boundary_thickness_px": ("边界清理", 1, 3, 1, "number"),
     "prefer_center_connected_yellow": (
         "主黄色区域", False, True, None, "bool"
     ),
@@ -177,6 +185,7 @@ class SegmentationConfig:
             "boundary_min_span_px",
             "boundary_min_valid_pixels",
             "boundary_overlay_thickness",
+            "final_boundary_thickness_px",
             "repair_max_component_area_px",
             "repair_max_iterations",
         )
@@ -276,8 +285,11 @@ class BoundaryResult:
     green_edge_near_yellow: np.ndarray
     gap_centerline: np.ndarray
     candidate: np.ndarray
+    boundary_region: np.ndarray
     final: np.ndarray
     component_count: int
+    components: List[Dict[str, object]]
+    estimated_mean_thickness_px: float
     valid: bool
     reason: str
 
@@ -838,6 +850,64 @@ class BoundaryExtractor:
             cv2.bitwise_not(mask), cv2.DIST_L2, 5
         )
 
+    @staticmethod
+    def _close(mask: np.ndarray, cfg: Dict[str, object]) -> np.ndarray:
+        """使用同一个小核参数连接轻微断裂。"""
+        iterations = int(cfg["boundary_close_iterations"])
+        if iterations <= 0:
+            return mask.copy()
+        size = int(cfg["boundary_close_kernel_size"])
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (size, size)
+        )
+        return cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=iterations,
+        )
+
+    @staticmethod
+    def _filter_components(
+        mask: np.ndarray,
+        roi_area: int,
+        cfg: Dict[str, object],
+    ) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+        """只按像素、跨度和异常面积过滤，不选择道路位置。"""
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
+        output = np.zeros_like(mask)
+        components: List[Dict[str, object]] = []
+        maximum_area = roi_area * float(
+            cfg["boundary_max_component_area_ratio"]
+        )
+        for label in range(1, count):
+            pixel_count = int(stats[label, cv2.CC_STAT_AREA])
+            bbox_x = int(stats[label, cv2.CC_STAT_LEFT])
+            bbox_y = int(stats[label, cv2.CC_STAT_TOP])
+            bbox_width = int(stats[label, cv2.CC_STAT_WIDTH])
+            bbox_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+            span = max(bbox_width, bbox_height)
+            if pixel_count < int(cfg["boundary_min_component_pixels"]):
+                continue
+            if pixel_count > maximum_area:
+                continue
+            if span < int(cfg["boundary_min_span_px"]):
+                continue
+            output[labels == label] = 255
+            components.append({
+                "id": len(components) + 1,
+                "pixel_count": pixel_count,
+                "bbox_x": bbox_x,
+                "bbox_y": bbox_y,
+                "bbox_width": bbox_width,
+                "bbox_height": bbox_height,
+                "centroid_x": round(float(centroids[label, 0]), 2),
+                "centroid_y": round(float(centroids[label, 1]), 2),
+            })
+        return output, components
+
     @classmethod
     def extract(
         cls,
@@ -848,11 +918,15 @@ class BoundaryExtractor:
         roi_end: int,
         cfg: Dict[str, object],
     ) -> BoundaryResult:
-        """生成候选、清理正式边界并判断有效性。"""
+        """分别生成宽候选区域和供第三阶段使用的窄分界线。"""
         thickness = int(cfg["boundary_contour_thickness_px"])
+        final_thickness = int(cfg["final_boundary_thickness_px"])
         search_radius = float(cfg["boundary_search_radius_px"])
         yellow_contour = cls._contour_mask(yellow, thickness)
         green_contour = cls._contour_mask(green, thickness)
+        thin_yellow_contour = cls._contour_mask(
+            yellow, final_thickness
+        )
         distance_to_yellow = cls._distance_to(yellow)
         distance_to_green = cls._distance_to(green)
         yellow_near_green = np.where(
@@ -865,6 +939,12 @@ class BoundaryExtractor:
             255,
             0,
         ).astype(np.uint8)
+        thin_yellow_near_green = np.where(
+            (thin_yellow_contour > 0)
+            & (distance_to_green <= search_radius),
+            255,
+            0,
+        ).astype(np.uint8)
 
         gap = np.zeros_like(yellow)
         if bool(cfg["gap_centerline_enable"]):
@@ -872,14 +952,21 @@ class BoundaryExtractor:
             tolerance = float(
                 cfg["gap_distance_balance_tolerance_px"]
             )
-            gap = np.where(
+            balance = np.abs(distance_to_yellow - distance_to_green)
+            gap_region = (
                 (unknown > 0)
                 & (distance_to_yellow <= maximum)
                 & (distance_to_green <= maximum)
-                & (
-                    np.abs(distance_to_yellow - distance_to_green)
-                    <= tolerance
-                ),
+                & (balance <= tolerance)
+            )
+            # 在 3x3 邻域中只保留距离差的局部最小值，把缝隙带压成
+            # 一至数像素的近似中线，不依赖 opencv-contrib 骨架函数。
+            local_minimum = cv2.erode(
+                balance.astype(np.float32),
+                np.ones((3, 3), dtype=np.uint8),
+            )
+            gap = np.where(
+                gap_region & (balance <= local_minimum + 0.25),
                 255,
                 0,
             ).astype(np.uint8)
@@ -887,62 +974,76 @@ class BoundaryExtractor:
         candidate = cv2.bitwise_or(
             cv2.bitwise_or(yellow_near_green, green_near_yellow), gap
         )
-        close_iterations = int(cfg["boundary_close_iterations"])
-        cleaned = candidate
-        if close_iterations > 0:
-            size = int(cfg["boundary_close_kernel_size"])
-            kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (size, size)
-            )
-            cleaned = cv2.morphologyEx(
-                cleaned,
-                cv2.MORPH_CLOSE,
-                kernel,
-                iterations=close_iterations,
-            )
-
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(
-            cleaned, connectivity=8
-        )
-        final = np.zeros_like(cleaned)
-        component_count = 0
+        region_cleaned = cls._close(candidate, cfg)
         roi_area = max(1, (roi_end - roi_start) * yellow.shape[1])
-        maximum_area = roi_area * float(
-            cfg["boundary_max_component_area_ratio"]
+        boundary_region, _region_components = cls._filter_components(
+            region_cleaned, roi_area, cfg
         )
-        for label in range(1, count):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            width = int(stats[label, cv2.CC_STAT_WIDTH])
-            height = int(stats[label, cv2.CC_STAT_HEIGHT])
-            span = max(width, height)
-            if area < int(cfg["boundary_min_component_pixels"]):
-                continue
-            if area > maximum_area:
-                continue
-            if span < int(cfg["boundary_min_span_px"]):
-                continue
-            final[labels == label] = 255
-            component_count += 1
+
+        # 正式接口只使用黄色道路侧细轮廓和缝隙中线；绿色侧轮廓不并入，
+        # 从源头避免两条平行白线。
+        support_size = max(3, int(round(search_radius)) * 2 + 1)
+        yellow_support = cv2.dilate(
+            thin_yellow_near_green,
+            cv2.getStructuringElement(
+                # 主要沿横向覆盖同一截面的黄色侧轮廓，避免把平行的
+                # gap 中线重复并入；纵向只扩 3 像素，仍允许中线补断。
+                cv2.MORPH_RECT, (support_size, 3)
+            ),
+            iterations=1,
+        )
+        gap_supplement = cv2.bitwise_and(
+            gap, cv2.bitwise_not(yellow_support)
+        )
+        final_candidate = cv2.bitwise_or(
+            thin_yellow_near_green, gap_supplement
+        )
+        final_cleaned = cls._close(final_candidate, cfg)
+        final, components = cls._filter_components(
+            final_cleaned, roi_area, cfg
+        )
+        component_count = len(components)
         final_pixels = int(cv2.countNonZero(final))
-        if final_pixels < int(cfg["boundary_min_valid_pixels"]):
+        if cv2.countNonZero(yellow) == 0:
             valid = False
-            reason = (
-                f"边界像素不足 {final_pixels}/"
-                f"{cfg['boundary_min_valid_pixels']}"
-            )
+            reason = "yellow_missing"
+        elif cv2.countNonZero(green) == 0:
+            valid = False
+            reason = "green_missing"
+        elif cv2.countNonZero(final_candidate) == 0:
+            valid = False
+            reason = "boundary_missing"
         elif component_count < 1:
             valid = False
-            reason = "没有合格边界连通域"
+            reason = "boundary_too_short"
+        elif final_pixels < int(cfg["boundary_min_valid_pixels"]):
+            valid = False
+            reason = "boundary_too_short"
         else:
             valid = True
-            reason = "boundary_valid"
+            reason = "valid"
+        approximate_length = sum(
+            max(
+                int(component["bbox_width"]),
+                int(component["bbox_height"]),
+            )
+            for component in components
+        )
+        mean_thickness = (
+            float(final_pixels) / approximate_length
+            if approximate_length > 0
+            else 0.0
+        )
         return BoundaryResult(
             yellow_edge_near_green=yellow_near_green,
             green_edge_near_yellow=green_near_yellow,
             gap_centerline=gap,
             candidate=candidate,
+            boundary_region=boundary_region,
             final=final,
             component_count=component_count,
+            components=components[:20],
+            estimated_mean_thickness_px=round(mean_thickness, 3),
             valid=valid,
             reason=reason,
         )
@@ -1002,6 +1103,10 @@ class RuntimeStatus:
     @staticmethod
     def defaults() -> Dict[str, object]:
         return {
+            "interface_version": INTERFACE_VERSION,
+            "boundary_topic": THIRD_STAGE_BOUNDARY_TOPIC,
+            "yellow_topic": THIRD_STAGE_YELLOW_TOPIC,
+            "green_topic": THIRD_STAGE_GREEN_TOPIC,
             "image_received": False,
             "image_topic": "/image_out",
             "frame_width": 0,
@@ -1009,6 +1114,10 @@ class RuntimeStatus:
             "encoding": "",
             "fps": 0.0,
             "last_frame_age_sec": None,
+            "source_stamp_sec": 0,
+            "source_stamp_nanosec": 0,
+            "source_frame_id": "",
+            "frame_sequence": 0,
             "segmentation_valid": False,
             "config_loaded": False,
             "threshold_config_path": "",
@@ -1021,6 +1130,8 @@ class RuntimeStatus:
             "config_error": "",
             "hsv_range_overlap": False,
             "hue_range_overlap_size": 0,
+            "roi_y_start_ratio": 0.0,
+            "roi_y_end_ratio": 1.0,
             "yellow_pixels_raw": 0,
             "green_pixels_raw": 0,
             "overlap_pixels": 0,
@@ -1037,10 +1148,13 @@ class RuntimeStatus:
             "green_edge_near_yellow_pixels": 0,
             "gap_centerline_pixels": 0,
             "boundary_candidate_pixels": 0,
+            "boundary_region_pixels": 0,
             "final_boundary_pixels": 0,
+            "estimated_boundary_mean_thickness_px": 0.0,
             "boundary_component_count": 0,
+            "boundary_components": [],
             "boundary_valid": False,
-            "boundary_reason": "等待有效阈值配置",
+            "boundary_reason": "no_image",
             "topology_repair_enable": False,
             "repaired_yellow_pixels": 0,
             "repaired_green_pixels": 0,
@@ -1100,6 +1214,9 @@ class SegmentationConfigStore:
                 "min_valid_pixels": cfg["boundary_min_valid_pixels"],
                 "overlay_color_bgr": list(BOUNDARY_OVERLAY_COLOR),
                 "overlay_thickness": cfg["boundary_overlay_thickness"],
+                "final_boundary_thickness_px": cfg[
+                    "final_boundary_thickness_px"
+                ],
             },
             "gap_centerline": {
                 "enable": cfg["gap_centerline_enable"],
@@ -1183,6 +1300,9 @@ class SegmentationConfigStore:
             "boundary_overlay_thickness": (
                 boundary, "overlay_thickness"
             ),
+            "final_boundary_thickness_px": (
+                boundary, "final_boundary_thickness_px"
+            ),
             "gap_centerline_enable": (gap, "enable"),
             "gap_max_distance_to_color_px": (
                 gap, "max_distance_to_color_px"
@@ -1236,12 +1356,13 @@ class GreenYellowSegmentationNode(Node):
         ("yellow_raw", "/gxb_test/yellow_mask_raw"),
         ("green_raw", "/gxb_test/green_mask_raw"),
         ("unknown_raw", "/gxb_test/unknown_mask_raw"),
-        ("yellow_final", "/gxb_test/yellow_mask_final"),
-        ("green_final", "/gxb_test/green_mask_final"),
+        ("yellow_final", THIRD_STAGE_YELLOW_TOPIC),
+        ("green_final", THIRD_STAGE_GREEN_TOPIC),
         ("unknown_final", "/gxb_test/unknown_mask_final"),
         ("gap", "/gxb_test/gap_centerline_mask"),
         ("candidate", "/gxb_test/boundary_candidate_mask"),
-        ("boundary", "/gxb_test/final_boundary_mask"),
+        ("region", BOUNDARY_REGION_TOPIC),
+        ("boundary", THIRD_STAGE_BOUNDARY_TOPIC),
     )
 
     def __init__(self) -> None:
@@ -1313,6 +1434,7 @@ class GreenYellowSegmentationNode(Node):
         self.last_frame_time = 0.0
         self.last_callback_time = 0.0
         self.last_encode_time = 0.0
+        self.frame_sequence = 0
         self.latest_raw_bgr: Optional[np.ndarray] = None
         self.http_server: Optional[ThreadingHTTPServer] = None
         self.http_thread: Optional[threading.Thread] = None
@@ -1340,7 +1462,7 @@ class GreenYellowSegmentationNode(Node):
             Image, "/gxb_test/segmentation_overlay", qos
         )
         self.status_publisher = self.create_publisher(
-            String, "/gxb_test/segmentation_status", qos
+            String, THIRD_STAGE_STATUS_TOPIC, qos
         )
         self.create_subscription(Image, self.image_topic, self._on_image, qos)
         if self.web_enabled:
@@ -1372,6 +1494,11 @@ class GreenYellowSegmentationNode(Node):
         with self.threshold_lock:
             self.threshold = loaded
         with self.status_lock:
+            missing_reason = (
+                "config_missing"
+                if "MISSING" in loaded.error
+                else "config_invalid"
+            )
             self.status.values.update({
                 "config_loaded": loaded.loaded,
                 "segmentation_valid": False,
@@ -1384,7 +1511,7 @@ class GreenYellowSegmentationNode(Node):
                 "config_error": loaded.error,
                 "boundary_valid": False,
                 "boundary_reason": (
-                    "等待图像" if loaded.loaded else loaded.error
+                    "no_image" if loaded.loaded else missing_reason
                 ),
                 "last_error": loaded.error,
             })
@@ -1453,14 +1580,17 @@ class GreenYellowSegmentationNode(Node):
         height, width = bgr.shape[:2]
         zero = np.zeros((height, width), dtype=np.uint8)
         boundary = BoundaryResult(
-            zero.copy(),
-            zero.copy(),
-            zero.copy(),
-            zero.copy(),
-            zero.copy(),
-            0,
-            False,
-            "等待有效阈值配置",
+            yellow_edge_near_green=zero.copy(),
+            green_edge_near_yellow=zero.copy(),
+            gap_centerline=zero.copy(),
+            candidate=zero.copy(),
+            boundary_region=zero.copy(),
+            final=zero.copy(),
+            component_count=0,
+            components=[],
+            estimated_mean_thickness_px=0.0,
+            valid=False,
+            reason="config_missing",
         )
         return SegmentationResult(
             bgr,
@@ -1538,6 +1668,7 @@ class GreenYellowSegmentationNode(Node):
         start = time.monotonic()
         try:
             bgr = ImageCodec.to_bgr(msg)
+            self.frame_sequence += 1
             self._maybe_auto_reload()
             threshold = self.threshold_snapshot()
             cfg = self.cfg_snapshot()
@@ -1569,7 +1700,7 @@ class GreenYellowSegmentationNode(Node):
                 )
                 self.status.values["segmentation_valid"] = False
                 self.status.values["boundary_valid"] = False
-                self.status.values["boundary_reason"] = "图像处理异常"
+                self.status.values["boundary_reason"] = "processing_error"
             self._publish_status()
 
     def _update_status(
@@ -1597,19 +1728,37 @@ class GreenYellowSegmentationNode(Node):
                     + 1,
                 )
             self.latest_raw_bgr = result.raw_bgr.copy()
+            header = getattr(msg, "header", None)
+            stamp = getattr(header, "stamp", None)
             self.status.values.update({
+                "interface_version": INTERFACE_VERSION,
+                "boundary_topic": THIRD_STAGE_BOUNDARY_TOPIC,
+                "yellow_topic": THIRD_STAGE_YELLOW_TOPIC,
+                "green_topic": THIRD_STAGE_GREEN_TOPIC,
                 "image_received": True,
                 "frame_width": int(result.raw_bgr.shape[1]),
                 "frame_height": int(result.raw_bgr.shape[0]),
                 "encoding": str(msg.encoding),
                 "fps": fps,
                 "last_frame_age_sec": 0.0,
+                "source_stamp_sec": int(
+                    getattr(stamp, "sec", 0)
+                ),
+                "source_stamp_nanosec": int(
+                    getattr(stamp, "nanosec", 0)
+                ),
+                "source_frame_id": str(
+                    getattr(header, "frame_id", "")
+                ),
+                "frame_sequence": self.frame_sequence,
                 "config_loaded": threshold.loaded,
                 "segmentation_valid": threshold.loaded,
                 "threshold_config_path": threshold.path,
                 "profile_name": self.profile_name,
                 "config_saved_at": threshold.saved_at,
                 "config_error": threshold.error,
+                "roi_y_start_ratio": threshold.roi_y_start_ratio,
+                "roi_y_end_ratio": threshold.roi_y_end_ratio,
                 "hsv_range_overlap": hue_overlap > 0,
                 "hue_range_overlap_size": hue_overlap,
                 "yellow_pixels_raw": int(
@@ -1657,18 +1806,31 @@ class GreenYellowSegmentationNode(Node):
                 "boundary_candidate_pixels": int(
                     cv2.countNonZero(result.boundary.candidate)
                 ),
+                "boundary_region_pixels": int(
+                    cv2.countNonZero(
+                        result.boundary.boundary_region
+                    )
+                ),
                 "final_boundary_pixels": int(
                     cv2.countNonZero(result.boundary.final)
                 ),
+                "estimated_boundary_mean_thickness_px":
+                    result.boundary.estimated_mean_thickness_px,
                 "boundary_component_count":
                     result.boundary.component_count,
+                "boundary_components":
+                    copy.deepcopy(result.boundary.components),
                 "boundary_valid": (
                     threshold.loaded and result.boundary.valid
                 ),
                 "boundary_reason": (
                     result.boundary.reason
                     if threshold.loaded
-                    else threshold.error
+                    else (
+                        "config_missing"
+                        if "MISSING" in threshold.error
+                        else "config_invalid"
+                    )
                 ),
                 "topology_repair_enable": bool(
                     cfg["topology_repair_enable"]
@@ -1698,7 +1860,10 @@ class GreenYellowSegmentationNode(Node):
             "green_final": result.green_final,
             "unknown_final": result.unknown_final,
             "gap": result.boundary.gap_centerline,
-            "candidate": result.boundary.candidate,
+            # 兼容旧调试话题：candidate 与新 region 都发布清理后的
+            # 候选分界区域；正式接口始终是 boundary。
+            "candidate": result.boundary.boundary_region,
+            "region": result.boundary.boundary_region,
             "boundary": result.boundary.final,
         }
         for name, mask in masks.items():
@@ -1752,7 +1917,15 @@ class GreenYellowSegmentationNode(Node):
             ),
             "candidate": ImageCodec.encode_jpeg(
                 cv2.cvtColor(
-                    result.boundary.candidate, cv2.COLOR_GRAY2BGR
+                    result.boundary.boundary_region,
+                    cv2.COLOR_GRAY2BGR,
+                ),
+                100,
+            ),
+            "region": ImageCodec.encode_jpeg(
+                cv2.cvtColor(
+                    result.boundary.boundary_region,
+                    cv2.COLOR_GRAY2BGR,
                 ),
                 100,
             ),
@@ -1907,9 +2080,10 @@ pre{white-space:pre-wrap;word-break:break-word}
 <div class="grid3"><div class="card"><b>Yellow mask final</b><img src="/stream/yellow"></div>
 <div class="card"><b>Green mask final</b><img src="/stream/green"></div>
 <div class="card"><b>Unknown mask final</b><img src="/stream/unknown"></div></div>
-<div class="grid3"><div class="card"><b>Gap centerline</b><img src="/stream/gap"></div>
-<div class="card"><b>Boundary candidate</b><img src="/stream/candidate"></div>
-<div class="card"><b>Final boundary</b><img src="/stream/boundary"></div></div>
+<div class="grid2"><div class="card"><b>Boundary region（调试候选区域）</b>
+<img src="/stream/region"></div>
+<div class="card"><b>Final boundary line（第三阶段正式接口）</b>
+<img src="/stream/boundary"></div></div>
 <pre id="status" class="card">等待相机图像</pre></section>
 <aside><div class="card"><b>第一阶段阈值（只读）</b>
 <p>来源：第一阶段 JSON 配置。需要修改 HSV 时，请运行
@@ -1961,7 +2135,7 @@ class SegmentationWebServer:
 
     STREAM_NAMES = {
         "raw", "overlay", "yellow", "green", "unknown",
-        "gap", "candidate", "boundary",
+        "gap", "candidate", "region", "boundary",
     }
 
     def __init__(self, node: GreenYellowSegmentationNode) -> None:
