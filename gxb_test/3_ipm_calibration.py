@@ -771,9 +771,9 @@ class IpmCalibrationNode(Node):
                 Image, self.config.green_topic, lambda msg: self._on_mask("green", msg), qos
             )
             self.create_subscription(String, self.config.segmentation_status_topic, self._on_segmentation_status, qos)
-        self.publishers: Dict[str, Any] = {}
+        self._ipm_publishers: Dict[str, Any] = {}
         if self.config.publish_ipm_debug_topics:
-            self.publishers = {
+            self._ipm_publishers = {
                 "raw": self.create_publisher(Image, "/gxb_test/ipm/raw_birdview", 1),
                 "boundary": self.create_publisher(Image, "/gxb_test/ipm/boundary_birdview", 1),
                 "yellow": self.create_publisher(Image, "/gxb_test/ipm/yellow_birdview", 1),
@@ -1013,9 +1013,9 @@ class IpmCalibrationNode(Node):
         pure_birdview = IpmTransformer.color(image, matrix, size)
         web_birdview = self._annotate_birdview(pure_birdview)
         self.frames.update("birdview", web_birdview, self.config.web_gui_jpeg_quality)
-        if self.publishers:
+        if self._ipm_publishers:
             # ROS raw_birdview 是纯透视结果，不混入 Web 调试标注。
-            self.publishers["raw"].publish(
+            self._ipm_publishers["raw"].publish(
                 ImageCodec.to_message(pure_birdview, "bgr8", source_message)
             )
         for name, mask in masks.items():
@@ -1025,8 +1025,8 @@ class IpmCalibrationNode(Node):
             self.frames.update(f"{name}_birdview", warped, self.config.web_gui_jpeg_quality)
             if name == "boundary":
                 self.frames.update("boundary_raw", mask, self.config.web_gui_jpeg_quality)
-            if self.publishers:
-                self.publishers[name].publish(
+            if self._ipm_publishers:
+                self._ipm_publishers[name].publish(
                     ImageCodec.to_message(warped, "mono8", mask_messages[name])
                 )
         self.last_encode_time = now
@@ -1091,11 +1091,11 @@ class IpmCalibrationNode(Node):
             return document
 
     def _publish_status(self) -> None:
-        if not self.publishers:
+        if not self._ipm_publishers:
             return
         message = String()
         message.data = json.dumps(self._status_document(), ensure_ascii=False)
-        self.publishers["status"].publish(message)
+        self._ipm_publishers["status"].publish(message)
 
     def _config_document(self) -> Dict[str, Any]:
         return asdict(self.config)
