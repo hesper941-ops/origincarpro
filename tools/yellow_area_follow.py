@@ -1432,7 +1432,7 @@ def numpy_to_image_message(
     return output
 
 
-def render_debug_image(
+def _render_debug_image_legacy(
     bgr: np.ndarray,
     result: VisionResult,
     roi_y_start_ratio: float,
@@ -1749,6 +1749,509 @@ def render_debug_image(
     return debug
 
 
+def _debug_path_polyline(
+    points: List[Tuple[float, float]],
+    interpolate: bool,
+    interpolate_count: int,
+    image_width: int,
+    roi_y_start: int,
+    roi_y_end: int,
+) -> np.ndarray:
+    """Create a smooth display-only polyline without changing control points."""
+    if not points:
+        return np.empty((0, 2), dtype=np.int32)
+    display_points = list(points)
+    if interpolate and len(points) >= 2:
+        fitted = _fit_x_of_y([(x, y, 1.0) for x, y in points])
+        if fitted is not None:
+            y_values = np.linspace(
+                min(point[1] for point in points),
+                max(point[1] for point in points),
+                max(2, int(interpolate_count)),
+            )
+            display_points = [
+                (float(np.polyval(fitted, y)), float(y)) for y in y_values
+            ]
+    return np.asarray(
+        [
+            (
+                int(np.clip(round(x), 0, image_width - 1)),
+                int(
+                    np.clip(
+                        round(roi_y_start + y),
+                        roi_y_start,
+                        roi_y_end - 1,
+                    )
+                ),
+            )
+            for x, y in display_points
+        ],
+        dtype=np.int32,
+    )
+
+
+def _path_mode_color(path_mode: str) -> Tuple[int, int, int]:
+    """Return the standardized BGR color for one path mode."""
+    return {
+        "both_boundary_center": (0, 255, 0),
+        "single_boundary_offset": (255, 255, 0),
+        "history_prediction": (0, 255, 255),
+        "yellow_area_center_fallback": (0, 165, 255),
+        "lost_stop": (0, 0, 255),
+    }.get(path_mode, (255, 255, 255))
+
+
+def draw_info_panel(
+    canvas: np.ndarray,
+    x0: int,
+    panel_width: int,
+    result: VisionResult,
+    linear: float,
+    angular: float,
+    speed_scale: float,
+    lost_frames: int,
+    params: dict,
+    fill_background: bool = True,
+) -> None:
+    """Draw a compact, grouped status panel beside the camera image."""
+    panel_height = canvas.shape[0]
+    x1 = min(canvas.shape[1], x0 + panel_width)
+    if fill_background:
+        canvas[:, x0:x1] = (24, 24, 24)
+    left = x0 + 12
+    white = (235, 235, 235)
+    muted = (175, 175, 175)
+    cyan = (255, 255, 0)
+    purple = (255, 0, 255)
+    mode_color = _path_mode_color(result.path_mode)
+
+    y = 20
+    if bool(params["dry_run"]):
+        cv2.putText(
+            canvas,
+            "DRY RUN",
+            (left, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.53,
+            purple,
+            2,
+            cv2.LINE_AA,
+        )
+        y += 20
+    cv2.putText(
+        canvas,
+        "MODE:",
+        (left, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.46,
+        muted,
+        1,
+        cv2.LINE_AA,
+    )
+    y += 20
+    cv2.putText(
+        canvas,
+        result.path_mode,
+        (left, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.53,
+        mode_color,
+        2,
+        cv2.LINE_AA,
+    )
+    y += 16
+
+    groups = [
+        (
+            "PATH",
+            [
+                f"boundary_points: {result.boundary_points_count}",
+                f"target_points: {len(result.target_path_points)}",
+                f"valid_center_count: {result.valid_center_count}",
+                f"left_visible: {result.left_visible_count}",
+                f"right_visible: {result.right_visible_count}",
+                f"both_visible: {result.both_visible_count}",
+            ],
+        ),
+        (
+            "ERROR",
+            [
+                f"near_error: {result.near_error:.3f}",
+                f"far_error: {result.far_error:.3f}",
+                f"control_error: {result.control_error:.3f}",
+            ],
+        ),
+        (
+            "CMD",
+            [
+                f"linear.x: {linear:.3f}",
+                f"angular.z: {angular:.3f}",
+                f"speed_scale: {speed_scale:.3f}",
+            ],
+        ),
+        (
+            "VISION",
+            [
+                f"yellow_pixels: {result.yellow_pixels}",
+                f"green_pixels: {result.green_pixels}",
+                f"lost_frames: {lost_frames}",
+                f"history_age: {result.history_age}",
+                f"fallback_frames: {result.yellow_fallback_frames}",
+            ],
+        ),
+        (
+            "PARAM",
+            [
+                f"offset_px: {float(params['single_boundary_offset_px']):.1f}",
+                f"kp: {float(params['kp']):.3f}",
+                f"kd: {float(params['kd']):.3f}",
+                f"head_gain: {float(params['head_gain']):.3f}",
+            ],
+        ),
+    ]
+    remaining_lines = sum(1 + len(lines) for _, lines in groups)
+    line_height = max(
+        12,
+        min(16, int((panel_height - y - 4) / max(remaining_lines, 1))),
+    )
+    field_scale = max(0.32, min(0.42, line_height / 36.0))
+    for title, lines in groups:
+        if y >= panel_height - 2:
+            break
+        y += 3
+        cv2.putText(
+            canvas,
+            f"[{title}]",
+            (left, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            field_scale,
+            cyan,
+            1,
+            cv2.LINE_AA,
+        )
+        y += line_height
+        for line in lines:
+            if y >= panel_height - 2:
+                break
+            cv2.putText(
+                canvas,
+                line,
+                (left, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                field_scale,
+                white,
+                1,
+                cv2.LINE_AA,
+            )
+            y += line_height
+
+
+def render_debug_image(
+    bgr: np.ndarray,
+    result: VisionResult,
+    linear: float,
+    angular: float,
+    speed_scale: float,
+    lost_frames: int,
+    params: dict,
+) -> np.ndarray:
+    """Render a clean main image plus an optional right-side status panel."""
+    main = bgr.copy()
+    image_height, image_width = main.shape[:2]
+    roi_y_start = int(
+        image_height * float(params["roi_y_start_ratio"])
+    )
+    roi_y_start = min(max(roi_y_start, 0), image_height - 1)
+    roi_y_end = int(image_height * float(params["roi_y_end_ratio"]))
+    roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
+    roi_y_end_line = min(roi_y_end, image_height - 1)
+
+    blue = (255, 0, 0)
+    red = (0, 0, 255)
+    cyan = (255, 255, 0)
+    light_blue = (255, 210, 40)
+    green = (0, 255, 0)
+    purple = (255, 0, 255)
+    white = (255, 255, 255)
+    orange = (0, 165, 255)
+    yellow = (0, 255, 255)
+
+    yellow_alpha = float(
+        np.clip(params["debug_yellow_overlay_alpha"], 0.0, 1.0)
+    )
+    if yellow_alpha > 0.0:
+        overlay = main.copy()
+        overlay_roi = overlay[roi_y_start:roi_y_end, :]
+        overlay_roi[result.yellow_mask > 0] = yellow
+        cv2.addWeighted(
+            overlay, yellow_alpha, main, 1.0 - yellow_alpha, 0.0, main
+        )
+    green_alpha = float(
+        np.clip(params["debug_green_overlay_alpha"], 0.0, 1.0)
+    )
+    if green_alpha > 0.0:
+        overlay = main.copy()
+        overlay_roi = overlay[roi_y_start:roi_y_end, :]
+        overlay_roi[result.green_mask > 0] = (0, 180, 0)
+        cv2.addWeighted(
+            overlay, green_alpha, main, 1.0 - green_alpha, 0.0, main
+        )
+    green_contours, _ = cv2.findContours(
+        result.green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(
+        main[roi_y_start:roi_y_end, :],
+        green_contours,
+        -1,
+        (0, 180, 0),
+        1,
+    )
+
+    cv2.line(
+        main, (0, roi_y_start), (image_width - 1, roi_y_start), cyan, 2
+    )
+    cv2.line(
+        main,
+        (0, roi_y_end_line),
+        (image_width - 1, roi_y_end_line),
+        cyan,
+        2,
+    )
+    image_center_x = image_width // 2
+    cv2.line(
+        main,
+        (image_center_x, roi_y_start),
+        (image_center_x, image_height - 1),
+        blue,
+        2,
+    )
+
+    # Draw actual points in green and a smooth display-only boundary fit.
+    for sequence in result.boundary_sequences:
+        for x, y, _ in sequence:
+            point = (
+                int(np.clip(round(x), 0, image_width - 1)),
+                int(
+                    np.clip(
+                        round(roi_y_start + y),
+                        roi_y_start,
+                        roi_y_end - 1,
+                    )
+                ),
+            )
+            cv2.circle(main, point, 3, green, -1)
+        fitted = _fit_x_of_y(sequence)
+        if fitted is not None and len(sequence) >= 2:
+            y_values = np.linspace(
+                sequence[0][1], sequence[-1][1], 40
+            )
+            fitted_line = np.asarray(
+                [
+                    (
+                        int(
+                            np.clip(
+                                round(np.polyval(fitted, y)),
+                                0,
+                                image_width - 1,
+                            )
+                        ),
+                        int(
+                            np.clip(
+                                round(roi_y_start + y),
+                                roi_y_start,
+                                roi_y_end - 1,
+                            )
+                        ),
+                    )
+                    for y in y_values
+                ],
+                dtype=np.int32,
+            )
+            cv2.polylines(
+                main, [fitted_line], False, light_blue, 1, cv2.LINE_AA
+            )
+
+    if result.path_mode != "lost_stop":
+        display_path = _debug_path_polyline(
+            result.target_path_points,
+            bool(params["debug_path_interpolate"]),
+            int(params["debug_path_interpolate_count"]),
+            image_width,
+            roi_y_start,
+            roi_y_end,
+        )
+        if result.path_mode == "history_prediction":
+            path_color = yellow
+        elif result.path_mode == "yellow_area_center_fallback":
+            path_color = yellow
+        else:
+            path_color = purple
+        if len(display_path) >= 2:
+            cv2.polylines(
+                main, [display_path], False, path_color, 3, cv2.LINE_AA
+            )
+        elif len(display_path) == 1:
+            cv2.circle(main, tuple(display_path[0]), 5, path_color, -1)
+
+        near_point = None
+        if result.near_center_x is not None and result.near_y is not None:
+            near_point = (
+                int(
+                    np.clip(
+                        round(result.near_center_x), 0, image_width - 1
+                    )
+                ),
+                int(
+                    np.clip(
+                        round(roi_y_start + result.near_y),
+                        roi_y_start,
+                        roi_y_end - 1,
+                    )
+                ),
+            )
+            cv2.circle(main, near_point, 8, (0, 0, 0), -1)
+            cv2.circle(main, near_point, 6, red, -1)
+            cv2.putText(
+                main,
+                "near",
+                (near_point[0] + 8, near_point[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                red,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.arrowedLine(
+                main,
+                (image_center_x, image_height - 1),
+                near_point,
+                white,
+                3,
+                cv2.LINE_AA,
+                tipLength=0.08,
+            )
+        if result.far_center_x is not None and result.far_y is not None:
+            far_point = (
+                int(
+                    np.clip(
+                        round(result.far_center_x), 0, image_width - 1
+                    )
+                ),
+                int(
+                    np.clip(
+                        round(roi_y_start + result.far_y),
+                        roi_y_start,
+                        roi_y_end - 1,
+                    )
+                ),
+            )
+            cv2.circle(main, far_point, 8, (0, 0, 0), -1)
+            cv2.circle(main, far_point, 6, orange, -1)
+            cv2.putText(
+                main,
+                "far",
+                (far_point[0] + 8, far_point[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                orange,
+                1,
+                cv2.LINE_AA,
+            )
+        if result.path_mode == "yellow_area_center_fallback":
+            cv2.putText(
+                main,
+                "fallback: yellow area center",
+                (10, 26),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                orange,
+                2,
+                cv2.LINE_AA,
+            )
+    else:
+        text = "LOST / STOP"
+        (text_width, text_height), _ = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, 1.15, 3
+        )
+        origin = (
+            max(8, (image_width - text_width) // 2),
+            max(text_height + 8, image_height // 2),
+        )
+        cv2.putText(
+            main,
+            text,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.15,
+            (0, 0, 0),
+            6,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            main,
+            text,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.15,
+            red,
+            3,
+            cv2.LINE_AA,
+        )
+
+    if bool(params["dry_run"]):
+        cv2.putText(
+            main,
+            "DRY RUN / ZERO CMD",
+            (10, image_height - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            main,
+            "DRY RUN / ZERO CMD",
+            (10, image_height - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            purple,
+            1,
+            cv2.LINE_AA,
+        )
+
+    requested_panel_width = max(1, int(params["debug_info_panel_width"]))
+    if bool(params["debug_side_panel"]):
+        canvas = np.full(
+            (image_height, image_width + requested_panel_width, 3),
+            (24, 24, 24),
+            dtype=np.uint8,
+        )
+        canvas[:, :image_width] = main
+        panel_x = image_width
+        panel_width = requested_panel_width
+    else:
+        canvas = main
+        panel_width = min(requested_panel_width, image_width)
+        panel_x = image_width - panel_width
+        overlay = canvas.copy()
+        overlay[:, panel_x:] = (24, 24, 24)
+        cv2.addWeighted(overlay, 0.82, canvas, 0.18, 0.0, canvas)
+    draw_info_panel(
+        canvas,
+        panel_x,
+        panel_width,
+        result,
+        linear,
+        angular,
+        speed_scale,
+        lost_frames,
+        params,
+        fill_background=bool(params["debug_side_panel"]),
+    )
+    return canvas
+
+
 class YellowAreaFollower(Node):
     """ROS2 node for standalone yellow-area following tests."""
 
@@ -1836,6 +2339,12 @@ class YellowAreaFollower(Node):
             "publish_boundary_debug_mask": False,
             "boundary_debug_mask_topic": "/yellow_area/boundary_mask",
             "debug_rate_hz": 10.0,
+            "debug_info_panel_width": 300,
+            "debug_side_panel": True,
+            "debug_path_interpolate": True,
+            "debug_path_interpolate_count": 40,
+            "debug_yellow_overlay_alpha": 0.18,
+            "debug_green_overlay_alpha": 0.10,
             "control_only_when_started": False,
             "dry_run": False,
             "log_interval_sec": 0.5,
@@ -1958,6 +2467,8 @@ class YellowAreaFollower(Node):
             "history_max_frames",
             "yellow_fallback_max_frames",
             "yellow_fallback_min_pixels",
+            "debug_info_panel_width",
+            "debug_path_interpolate_count",
             "lost_stop_frames",
         ):
             if int(p[name]) <= 0:
@@ -2026,6 +2537,12 @@ class YellowAreaFollower(Node):
             )
         if float(p["debug_rate_hz"]) <= 0.0:
             raise ValueError("debug_rate_hz must be greater than zero")
+        for name in (
+            "debug_yellow_overlay_alpha",
+            "debug_green_overlay_alpha",
+        ):
+            if not 0.0 <= float(p[name]) <= 1.0:
+                raise ValueError(f"{name} must be in [0.0, 1.0]")
         if float(p["log_interval_sec"]) <= 0.0:
             raise ValueError("log_interval_sec must be greater than zero")
         if float(p["image_timeout_sec"]) <= 0.0:
@@ -2046,6 +2563,8 @@ class YellowAreaFollower(Node):
             f"publish_boundary_debug_mask="
             f"{p['publish_boundary_debug_mask']}, "
             f"debug_rate_hz={p['debug_rate_hz']}, "
+            f"debug_side_panel={p['debug_side_panel']}, "
+            f"debug_info_panel_width={p['debug_info_panel_width']}, "
             f"dry_run={p['dry_run']}, "
             f"control_only_when_started={p['control_only_when_started']}"
         )
@@ -2376,20 +2895,27 @@ class YellowAreaFollower(Node):
             self.debug_image_publisher is not None
             and self.debug_mask_publisher is not None
         ):
+            if result.path_mode == "both_boundary_center":
+                speed_scale = float(p["both_boundary_speed_scale"])
+            elif result.path_mode == "single_boundary_offset":
+                speed_scale = float(p["single_boundary_speed_scale"])
+            elif result.path_mode == "history_prediction":
+                speed_scale = float(p["history_speed_scale"]) * (
+                    float(p["history_confidence_decay"])
+                    ** result.history_age
+                )
+            elif result.path_mode == "yellow_area_center_fallback":
+                speed_scale = float(p["yellow_fallback_speed_scale"])
+            else:
+                speed_scale = 0.0
             debug = render_debug_image(
                 bgr,
                 result,
-                float(p["roi_y_start_ratio"]),
-                float(p["roi_y_end_ratio"]),
                 linear,
                 angular,
+                speed_scale,
                 self.lost_frames,
-                self.single_boundary_frames,
-                float(p["kp"]),
-                float(p["kd"]),
-                float(p["head_gain"]),
-                float(p["single_boundary_offset_px"]),
-                bool(p["dry_run"]),
+                p,
             )
             full_yellow_mask = np.zeros(
                 (image_height, image_width), dtype=np.uint8
