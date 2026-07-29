@@ -59,11 +59,28 @@
     timeout 3s ros2 topic echo /cmd_vel_raw || true
     timeout 3s ros2 topic echo /cmd_vel || true
 
+V5 网页调参示例：
+
+    python3 tools/yellow_area_follow.py \
+      --ros-args \
+      --params-file tools/yellow_area_params.yaml \
+      -p web_gui_enable:=true \
+      -p web_gui_port:=8088 \
+      -p publish_debug_image:=false \
+      -p dry_run:=true
+
+随后访问 http://小车IP:8088。网页图像不拼接右侧状态栏；首次调参请保持
+dry_run=true。IPM 四点按左上、右上、左下、右下填写原图像素坐标。
+
 Ctrl+C 退出时，本脚本会连续发布多次零速。首次测试请架空车轮或确保急停可用。
 """
 
+import json
+import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional, Tuple
 
 import cv2
@@ -79,6 +96,146 @@ MORPHOLOGY_KERNEL_SIZE = 5
 STOP_PUBLISH_COUNT = 5
 STOP_PUBLISH_INTERVAL_SEC = 0.05
 
+
+# name: (group, minimum, maximum, step, widget/options)
+WEB_PARAMETER_SCHEMA = {
+    "dry_run": ("MODE", None, None, None, "bool"),
+    "publish_debug_image": ("MODE", None, None, None, "bool"),
+    "publish_boundary_debug_mask": ("MODE", None, None, None, "bool"),
+    "path_geometry_mode": ("MODE", None, None, None, ["image", "birdview"]),
+    "ipm_enable": ("MODE", None, None, None, "bool"),
+    "safe_corridor_enable": ("MODE", None, None, None, "bool"),
+    "linear_speed": ("SPEED", 0.0, 0.15, 0.005, "number"),
+    "min_linear_speed": ("SPEED", 0.0, 0.10, 0.005, "number"),
+    "max_linear_speed": ("SPEED", 0.0, 0.20, 0.005, "number"),
+    "both_boundary_speed_scale": ("SPEED", 0.0, 1.5, 0.05, "number"),
+    "single_boundary_speed_scale": ("SPEED", 0.0, 1.2, 0.05, "number"),
+    "history_speed_scale": ("SPEED", 0.0, 1.0, 0.05, "number"),
+    "yellow_fallback_speed_scale": ("SPEED", 0.0, 0.8, 0.05, "number"),
+    "edge_risk_slowdown": ("SPEED", 0.0, 1.0, 0.05, "number"),
+    "h_min": ("YELLOW HSV", 0, 179, 1, "number"),
+    "h_max": ("YELLOW HSV", 0, 179, 1, "number"),
+    "s_min": ("YELLOW HSV", 0, 255, 1, "number"),
+    "s_max": ("YELLOW HSV", 0, 255, 1, "number"),
+    "v_min": ("YELLOW HSV", 0, 255, 1, "number"),
+    "v_max": ("YELLOW HSV", 0, 255, 1, "number"),
+    "green_h_min": ("GREEN HSV", 0, 179, 1, "number"),
+    "green_h_max": ("GREEN HSV", 0, 179, 1, "number"),
+    "green_s_min": ("GREEN HSV", 0, 255, 1, "number"),
+    "green_s_max": ("GREEN HSV", 0, 255, 1, "number"),
+    "green_v_min": ("GREEN HSV", 0, 255, 1, "number"),
+    "green_v_max": ("GREEN HSV", 0, 255, 1, "number"),
+    "roi_y_start_ratio": ("ROI", 0.0, 0.95, 0.01, "number"),
+    "roi_y_end_ratio": ("ROI", 0.05, 1.0, 0.01, "number"),
+    "single_boundary_offset_px": ("PATH", 40, 220, 1, "number"),
+    "single_boundary_sample_count": ("PATH", 6, 30, 1, "number"),
+    "boundary_y_bucket_px": ("PATH", 4, 14, 1, "number"),
+    "boundary_min_bucket_points": ("PATH", 1, 8, 1, "number"),
+    "boundary_max_x_jump_px": ("PATH", 40, 220, 1, "number"),
+    "near_y_ratio": ("PATH", 0.45, 0.90, 0.01, "number"),
+    "far_y_ratio": ("PATH", 0.25, 0.80, 0.01, "number"),
+    "head_gain": ("PATH", 0.0, 0.8, 0.01, "number"),
+    "kp": ("CONTROL", 0.0, 0.8, 0.01, "number"),
+    "kd": ("CONTROL", 0.0, 0.5, 0.01, "number"),
+    "max_angular": ("CONTROL", 0.0, 0.8, 0.01, "number"),
+    "smoothing_alpha": ("CONTROL", 0.05, 0.8, 0.01, "number"),
+    "angular_smoothing_alpha": ("CONTROL", 0.05, 0.8, 0.01, "number"),
+    "error_deadband": ("CONTROL", 0.0, 0.2, 0.01, "number"),
+    "min_yellow_margin_px": ("SAFETY", 0, 200, 1, "number"),
+    "warn_yellow_margin_px": ("SAFETY", 0, 250, 1, "number"),
+    "stop_yellow_margin_px": ("SAFETY", 0, 150, 1, "number"),
+    "target_clamp_to_yellow_segment": (
+        "SAFETY", None, None, None, "bool"
+    ),
+    "yellow_segment_band_half_height": ("SAFETY", 1, 20, 1, "number"),
+    "min_yellow_segment_width_px": ("SAFETY", 1, 500, 1, "number"),
+    "edge_risk_stop_enable": ("SAFETY", None, None, None, "bool"),
+    "black_guard_enable": ("SAFETY", None, None, None, "bool"),
+    "black_v_max": ("SAFETY", 0, 255, 1, "number"),
+    "black_s_max": ("SAFETY", 0, 255, 1, "number"),
+    "black_guard_margin_px": ("SAFETY", 1, 100, 1, "number"),
+    "black_guard_slowdown": ("SAFETY", 0.0, 1.0, 0.05, "number"),
+    "reject_extreme_error_enable": (
+        "SAFETY", None, None, None, "bool"
+    ),
+    "reject_error_abs_threshold": ("SAFETY", 0.5, 1.0, 0.01, "number"),
+    "ipm_width": ("IPM", 160, 1920, 1, "number"),
+    "ipm_height": ("IPM", 120, 1080, 1, "number"),
+    "ipm_meter_per_px": ("IPM", 0.0001, 0.05, 0.0001, "number"),
+    "ipm_desired_offset_m": ("IPM", 0.0, 2.0, 0.01, "number"),
+    "ipm_safe_margin_m": ("IPM", 0.0, 1.0, 0.01, "number"),
+    "ipm_warn_margin_m": ("IPM", 0.0, 1.0, 0.01, "number"),
+    "ipm_stop_margin_m": ("IPM", 0.0, 1.0, 0.01, "number"),
+}
+for _point in (
+    "top_left", "top_right", "bottom_left", "bottom_right"
+):
+    WEB_PARAMETER_SCHEMA[f"ipm_src_{_point}_x"] = (
+        "IPM", 0, 4096, 1, "number"
+    )
+    WEB_PARAMETER_SCHEMA[f"ipm_src_{_point}_y"] = (
+        "IPM", 0, 4096, 1, "number"
+    )
+
+
+WEB_GUI_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport"
+content="width=device-width,initial-scale=1"><title>Yellow Path V5</title>
+<style>
+body{margin:0;background:#111;color:#eee;font:14px system-ui}
+header{position:sticky;top:0;z-index:2;background:#222;padding:9px;display:flex;
+gap:12px;align-items:center}button{padding:8px 14px}.stop{background:#c22;color:#fff}
+main{display:grid;grid-template-columns:minmax(320px,2fr) minmax(300px,1fr);
+gap:10px;padding:10px}.video img{width:100%;height:auto;background:#222}
+.card{background:#202020;padding:9px;margin-bottom:8px;border-radius:6px}
+.row{display:grid;grid-template-columns:minmax(150px,1fr) minmax(160px,1fr);
+gap:6px;margin:5px 0}.ctrl{display:grid;grid-template-columns:1fr 70px;gap:5px}
+input,select{width:100%;box-sizing:border-box;background:#333;color:#fff}
+pre{white-space:pre-wrap}.hint{color:#bbb;line-height:1.45}
+@media(max-width:850px){main{grid-template-columns:1fr}}
+</style></head><body>
+<header><button class="stop" onclick="stopNow()">STOP</button>
+<label>dry_run <input id="dry" type="checkbox" onchange="setv('dry_run',this.checked)"></label>
+<b id="mode">waiting for image</b><span id="motion">0.000 / 0.000</span>
+<span id="scale">scale 0.00</span><button onclick="copyArgs()">Copy args</button></header>
+<main><section class="video"><div class="card"><img src="/stream"
+alt="waiting for image"></div><div class="card hint">调参顺序：先 HSV，再 ROI，
+再调 IPM 四点；随后调 offset / desired offset、安全边距，最后调速度、
+head_gain、kp、kd。Web 图像始终保持完整，不拼接状态栏。</div>
+<pre class="card" id="status">waiting for image</pre></section>
+<aside id="controls"></aside></main>
+<script>
+let schema={},params={};
+async function getj(u){return (await fetch(u)).json()}
+function field(n,v,s){let t=s[4],el;if(Array.isArray(t)){el=document.createElement('select');
+t.forEach(x=>el.add(new Option(x,x)));el.value=v;el.onchange=()=>setv(n,el.value)}
+else if(t==='bool'){el=document.createElement('input');el.type='checkbox';el.checked=v;
+el.onchange=()=>setv(n,el.checked)}else{el=document.createElement('div');el.className='ctrl';
+let range=document.createElement('input'),num=document.createElement('input');
+range.type='range';num.type='number';[range,num].forEach(x=>{x.min=s[1];x.max=s[2];x.step=s[3];
+x.value=v});range.oninput=()=>num.value=range.value;num.oninput=()=>range.value=num.value;
+range.onchange=()=>setv(n,range.value);num.onchange=()=>setv(n,num.value);
+el.append(range,num)}
+let r=document.createElement('div');r.className='row';r.innerHTML='<label>'+n+'</label>';
+r.appendChild(el);return r}
+async function load(){let x=await getj('/api/params');params=x.params;schema=x.schema;
+let groups={};Object.keys(schema).forEach(n=>(groups[schema[n][0]]??=[]).push(n));
+let root=document.getElementById('controls');root.innerHTML='';
+Object.keys(groups).forEach(g=>{let c=document.createElement('div');c.className='card';
+c.innerHTML='<b>'+g+'</b>';groups[g].forEach(n=>c.appendChild(field(n,params[n],schema[n])));
+root.appendChild(c)});document.getElementById('dry').checked=!!params.dry_run}
+async function setv(n,v){await fetch('/api/set?name='+encodeURIComponent(n)+'&value='+
+encodeURIComponent(v),{method:'POST'});await load()}
+async function stopNow(){await fetch('/api/stop',{method:'POST'});await load()}
+async function copyArgs(){let t=await (await fetch('/api/launch_args')).text();
+await navigator.clipboard.writeText(t);alert('Copied')}
+async function tick(){try{let s=await getj('/api/status');document.getElementById('status').
+textContent=JSON.stringify(s,null,2);document.getElementById('mode').textContent=s.stop_state||
+s.path_mode;document.getElementById('motion').textContent=(s.linear_x||0).toFixed(3)+' / '+
+(s.angular_z||0).toFixed(3);document.getElementById('scale').textContent='scale '+
+(s.speed_scale||0).toFixed(2);document.getElementById('dry').checked=!!s.dry_run}catch(e){}}
+load();tick();setInterval(tick,500);
+</script></body></html>"""
 
 @dataclass
 class BoundaryBandResult:
@@ -128,6 +285,20 @@ class VisionResult:
     fallback_centroid: Optional[Tuple[float, float]]
     history_age: int
     yellow_fallback_frames: int
+    path_geometry_mode: str = "image"
+    ipm_valid: bool = True
+    speed_scale: float = 0.0
+    edge_risk: bool = False
+    black_edge_risk: bool = False
+    min_target_yellow_margin_px: float = 0.0
+    min_target_yellow_margin_m: float = 0.0
+    clamped_points_count: int = 0
+    unsafe_points_count: int = 0
+    rejected_extreme_error: bool = False
+    safety_stop: bool = False
+    clamped_debug_points: Optional[
+        List[Tuple[Tuple[float, float], Tuple[float, float]]]
+    ] = None
 
 
 def image_message_to_bgr(msg: Image) -> np.ndarray:
@@ -2006,6 +2177,28 @@ def render_debug_image(
         (0, 180, 0),
         1,
     )
+    if bool(params.get("safe_corridor_enable", False)):
+        safe_margin = float(params["min_yellow_margin_px"])
+        if result.path_geometry_mode == "birdview":
+            safe_margin = float(params["ipm_safe_margin_m"]) / max(
+                float(params["ipm_meter_per_px"]), 1e-6
+            )
+        safe_distance = cv2.distanceTransform(
+            result.yellow_mask, cv2.DIST_L2, 5
+        )
+        safe_mask = np.where(
+            safe_distance >= safe_margin, 255, 0
+        ).astype(np.uint8)
+        safe_contours, _ = cv2.findContours(
+            safe_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(
+            main[roi_y_start:roi_y_end, :],
+            safe_contours,
+            -1,
+            white,
+            1,
+        )
 
     cv2.line(
         main, (0, roi_y_start), (image_width - 1, roi_y_start), cyan, 2
@@ -2220,6 +2413,43 @@ def render_debug_image(
             cv2.LINE_AA,
         )
 
+    for original, clamped in result.clamped_debug_points or []:
+        old_point = (
+            int(np.clip(round(original[0]), 0, image_width - 1)),
+            int(np.clip(round(roi_y_start + original[1]), 0, image_height - 1)),
+        )
+        new_point = (
+            int(np.clip(round(clamped[0]), 0, image_width - 1)),
+            int(np.clip(round(roi_y_start + clamped[1]), 0, image_height - 1)),
+        )
+        cv2.drawMarker(main, old_point, orange, cv2.MARKER_TILTED_CROSS, 8, 2)
+        cv2.circle(main, new_point, 4, white, -1)
+    compact_lines = []
+    if bool(params.get("debug_show_compact_text", True)):
+        compact_lines.append(
+            f"{result.path_geometry_mode} | {result.path_mode}"
+        )
+    if result.edge_risk:
+        compact_lines.append("EDGE RISK")
+    if result.black_edge_risk:
+        compact_lines.append("BLACK EDGE RISK")
+    if result.rejected_extreme_error:
+        compact_lines.append("REJECTED EXTREME ERROR")
+    if not result.ipm_valid:
+        compact_lines.append("IPM_INVALID / IMAGE FALLBACK")
+    for index, text in enumerate(compact_lines):
+        color = orange if "RISK" in text or "REJECTED" in text else white
+        cv2.putText(
+            main,
+            text,
+            (10, 24 + 20 * index),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     requested_panel_width = max(1, int(params["debug_info_panel_width"]))
     if bool(params["debug_side_panel"]):
         canvas = np.full(
@@ -2230,25 +2460,39 @@ def render_debug_image(
         canvas[:, :image_width] = main
         panel_x = image_width
         panel_width = requested_panel_width
-    else:
+        draw_info_panel(
+            canvas,
+            panel_x,
+            panel_width,
+            result,
+            linear,
+            angular,
+            speed_scale,
+            lost_frames,
+            params,
+            fill_background=True,
+        )
+    elif bool(params.get("debug_embed_info_panel", False)):
         canvas = main
         panel_width = min(requested_panel_width, image_width)
         panel_x = image_width - panel_width
         overlay = canvas.copy()
         overlay[:, panel_x:] = (24, 24, 24)
         cv2.addWeighted(overlay, 0.82, canvas, 0.18, 0.0, canvas)
-    draw_info_panel(
-        canvas,
-        panel_x,
-        panel_width,
-        result,
-        linear,
-        angular,
-        speed_scale,
-        lost_frames,
-        params,
-        fill_background=bool(params["debug_side_panel"]),
-    )
+        draw_info_panel(
+            canvas,
+            panel_x,
+            panel_width,
+            result,
+            linear,
+            angular,
+            speed_scale,
+            lost_frames,
+            params,
+            fill_background=False,
+        )
+    else:
+        canvas = main
     return canvas
 
 
@@ -2323,6 +2567,7 @@ class YellowAreaFollower(Node):
             "heading_gain": 0.20,
             "linear_speed": 0.04,
             "min_linear_speed": 0.02,
+            "max_linear_speed": 0.08,
             "kp": 0.22,
             "kd": 0.12,
             "max_angular": 0.25,
@@ -2340,13 +2585,53 @@ class YellowAreaFollower(Node):
             "boundary_debug_mask_topic": "/yellow_area/boundary_mask",
             "debug_rate_hz": 10.0,
             "debug_info_panel_width": 300,
-            "debug_side_panel": True,
+            "debug_side_panel": False,
+            "debug_embed_info_panel": False,
+            "debug_show_compact_text": True,
             "debug_path_interpolate": True,
             "debug_path_interpolate_count": 40,
             "debug_yellow_overlay_alpha": 0.18,
             "debug_green_overlay_alpha": 0.10,
             "control_only_when_started": False,
             "dry_run": False,
+            "web_gui_enable": False,
+            "web_gui_host": "0.0.0.0",
+            "web_gui_port": 8088,
+            "web_gui_jpeg_quality": 75,
+            "web_gui_max_fps": 8.0,
+            "path_geometry_mode": "image",
+            "ipm_enable": False,
+            "ipm_width": 640,
+            "ipm_height": 480,
+            "ipm_src_top_left_x": 170,
+            "ipm_src_top_left_y": 150,
+            "ipm_src_top_right_x": 470,
+            "ipm_src_top_right_y": 150,
+            "ipm_src_bottom_left_x": 30,
+            "ipm_src_bottom_left_y": 460,
+            "ipm_src_bottom_right_x": 610,
+            "ipm_src_bottom_right_y": 460,
+            "ipm_meter_per_px": 0.003,
+            "ipm_desired_offset_m": 0.35,
+            "ipm_safe_margin_m": 0.12,
+            "ipm_warn_margin_m": 0.18,
+            "ipm_stop_margin_m": 0.06,
+            "safe_corridor_enable": True,
+            "min_yellow_margin_px": 35,
+            "warn_yellow_margin_px": 55,
+            "stop_yellow_margin_px": 18,
+            "target_clamp_to_yellow_segment": True,
+            "yellow_segment_band_half_height": 5,
+            "min_yellow_segment_width_px": 80,
+            "edge_risk_slowdown": 0.45,
+            "edge_risk_stop_enable": False,
+            "black_guard_enable": False,
+            "black_v_max": 45,
+            "black_s_max": 120,
+            "black_guard_margin_px": 25,
+            "black_guard_slowdown": 0.50,
+            "reject_extreme_error_enable": True,
+            "reject_error_abs_threshold": 0.92,
             "log_interval_sec": 0.5,
             "image_timeout_sec": 1.0,
         }
@@ -2356,6 +2641,23 @@ class YellowAreaFollower(Node):
             name: self.get_parameter(name).value for name in defaults
         }
         self._validate_parameters()
+        self.cfg_lock = threading.RLock()
+        self.cfg = self.params
+        self.status_lock = threading.Lock()
+        self.web_frame_lock = threading.Condition()
+        self.web_status = {
+            "path_mode": "waiting_for_image",
+            "path_geometry_mode": str(self.cfg["path_geometry_mode"]),
+            "linear_x": 0.0,
+            "angular_z": 0.0,
+            "speed_scale": 0.0,
+            "dry_run": bool(self.cfg["dry_run"]),
+        }
+        self.web_jpeg: Optional[bytes] = None
+        self.last_web_frame_time = 0.0
+        self.web_server: Optional[ThreadingHTTPServer] = None
+        self.web_thread: Optional[threading.Thread] = None
+        self.gui_stopped = False
 
         self.image_topic = str(self.params["image_topic"])
         self.cmd_topic = str(self.params["cmd_topic"])
@@ -2369,22 +2671,17 @@ class YellowAreaFollower(Node):
             qos_profile_sensor_data,
         )
 
-        self.debug_image_publisher = None
-        self.debug_mask_publisher = None
-        self.boundary_debug_mask_publisher = None
-        if bool(self.params["publish_debug_image"]):
-            self.debug_image_publisher = self.create_publisher(
-                Image, str(self.params["debug_image_topic"]), 1
-            )
-            self.debug_mask_publisher = self.create_publisher(
-                Image, str(self.params["debug_mask_topic"]), 1
-            )
-        if bool(self.params["publish_boundary_debug_mask"]):
-            self.boundary_debug_mask_publisher = self.create_publisher(
-                Image,
-                str(self.params["boundary_debug_mask_topic"]),
-                1,
-            )
+        # Publishers are cheap to keep available; the runtime flags below
+        # decide whether a frame is actually sent.
+        self.debug_image_publisher = self.create_publisher(
+            Image, str(self.params["debug_image_topic"]), 1
+        )
+        self.debug_mask_publisher = self.create_publisher(
+            Image, str(self.params["debug_mask_topic"]), 1
+        )
+        self.boundary_debug_mask_publisher = self.create_publisher(
+            Image, str(self.params["boundary_debug_mask_topic"]), 1
+        )
 
         self.previous_error: Optional[float] = None
         self.previous_angular: Optional[float] = 0.0
@@ -2402,6 +2699,8 @@ class YellowAreaFollower(Node):
         self.last_debug_time = 0.0
         self.watchdog_stopped = False
         self.create_timer(0.1, self._watchdog_callback)
+        if bool(self.cfg["web_gui_enable"]):
+            self._start_web_server()
         self._log_configuration()
 
     def _validate_parameters(self) -> None:
@@ -2475,9 +2774,14 @@ class YellowAreaFollower(Node):
                 raise ValueError(f"{name} must be greater than zero")
         linear_speed = float(p["linear_speed"])
         min_linear_speed = float(p["min_linear_speed"])
-        if linear_speed < 0.0 or not 0.0 <= min_linear_speed <= linear_speed:
+        max_linear_speed = float(p["max_linear_speed"])
+        if (
+            linear_speed < 0.0
+            or min_linear_speed < 0.0
+            or max_linear_speed < 0.0
+        ):
             raise ValueError(
-                "speeds must satisfy 0 <= min_linear_speed <= linear_speed"
+                "linear speed parameters must not be negative"
             )
         for name in (
             "kp",
@@ -2505,15 +2809,21 @@ class YellowAreaFollower(Node):
             )
         for name in (
             "boundary_loss_slowdown",
-            "both_boundary_speed_scale",
-            "single_boundary_speed_scale",
             "history_speed_scale",
             "history_confidence_decay",
             "yellow_fallback_speed_scale",
             "boundary_keep_component_ratio",
+            "edge_risk_slowdown",
+            "black_guard_slowdown",
         ):
             if not 0.0 <= float(p[name]) <= 1.0:
                 raise ValueError(f"{name} must be in [0.0, 1.0]")
+        if not 0.0 <= float(p["both_boundary_speed_scale"]) <= 1.5:
+            raise ValueError("both_boundary_speed_scale must be in [0, 1.5]")
+        if not 0.0 <= float(p["single_boundary_speed_scale"]) <= 1.2:
+            raise ValueError(
+                "single_boundary_speed_scale must be in [0, 1.2]"
+            )
         if not (
             0.0 <= float(p["single_boundary_y_min_ratio"]) < 1.0
             and 0.0 < float(p["single_boundary_y_max_ratio"]) <= 1.0
@@ -2547,6 +2857,418 @@ class YellowAreaFollower(Node):
             raise ValueError("log_interval_sec must be greater than zero")
         if float(p["image_timeout_sec"]) <= 0.0:
             raise ValueError("image_timeout_sec must be greater than zero")
+        if str(p["path_geometry_mode"]) not in ("image", "birdview"):
+            raise ValueError("path_geometry_mode must be image or birdview")
+        if int(p["ipm_width"]) <= 0 or int(p["ipm_height"]) <= 0:
+            raise ValueError("IPM output size must be positive")
+        if float(p["ipm_meter_per_px"]) <= 0.0:
+            raise ValueError("ipm_meter_per_px must be greater than zero")
+        if not 1 <= int(p["web_gui_jpeg_quality"]) <= 100:
+            raise ValueError("web_gui_jpeg_quality must be in [1, 100]")
+        if float(p["web_gui_max_fps"]) <= 0.0:
+            raise ValueError("web_gui_max_fps must be greater than zero")
+        if not 1 <= int(p["web_gui_port"]) <= 65535:
+            raise ValueError("web_gui_port must be in [1, 65535]")
+
+    def _cfg_snapshot(self) -> dict:
+        with self.cfg_lock:
+            return dict(self.cfg)
+
+    def _set_runtime_parameter(self, name: str, raw_value: str) -> object:
+        if name not in WEB_PARAMETER_SCHEMA:
+            raise ValueError(f"parameter is not adjustable: {name}")
+        schema = WEB_PARAMETER_SCHEMA[name]
+        with self.cfg_lock:
+            current = self.cfg[name]
+            if schema[4] == "bool":
+                lowered = str(raw_value).strip().lower()
+                if lowered not in ("true", "false", "1", "0", "yes", "no"):
+                    raise ValueError(f"invalid boolean: {raw_value}")
+                value = lowered in ("true", "1", "yes")
+            elif isinstance(schema[4], list):
+                value = str(raw_value)
+                if value not in schema[4]:
+                    raise ValueError(f"invalid choice: {value}")
+            elif isinstance(current, int) and not isinstance(current, bool):
+                value = int(round(float(raw_value)))
+            else:
+                value = float(raw_value)
+            if schema[1] is not None:
+                value = max(schema[1], min(schema[2], value))
+            self.cfg[name] = value
+            if name in ("roi_y_start_ratio", "roi_y_end_ratio"):
+                start = float(self.cfg["roi_y_start_ratio"])
+                end = float(self.cfg["roi_y_end_ratio"])
+                if end <= start + 0.10:
+                    self.cfg["roi_y_end_ratio"] = min(1.0, start + 0.25)
+            return self.cfg[name]
+
+    def _web_payload_params(self) -> dict:
+        p = self._cfg_snapshot()
+        adjustable = {name: p[name] for name in WEB_PARAMETER_SCHEMA}
+        return {
+            **adjustable,
+            "params": adjustable,
+            "schema": {
+                name: list(schema)
+                for name, schema in WEB_PARAMETER_SCHEMA.items()
+            },
+        }
+
+    def _web_launch_args(self) -> str:
+        p = self._cfg_snapshot()
+        lines = []
+        for name in WEB_PARAMETER_SCHEMA:
+            value = p[name]
+            if isinstance(value, bool):
+                value = str(value).lower()
+            lines.append(f"-p {name}:={value}")
+        return " \\\n".join(lines)
+
+    def _start_web_server(self) -> None:
+        node = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+            def _send(self, status: int, body: bytes, content_type: str) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _json(self, value: object, status: int = 200) -> None:
+                self._send(
+                    status,
+                    json.dumps(value, ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+
+            def _route(self) -> None:
+                parsed = urllib.parse.urlparse(self.path)
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    if parsed.path == "/":
+                        self._send(
+                            200,
+                            WEB_GUI_HTML.encode("utf-8"),
+                            "text/html; charset=utf-8",
+                        )
+                    elif parsed.path == "/api/params":
+                        self._json(node._web_payload_params())
+                    elif parsed.path == "/api/status":
+                        with node.status_lock:
+                            self._json(dict(node.web_status))
+                    elif parsed.path == "/api/launch_args":
+                        self._send(
+                            200,
+                            node._web_launch_args().encode("utf-8"),
+                            "text/plain; charset=utf-8",
+                        )
+                    elif parsed.path == "/api/set":
+                        name = query.get("name", [""])[0]
+                        value = query.get("value", [""])[0]
+                        self._json(
+                            {"ok": True, "name": name,
+                             "value": node._set_runtime_parameter(name, value)}
+                        )
+                    elif parsed.path == "/api/stop":
+                        node._gui_emergency_stop()
+                        self._json({"ok": True, "state": "STOPPED_BY_GUI"})
+                    elif parsed.path == "/stream":
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type",
+                            "multipart/x-mixed-replace; boundary=frame",
+                        )
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        last_frame = None
+                        while node.web_server is not None:
+                            with node.web_frame_lock:
+                                node.web_frame_lock.wait(timeout=1.0)
+                                frame = node.web_jpeg
+                            if frame is None or frame is last_frame:
+                                continue
+                            last_frame = frame
+                            self.wfile.write(b"--frame\r\n")
+                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                            self.wfile.write(
+                                f"Content-Length: {len(frame)}\r\n\r\n".
+                                encode("ascii")
+                            )
+                            self.wfile.write(frame)
+                            self.wfile.write(b"\r\n")
+                    else:
+                        self._json({"error": "not found"}, 404)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                except Exception as exc:
+                    self._json({"error": str(exc)}, 400)
+
+            def do_GET(self) -> None:
+                self._route()
+
+            def do_POST(self) -> None:
+                self._route()
+
+        p = self._cfg_snapshot()
+        self.web_server = ThreadingHTTPServer(
+            (str(p["web_gui_host"]), int(p["web_gui_port"])), Handler
+        )
+        self.web_server.daemon_threads = True
+        self.web_thread = threading.Thread(
+            target=self.web_server.serve_forever,
+            name="yellow-area-web-gui",
+            daemon=True,
+        )
+        self.web_thread.start()
+        self.get_logger().info(
+            f"Web GUI: http://{p['web_gui_host']}:{p['web_gui_port']}"
+        )
+
+    def shutdown_web_server(self) -> None:
+        server = self.web_server
+        self.web_server = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        with self.web_frame_lock:
+            self.web_frame_lock.notify_all()
+
+    def _gui_emergency_stop(self) -> None:
+        with self.cfg_lock:
+            self.cfg["dry_run"] = True
+        self.gui_stopped = True
+        with self.status_lock:
+            self.web_status["stop_state"] = "STOPPED_BY_GUI"
+            self.web_status["dry_run"] = True
+        self.publish_stop_repeated()
+        self.get_logger().warning("STOPPED_BY_GUI: dry_run enabled, zero sent.")
+
+    @staticmethod
+    def _prepare_geometry(
+        bgr: np.ndarray, params: dict
+    ) -> Tuple[np.ndarray, dict, str, bool]:
+        requested = (
+            bool(params["ipm_enable"])
+            or str(params["path_geometry_mode"]) == "birdview"
+        )
+        if not requested:
+            return bgr, dict(params), "image", True
+        height, width = bgr.shape[:2]
+        src = np.float32([
+            [params["ipm_src_top_left_x"], params["ipm_src_top_left_y"]],
+            [params["ipm_src_top_right_x"], params["ipm_src_top_right_y"]],
+            [params["ipm_src_bottom_right_x"], params["ipm_src_bottom_right_y"]],
+            [params["ipm_src_bottom_left_x"], params["ipm_src_bottom_left_y"]],
+        ])
+        out_width = int(params["ipm_width"])
+        out_height = int(params["ipm_height"])
+        inside = bool(
+            np.all(src[:, 0] >= 0)
+            and np.all(src[:, 0] < width)
+            and np.all(src[:, 1] >= 0)
+            and np.all(src[:, 1] < height)
+        )
+        polygon = np.round(src).astype(np.int32)
+        valid = (
+            inside
+            and cv2.isContourConvex(polygon)
+            and abs(cv2.contourArea(polygon)) >= 100.0
+            and out_width > 1
+            and out_height > 1
+        )
+        if not valid:
+            return bgr, dict(params), "image", False
+        dst = np.float32([
+            [0, 0], [out_width - 1, 0],
+            [out_width - 1, out_height - 1], [0, out_height - 1],
+        ])
+        matrix = cv2.getPerspectiveTransform(src, dst)
+        if not np.all(np.isfinite(matrix)):
+            return bgr, dict(params), "image", False
+        birdview = cv2.warpPerspective(
+            bgr, matrix, (out_width, out_height), flags=cv2.INTER_LINEAR
+        )
+        effective = dict(params)
+        effective["roi_y_start_ratio"] = 0.0
+        effective["roi_y_end_ratio"] = 1.0
+        effective["single_boundary_offset_px"] = max(
+            1,
+            float(params["ipm_desired_offset_m"])
+            / max(float(params["ipm_meter_per_px"]), 1e-6),
+        )
+        return birdview, effective, "birdview", True
+
+    @staticmethod
+    def _yellow_fallback_after_reject(
+        observation: VisionResult,
+        image_shape: Tuple[int, int],
+        params: dict,
+    ) -> VisionResult:
+        height, width = image_shape
+        roi_start = int(height * float(params["roi_y_start_ratio"]))
+        roi_end = int(height * float(params["roi_y_end_ratio"]))
+        roi_start = min(max(roi_start, 0), height - 1)
+        roi_end = min(max(roi_end, roi_start + 1), height)
+        contours, _ = cv2.findContours(
+            observation.yellow_mask, cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        path = []
+        centroid = None
+        if contours and observation.yellow_pixels >= int(
+            params["yellow_fallback_min_pixels"]
+        ):
+            contour = max(contours, key=cv2.contourArea)
+            moments = cv2.moments(contour)
+            if moments["m00"] > 0.0:
+                x = float(moments["m10"] / moments["m00"])
+                y = float(moments["m01"] / moments["m00"])
+                centroid = (x, y)
+                path = [
+                    (x, sample_y)
+                    for sample_y in np.linspace(
+                        0, max(1, roi_end - roi_start - 1), 6
+                    )
+                ]
+        mode = "yellow_area_center_fallback" if path else "lost_stop"
+        result = _make_v4_result(
+            mode, path, observation.yellow_pixels, observation.green_pixels,
+            observation.yellow_mask, observation.green_mask,
+            observation.boundary_mask, observation.boundary_sequences,
+            observation.left_boundary_points,
+            observation.right_boundary_points,
+            observation.single_boundary_points, len(path),
+            observation.left_visible_count, observation.right_visible_count,
+            observation.both_visible_count, centroid, width, height,
+            roi_start, roi_end, params,
+        )
+        result.rejected_extreme_error = True
+        return result
+
+    @staticmethod
+    def _apply_safe_corridor(
+        result: VisionResult,
+        frame: np.ndarray,
+        params: dict,
+        geometry_mode: str,
+    ) -> VisionResult:
+        result.path_geometry_mode = geometry_mode
+        if not result.valid or not result.target_path_points:
+            return result
+        height, width = frame.shape[:2]
+        roi_start = int(height * float(params["roi_y_start_ratio"]))
+        roi_end = int(height * float(params["roi_y_end_ratio"]))
+        roi_start = min(max(roi_start, 0), height - 1)
+        roi_end = min(max(roi_end, roi_start + 1), height)
+        mask = result.yellow_mask
+        distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        meter_per_px = max(float(params["ipm_meter_per_px"]), 1e-6)
+        if geometry_mode == "birdview":
+            safe_margin = float(params["ipm_safe_margin_m"]) / meter_per_px
+            warn_margin = float(params["ipm_warn_margin_m"]) / meter_per_px
+            stop_margin = float(params["ipm_stop_margin_m"]) / meter_per_px
+        else:
+            safe_margin = float(params["min_yellow_margin_px"])
+            warn_margin = float(params["warn_yellow_margin_px"])
+            stop_margin = float(params["stop_yellow_margin_px"])
+        corrected = []
+        changes = []
+        margins = []
+        unsafe = 0
+        band_half = max(1, int(params["yellow_segment_band_half_height"]))
+        min_width = int(params["min_yellow_segment_width_px"])
+        for original_x, original_y in result.target_path_points:
+            y = int(np.clip(round(original_y), 0, mask.shape[0] - 1))
+            x = float(np.clip(original_x, 0, mask.shape[1] - 1))
+            y0, y1 = max(0, y - band_half), min(mask.shape[0], y + band_half + 1)
+            columns = np.any(mask[y0:y1, :] > 0, axis=0)
+            transitions = np.diff(np.r_[False, columns, False].astype(np.int8))
+            starts = np.flatnonzero(transitions == 1)
+            ends = np.flatnonzero(transitions == -1) - 1
+            segments = [
+                (int(left), int(right)) for left, right in zip(starts, ends)
+                if right - left + 1 >= min_width
+            ]
+            if not segments:
+                unsafe += 1
+                corrected.append((x, float(original_y)))
+                margins.append(0.0)
+                continue
+            left, right = min(
+                segments,
+                key=lambda segment: 0.0
+                if segment[0] <= x <= segment[1]
+                else min(abs(x - segment[0]), abs(x - segment[1])),
+            )
+            safe_left, safe_right = left + safe_margin, right - safe_margin
+            if safe_left > safe_right:
+                unsafe += 1
+                new_x = 0.5 * (left + right)
+            elif bool(params["target_clamp_to_yellow_segment"]):
+                new_x = float(np.clip(x, safe_left, safe_right))
+            else:
+                new_x = x
+            if abs(new_x - x) > 0.5:
+                changes.append(((x, float(original_y)), (new_x, float(original_y))))
+            xi = int(np.clip(round(new_x), 0, mask.shape[1] - 1))
+            margins.append(float(distance[y, xi]))
+            corrected.append((new_x, float(original_y)))
+        result.target_path_points = corrected
+        result.clamped_debug_points = changes
+        result.clamped_points_count = len(changes)
+        result.unsafe_points_count = unsafe
+        result.min_target_yellow_margin_px = min(margins) if margins else 0.0
+        result.min_target_yellow_margin_m = (
+            result.min_target_yellow_margin_px * meter_per_px
+            if geometry_mode == "birdview" else 0.0
+        )
+        result.edge_risk = bool(
+            unsafe > len(corrected) // 2
+            or result.min_target_yellow_margin_px < warn_margin
+        )
+        result.safety_stop = bool(
+            params["edge_risk_stop_enable"]
+            and result.min_target_yellow_margin_px < stop_margin
+        )
+        try:
+            (
+                result.near_center_x, result.far_center_x,
+                result.near_y, result.far_y,
+                result.near_error, result.far_error, result.control_error,
+            ) = _target_path_lookahead(
+                corrected, width, height, roi_start, roi_end,
+                float(params["near_y_ratio"]), float(params["far_y_ratio"]),
+                float(params["head_gain"]),
+                bool(params["use_heading_error"]),
+                float(params["heading_gain"]),
+            )
+        except ValueError:
+            result.safety_stop = True
+        if bool(params["black_guard_enable"]):
+            roi = frame[roi_start:roi_end, :]
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            black = cv2.inRange(
+                hsv, np.array((0, 0, 0), np.uint8),
+                np.array((179, int(params["black_s_max"]),
+                          int(params["black_v_max"])), np.uint8),
+            )
+            radius = int(params["black_guard_margin_px"])
+            for x, y in corrected:
+                xi, yi = int(round(x)), int(round(y))
+                x0, x1 = max(0, xi - radius), min(black.shape[1], xi + radius + 1)
+                y0, y1 = max(0, yi - radius), min(black.shape[0], yi + radius + 1)
+                if x1 > x0 and y1 > y0 and cv2.countNonZero(
+                    black[y0:y1, x0:x1]
+                ) > 0:
+                    result.black_edge_risk = True
+                    break
+        return result
 
     def _log_configuration(self) -> None:
         p = self.params
@@ -2566,7 +3288,9 @@ class YellowAreaFollower(Node):
             f"debug_side_panel={p['debug_side_panel']}, "
             f"debug_info_panel_width={p['debug_info_panel_width']}, "
             f"dry_run={p['dry_run']}, "
-            f"control_only_when_started={p['control_only_when_started']}"
+            f"control_only_when_started={p['control_only_when_started']}, "
+            f"web_gui_enable={p['web_gui_enable']}, "
+            f"web_gui={p['web_gui_host']}:{p['web_gui_port']}"
         )
         self.get_logger().info(
             "HSV threshold: "
@@ -2585,6 +3309,7 @@ class YellowAreaFollower(Node):
         self.get_logger().info(
             "Control: "
             f"linear={p['linear_speed']}, min_linear={p['min_linear_speed']}, "
+            f"max_linear={p['max_linear_speed']}, "
             f"kp={p['kp']}, kd={p['kd']}, max_angular={p['max_angular']}, "
             f"smoothing_alpha={p['smoothing_alpha']}, "
             f"angular_smoothing_alpha={p['angular_smoothing_alpha']}, "
@@ -2593,25 +3318,100 @@ class YellowAreaFollower(Node):
             f"lost_stop_frames={p['lost_stop_frames']}, "
             f"search_on_lost={p['search_on_lost']}"
         )
+        self.get_logger().info(
+            "Geometry/safety: "
+            f"path_geometry_mode={p['path_geometry_mode']}, "
+            f"ipm_enable={p['ipm_enable']}, "
+            f"ipm_size={p['ipm_width']}x{p['ipm_height']}, "
+            f"safe_corridor_enable={p['safe_corridor_enable']}"
+        )
 
     def _image_callback(self, msg: Image) -> None:
         self.last_image_time = time.monotonic()
         self.watchdog_stopped = False
         try:
             bgr = image_message_to_bgr(msg)
-            p = self.params
-            result = extract_boundary_path(bgr, p)
-            result = self._apply_path_priority(result, bgr.shape[:2])
+            p = self._cfg_snapshot()
+            frame, effective, geometry_mode, ipm_valid = (
+                self._prepare_geometry(bgr, p)
+            )
+            result = extract_boundary_path(frame, effective)
+            result.path_geometry_mode = geometry_mode
+            result.ipm_valid = ipm_valid
+            if (
+                bool(effective["reject_extreme_error_enable"])
+                and max(abs(result.near_error), abs(result.far_error))
+                > float(effective["reject_error_abs_threshold"])
+            ):
+                result = self._yellow_fallback_after_reject(
+                    result, frame.shape[:2], effective
+                )
+            if bool(effective["safe_corridor_enable"]):
+                result = self._apply_safe_corridor(
+                    result, frame, effective, geometry_mode
+                )
+                if (
+                    result.target_path_points
+                    and result.unsafe_points_count
+                    > len(result.target_path_points) // 2
+                ):
+                    result = self._yellow_fallback_after_reject(
+                        result, frame.shape[:2], effective
+                    )
+            result = self._apply_path_priority(
+                result, frame.shape[:2], effective
+            )
+            result.path_geometry_mode = geometry_mode
+            result.ipm_valid = ipm_valid
+            if bool(effective["safe_corridor_enable"]):
+                result = self._apply_safe_corridor(
+                    result, frame, effective, geometry_mode
+                )
+                if (
+                    result.target_path_points
+                    and result.unsafe_points_count
+                    > len(result.target_path_points) // 2
+                ):
+                    fallback = self._yellow_fallback_after_reject(
+                        result, frame.shape[:2], effective
+                    )
+                    fallback.path_geometry_mode = geometry_mode
+                    fallback.ipm_valid = ipm_valid
+                    result = self._apply_safe_corridor(
+                        fallback, frame, effective, geometry_mode
+                    )
+                    if (
+                        result.target_path_points
+                        and result.unsafe_points_count
+                        > len(result.target_path_points) // 2
+                    ):
+                        result.valid = False
+                        result.path_mode = "lost_stop"
+                if (
+                    bool(effective["reject_extreme_error_enable"])
+                    and max(abs(result.near_error), abs(result.far_error))
+                    > float(effective["reject_error_abs_threshold"])
+                ):
+                    result.rejected_extreme_error = True
+                    result.valid = False
+                    result.path_mode = "lost_stop"
+            if result.safety_stop:
+                result.valid = False
+                result.path_mode = "lost_stop"
             if result.valid:
-                self._handle_valid_result(bgr, msg, result)
+                self._handle_valid_result(
+                    frame, msg, result, effective
+                )
             else:
-                self._handle_lost_result(bgr, msg, result)
+                self._handle_lost_result(
+                    frame, msg, result, effective
+                )
         except Exception as exc:
             self.lost_frames += 1
             self.single_boundary_frames = 0
             self.previous_error = None
             self.previous_angular = 0.0
-            self._publish_stop()
+            self.publish_stop_repeated()
             self._throttled_error(
                 f"Image processing failed; stopping: {exc}"
             )
@@ -2620,10 +3420,11 @@ class YellowAreaFollower(Node):
         self,
         observation: VisionResult,
         image_shape: Tuple[int, int],
+        params: Optional[dict] = None,
     ) -> VisionResult:
         """Apply boundary, history, yellow-fallback, then lost priority."""
         image_height, image_width = image_shape
-        p = self.params
+        p = params if params is not None else self._cfg_snapshot()
         roi_y_start = int(image_height * float(p["roi_y_start_ratio"]))
         roi_y_start = min(max(roi_y_start, 0), image_height - 1)
         roi_y_end = int(image_height * float(p["roi_y_end_ratio"]))
@@ -2675,6 +3476,9 @@ class YellowAreaFollower(Node):
                 p,
             )
             history_result.history_age = self.history_age
+            history_result.rejected_extreme_error = (
+                observation.rejected_extreme_error
+            )
             return history_result
 
         if observation.path_mode == "yellow_area_center_fallback":
@@ -2713,6 +3517,9 @@ class YellowAreaFollower(Node):
         )
         lost_result.history_age = self.history_age
         lost_result.yellow_fallback_frames = self.yellow_fallback_frames
+        lost_result.rejected_extreme_error = (
+            observation.rejected_extreme_error
+        )
         return lost_result
 
     def _handle_valid_result(
@@ -2720,8 +3527,9 @@ class YellowAreaFollower(Node):
         bgr: np.ndarray,
         source_msg: Image,
         result: VisionResult,
+        p: Optional[dict] = None,
     ) -> None:
-        p = self.params
+        p = p if p is not None else self._cfg_snapshot()
         self.lost_frames = 0
         if result.path_mode == "both_boundary_center":
             speed_scale = float(p["both_boundary_speed_scale"])
@@ -2739,6 +3547,11 @@ class YellowAreaFollower(Node):
             self.single_boundary_frames = 0
         else:
             speed_scale = 0.0
+        if result.edge_risk:
+            speed_scale *= float(p["edge_risk_slowdown"])
+        if result.black_edge_risk:
+            speed_scale *= float(p["black_guard_slowdown"])
+        result.speed_scale = speed_scale
 
         now = time.monotonic()
         elapsed = now - self.last_control_time
@@ -2751,8 +3564,11 @@ class YellowAreaFollower(Node):
             float(p["smoothing_alpha"]),
             float(p["angular_smoothing_alpha"]),
             float(p["error_deadband"]),
-            float(p["linear_speed"]),
-            float(p["min_linear_speed"]),
+            min(float(p["linear_speed"]), float(p["max_linear_speed"])),
+            min(
+                float(p["min_linear_speed"]),
+                float(p["max_linear_speed"]),
+            ),
             speed_scale,
             float(p["kp"]),
             float(p["kd"]),
@@ -2761,24 +3577,27 @@ class YellowAreaFollower(Node):
         )
         self.previous_error = filtered_error
         self.previous_angular = angular
+        linear = min(linear, float(p["max_linear_speed"]))
         if abs(filtered_error) > 1e-6:
             self.last_turn_direction = -1.0 if filtered_error > 0.0 else 1.0
-        self._publish_velocity(linear, angular)
+        self._publish_velocity(linear, angular, p)
+        self._update_web_status(result, linear, angular, p)
         self._throttled_status_log(result, linear, angular)
-        self._publish_debug(bgr, source_msg, result, linear, angular)
+        self._publish_debug(bgr, source_msg, result, linear, angular, p)
 
     def _handle_lost_result(
         self,
         bgr: np.ndarray,
         source_msg: Image,
         result: VisionResult,
+        p: Optional[dict] = None,
     ) -> None:
         self.lost_frames += 1
         self.single_boundary_frames = 0
         self.previous_error = None
         self.previous_angular = 0.0
         self.last_control_time = time.monotonic()
-        p = self.params
+        p = p if p is not None else self._cfg_snapshot()
         angular = 0.0
         if (
             bool(p["search_on_lost"])
@@ -2787,15 +3606,23 @@ class YellowAreaFollower(Node):
             angular = (
                 self.last_turn_direction * float(p["search_angular"])
             )
-            self._publish_velocity(0.0, angular)
+            self._publish_velocity(0.0, angular, p)
         else:
-            self._publish_stop()
+            if self.lost_frames == 1:
+                self.publish_stop_repeated()
+            else:
+                self._publish_stop()
+        result.speed_scale = 0.0
+        self._update_web_status(result, 0.0, angular, p)
         self._throttled_status_log(result, 0.0, angular)
-        self._publish_debug(bgr, source_msg, result, 0.0, angular)
+        self._publish_debug(bgr, source_msg, result, 0.0, angular, p)
 
-    def _publish_velocity(self, linear: float, angular: float) -> None:
+    def _publish_velocity(
+        self, linear: float, angular: float, params: Optional[dict] = None
+    ) -> None:
         command = Twist()
-        if bool(self.params["dry_run"]):
+        p = params if params is not None else self._cfg_snapshot()
+        if bool(p["dry_run"]) or self.gui_stopped:
             command.linear.x = 0.0
             command.angular.z = 0.0
         else:
@@ -2814,7 +3641,7 @@ class YellowAreaFollower(Node):
 
     def _watchdog_callback(self) -> None:
         elapsed = time.monotonic() - self.last_image_time
-        if elapsed < float(self.params["image_timeout_sec"]):
+        if elapsed < float(self._cfg_snapshot()["image_timeout_sec"]):
             return
         self._publish_stop()
         if not self.watchdog_stopped:
@@ -2826,6 +3653,51 @@ class YellowAreaFollower(Node):
                 f"No image received for {elapsed:.2f}s; stopping."
             )
 
+    def _update_web_status(
+        self,
+        result: VisionResult,
+        linear: float,
+        angular: float,
+        params: dict,
+    ) -> None:
+        status = {
+            "path_mode": result.path_mode,
+            "path_geometry_mode": result.path_geometry_mode,
+            "ipm_enable": bool(params["ipm_enable"]),
+            "ipm_valid": bool(result.ipm_valid),
+            "near_error": float(result.near_error),
+            "far_error": float(result.far_error),
+            "control_error": float(result.control_error),
+            "linear_x": float(linear),
+            "angular_z": float(angular),
+            "speed_scale": float(result.speed_scale),
+            "yellow_pixels": int(result.yellow_pixels),
+            "green_pixels": int(result.green_pixels),
+            "boundary_points": int(result.boundary_points_count),
+            "target_points": len(result.target_path_points),
+            "edge_risk": bool(result.edge_risk),
+            "black_edge_risk": bool(result.black_edge_risk),
+            "min_target_margin_px": float(
+                result.min_target_yellow_margin_px
+            ),
+            "min_target_margin_m": float(
+                result.min_target_yellow_margin_m
+            ),
+            "clamped_points_count": int(result.clamped_points_count),
+            "unsafe_points_count": int(result.unsafe_points_count),
+            "rejected_extreme_error": bool(
+                result.rejected_extreme_error
+            ),
+            "lost_frames": int(self.lost_frames),
+            "dry_run": bool(params["dry_run"]),
+        }
+        if self.gui_stopped:
+            status["stop_state"] = "STOPPED_BY_GUI"
+        elif not result.ipm_valid:
+            status["stop_state"] = "IPM_INVALID / IMAGE_FALLBACK"
+        with self.status_lock:
+            self.web_status = status
+
     def _throttled_status_log(
         self,
         result: VisionResult,
@@ -2834,7 +3706,7 @@ class YellowAreaFollower(Node):
     ) -> None:
         now = time.monotonic()
         if now - self.last_log_time < float(
-            self.params["log_interval_sec"]
+            self._cfg_snapshot()["log_interval_sec"]
         ):
             return
         self.last_log_time = now
@@ -2853,13 +3725,17 @@ class YellowAreaFollower(Node):
             f"single_boundary_frames={self.single_boundary_frames}, "
             f"history_age={result.history_age}, "
             f"yellow_fallback_frames={result.yellow_fallback_frames}, "
-            f"path_mode={result.path_mode}"
+            f"path_mode={result.path_mode}, "
+            f"geometry={result.path_geometry_mode}, "
+            f"speed_scale={result.speed_scale:.2f}, "
+            f"edge_risk={result.edge_risk}, "
+            f"margin_px={result.min_target_yellow_margin_px:.1f}"
         )
 
     def _throttled_error(self, message: str) -> None:
         now = time.monotonic()
         if now - self.last_error_log_time < float(
-            self.params["log_interval_sec"]
+            self._cfg_snapshot()["log_interval_sec"]
         ):
             return
         self.last_error_log_time = now
@@ -2872,18 +3748,30 @@ class YellowAreaFollower(Node):
         result: VisionResult,
         linear: float,
         angular: float,
+        params: Optional[dict] = None,
     ) -> None:
-        if (
-            self.debug_image_publisher is None
-            or self.debug_mask_publisher is None
-        ) and self.boundary_debug_mask_publisher is None:
+        p = params if params is not None else self._cfg_snapshot()
+        ros_image_enabled = bool(p["publish_debug_image"])
+        ros_boundary_enabled = bool(p["publish_boundary_debug_mask"])
+        web_enabled = bool(p["web_gui_enable"]) and self.web_server is not None
+        if not (ros_image_enabled or ros_boundary_enabled or web_enabled):
             return
-
-        p = self.params
         now = time.monotonic()
-        if now - self.last_debug_time < 1.0 / float(p["debug_rate_hz"]):
+        ros_due = (
+            (ros_image_enabled or ros_boundary_enabled)
+            and now - self.last_debug_time >= 1.0 / float(p["debug_rate_hz"])
+        )
+        web_due = (
+            web_enabled
+            and now - self.last_web_frame_time
+            >= 1.0 / float(p["web_gui_max_fps"])
+        )
+        if not (ros_due or web_due):
             return
-        self.last_debug_time = now
+        if ros_due:
+            self.last_debug_time = now
+        if web_due:
+            self.last_web_frame_time = now
 
         image_height, image_width = bgr.shape[:2]
         roi_y_start = int(image_height * float(p["roi_y_start_ratio"]))
@@ -2891,29 +3779,14 @@ class YellowAreaFollower(Node):
         roi_y_end = int(image_height * float(p["roi_y_end_ratio"]))
         roi_y_end = min(max(roi_y_end, roi_y_start + 1), image_height)
 
-        if (
-            self.debug_image_publisher is not None
-            and self.debug_mask_publisher is not None
-        ):
-            if result.path_mode == "both_boundary_center":
-                speed_scale = float(p["both_boundary_speed_scale"])
-            elif result.path_mode == "single_boundary_offset":
-                speed_scale = float(p["single_boundary_speed_scale"])
-            elif result.path_mode == "history_prediction":
-                speed_scale = float(p["history_speed_scale"]) * (
-                    float(p["history_confidence_decay"])
-                    ** result.history_age
-                )
-            elif result.path_mode == "yellow_area_center_fallback":
-                speed_scale = float(p["yellow_fallback_speed_scale"])
-            else:
-                speed_scale = 0.0
+        debug = None
+        if ros_due and ros_image_enabled:
             debug = render_debug_image(
                 bgr,
                 result,
                 linear,
                 angular,
-                speed_scale,
+                result.speed_scale,
                 self.lost_frames,
                 p,
             )
@@ -2930,7 +3803,7 @@ class YellowAreaFollower(Node):
                 )
             )
 
-        if self.boundary_debug_mask_publisher is not None:
+        if ros_due and ros_boundary_enabled:
             full_boundary_mask = np.zeros(
                 (image_height, image_width), dtype=np.uint8
             )
@@ -2942,6 +3815,31 @@ class YellowAreaFollower(Node):
                     full_boundary_mask, "mono8", source_msg
                 )
             )
+
+        if web_due:
+            web_params = dict(p)
+            web_params["debug_side_panel"] = False
+            web_params["debug_embed_info_panel"] = False
+            if debug is None or bool(p["debug_side_panel"]):
+                debug = render_debug_image(
+                    bgr,
+                    result,
+                    linear,
+                    angular,
+                    result.speed_scale,
+                    self.lost_frames,
+                    web_params,
+                )
+            quality = int(
+                np.clip(p["web_gui_jpeg_quality"], 1, 100)
+            )
+            ok, encoded = cv2.imencode(
+                ".jpg", debug, [cv2.IMWRITE_JPEG_QUALITY, quality]
+            )
+            if ok:
+                with self.web_frame_lock:
+                    self.web_jpeg = encoded.tobytes()
+                    self.web_frame_lock.notify_all()
 
 
 def main(args=None) -> int:
@@ -2965,6 +3863,8 @@ def main(args=None) -> int:
             print(f"Failed to start yellow area follower: {exc}", flush=True)
     finally:
         if node is not None:
+            node.shutdown_web_server()
+            node.publish_stop_repeated()
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
