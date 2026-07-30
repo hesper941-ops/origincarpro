@@ -363,7 +363,7 @@ class PipelineResult:
     candidate_curves: List[Any]
     selected_boundary: np.ndarray
     centerline_mask: np.ndarray
-    overlay: np.ndarray
+    overlay: Optional[np.ndarray]
     geometry: Any
     roi: Tuple[int, int]
     boundary_valid: bool
@@ -376,6 +376,357 @@ class PipelineResult:
     road_side_status: Dict[str, Any]
     boundary_component_count: int
     valid_boundary_component_count: int
+    roi_y_offset: int
+    yellow_corridor_status: Dict[str, Any]
+    fallback_boundary_pipeline_used: bool
+    timing_ms: Dict[str, float]
+    counters: Dict[str, int]
+
+
+TIMING_NAMES = (
+    "segmentation_ms",
+    "boundary_extract_ms",
+    "ipm_warp_ms",
+    "main_yellow_select_ms",
+    "yellow_corridor_ms",
+    "component_analysis_ms",
+    "fragment_descriptor_ms",
+    "boundary_repair_ms",
+    "boundary_merge_ms",
+    "road_side_vote_ms",
+    "dual_planner_ms",
+    "single_planner_ms",
+    "centerline_smooth_ms",
+    "overlay_build_ms",
+    "jpeg_encode_ms",
+    "path_publish_ms",
+    "total_processing_ms",
+)
+
+COUNTER_NAMES = (
+    "polyfit_call_count",
+    "road_side_probe_count",
+    "repair_candidate_pair_count",
+    "repair_accepted_pair_count",
+    "merge_candidate_pair_count",
+    "fragment_count_before_filter",
+    "fragment_count_after_filter",
+    "overlay_build_count",
+    "jpeg_encode_count",
+)
+
+
+class PerformanceWindow:
+    """保存有限帧的轻量耗时快照，并按需计算平均值和 P95。"""
+
+    def __init__(self, size: int = 120) -> None:
+        self.lock = threading.Lock()
+        self.samples: Deque[Dict[str, float]] = deque(maxlen=size)
+
+    def add(self, sample: Dict[str, float]) -> None:
+        with self.lock:
+            self.samples.append(
+                {name: float(sample.get(name, 0.0)) for name in TIMING_NAMES}
+            )
+
+    def update_latest(self, values: Dict[str, float]) -> None:
+        with self.lock:
+            if self.samples:
+                self.samples[-1].update(
+                    {name: float(value) for name, value in values.items()}
+                )
+
+    def summary(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+        with self.lock:
+            samples = list(self.samples)
+        if not samples:
+            empty = {name: 0.0 for name in TIMING_NAMES}
+            return empty, empty.copy()
+        average: Dict[str, float] = {}
+        p95: Dict[str, float] = {}
+        for name in TIMING_NAMES:
+            values = np.asarray(
+                [sample.get(name, 0.0) for sample in samples],
+                dtype=np.float64,
+            )
+            average[name] = float(np.mean(values))
+            p95[name] = float(np.percentile(values, 95))
+        return average, p95
+
+
+@dataclass
+class CroppedIpm:
+    """完整 IPM 的 planning ROI 局部视图。"""
+
+    full: Any
+    y_offset: int
+    output_width: int
+    output_height: int
+    homography_matrix: np.ndarray
+    inverse_homography_matrix: np.ndarray
+    vehicle_origin_y_px: float
+
+    @classmethod
+    def from_full(
+        cls, ipm: Any, geometry_config: Any
+    ) -> Tuple["CroppedIpm", float, float]:
+        forward_min, forward_max, y_min, y_max = ipm.planning_roi(
+            geometry_config
+        )
+        translation = np.asarray(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, -float(y_min)], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        local_homography = translation @ ipm.homography_matrix
+        inverse_translation = np.asarray(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, float(y_min)], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        return (
+            cls(
+                full=ipm,
+                y_offset=int(y_min),
+                output_width=int(ipm.output_width),
+                output_height=int(y_max - y_min + 1),
+                homography_matrix=local_homography,
+                inverse_homography_matrix=(
+                    ipm.inverse_homography_matrix @ inverse_translation
+                ),
+                vehicle_origin_y_px=float(ipm.vehicle_origin_y_px - y_min),
+            ),
+            forward_min,
+            forward_max,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.full, name)
+
+    def planning_roi(
+        self, _config: Any
+    ) -> Tuple[float, float, int, int]:
+        near = (
+            self.vehicle_origin_y_px - (self.output_height - 1)
+        ) * self.meter_per_pixel
+        far = self.vehicle_origin_y_px * self.meter_per_pixel
+        return near, far, 0, self.output_height - 1
+
+    def to_full_points(self, points: np.ndarray) -> np.ndarray:
+        converted = np.asarray(points, dtype=np.float64).reshape(-1, 2).copy()
+        if len(converted):
+            converted[:, 1] += self.y_offset
+        return converted
+
+    def paste_mask(self, local: np.ndarray) -> np.ndarray:
+        shape = (self.full.output_height, self.full.output_width)
+        output = np.zeros(shape, dtype=local.dtype)
+        output[
+            self.y_offset : self.y_offset + self.output_height,
+            : self.output_width,
+        ] = local
+        return output
+
+    def paste_color(self, local: np.ndarray) -> np.ndarray:
+        output = np.zeros(
+            (
+                self.full.output_height,
+                self.full.output_width,
+                local.shape[2],
+            ),
+            dtype=local.dtype,
+        )
+        output[
+            self.y_offset : self.y_offset + self.output_height,
+            : self.output_width,
+        ] = local
+        return output
+
+
+@dataclass
+class YellowCorridorConfig:
+    """基于主黄色区域双轮廓的快速中心线参数，均待实车继续验证。"""
+
+    enable: bool = True
+    sample_step_m: float = 0.05
+    width_min_ratio: float = 0.65
+    width_max_ratio: float = 1.40
+    center_jump_max_m: float = 0.15
+    min_valid_samples: int = 6
+    min_forward_span_m: float = 0.25
+    boundary_validation_radius_px: int = 5
+    min_boundary_valid_ratio: float = 0.45
+
+    def validate(self) -> None:
+        if self.sample_step_m <= 0 or self.center_jump_max_m <= 0:
+            raise ValueError("黄色通道步长和中心跳变限制必须大于 0")
+        if not (0 < self.width_min_ratio < self.width_max_ratio):
+            raise ValueError("黄色通道宽度比例非法")
+        if self.min_valid_samples < 2 or self.min_forward_span_m <= 0:
+            raise ValueError("黄色通道有效点数或跨度非法")
+        if self.boundary_validation_radius_px < 1:
+            raise ValueError("黄色通道边缘验证半径必须大于 0")
+        if not (0 <= self.min_boundary_valid_ratio <= 1):
+            raise ValueError("黄色通道边缘有效比例必须位于 [0, 1]")
+
+
+class YellowCorridorPlanner:
+    """逐行跟踪主黄色连续区间的左右轮廓，优先生成轻量中心线。"""
+
+    EMPTY_STATUS: Dict[str, Any] = {
+        "yellow_corridor_attempted": False,
+        "yellow_corridor_valid": False,
+        "yellow_corridor_valid_sample_count": 0,
+        "yellow_corridor_forward_span_m": 0.0,
+        "yellow_corridor_width_px_mean": 0.0,
+        "yellow_corridor_width_px_std": 0.0,
+        "yellow_corridor_boundary_valid_ratio": 0.0,
+        "yellow_corridor_reason": "disabled",
+    }
+
+    @staticmethod
+    def _intervals(row: np.ndarray) -> List[Tuple[int, int]]:
+        active = row > 0
+        if not np.any(active):
+            return []
+        padded = np.pad(active.astype(np.int8), (1, 1))
+        changes = np.diff(padded)
+        starts = np.where(changes == 1)[0]
+        ends = np.where(changes == -1)[0] - 1
+        return [(int(start), int(end)) for start, end in zip(starts, ends)]
+
+    @staticmethod
+    def _edge_valid(
+        x: int,
+        y: int,
+        observed_boundary: np.ndarray,
+        green: np.ndarray,
+        radius: int,
+    ) -> bool:
+        height, width = observed_boundary.shape
+        x0, x1 = max(0, x - radius), min(width, x + radius + 1)
+        y0, y1 = max(0, y - 1), min(height, y + 2)
+        if x1 <= x0 or y1 <= y0:
+            return False
+        return bool(
+            np.any(observed_boundary[y0:y1, x0:x1] > 0)
+            or np.any(green[y0:y1, x0:x1] > 0)
+        )
+
+    @classmethod
+    def plan(
+        cls,
+        main_yellow: np.ndarray,
+        observed_boundary: np.ndarray,
+        green: np.ndarray,
+        ipm: Any,
+        config: YellowCorridorConfig,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        status = copy.deepcopy(cls.EMPTY_STATUS)
+        if not config.enable:
+            return STAGE4.GeometryResult(reason="yellow_corridor_disabled"), status
+        status["yellow_corridor_attempted"] = True
+        step_px = max(2, int(round(config.sample_step_m / ipm.meter_per_pixel)))
+        expected_width = ipm.expected_lane_width_px
+        minimum_width = expected_width * config.width_min_ratio
+        maximum_width = expected_width * config.width_max_ratio
+        jump_limit = config.center_jump_max_m / ipm.meter_per_pixel
+        previous_center = float(ipm.vehicle_center_x_px)
+        points: List[Tuple[float, float]] = []
+        widths: List[float] = []
+        edge_valid_count = 0
+        lost_rows = 0
+        for y in range(main_yellow.shape[0] - 1, -1, -step_px):
+            candidates: List[Tuple[float, int, int, float]] = []
+            for left, right in cls._intervals(main_yellow[y]):
+                width = float(right - left + 1)
+                if not (minimum_width <= width <= maximum_width):
+                    continue
+                center = (left + right) / 2.0
+                jump = abs(center - previous_center)
+                if points and jump > jump_limit:
+                    continue
+                if not points and jump > expected_width:
+                    continue
+                center_index = int(round(center))
+                if not (
+                    0 <= center_index < main_yellow.shape[1]
+                    and main_yellow[y, center_index] > 0
+                ):
+                    continue
+                score = jump + abs(width - expected_width) * 0.15
+                candidates.append((score, left, right, center))
+            if not candidates:
+                lost_rows += 1
+                if points and lost_rows > 1:
+                    break
+                continue
+            lost_rows = 0
+            _score, left, right, center = min(
+                candidates, key=lambda item: item[0]
+            )
+            left_valid = cls._edge_valid(
+                left,
+                y,
+                observed_boundary,
+                green,
+                config.boundary_validation_radius_px,
+            )
+            right_valid = cls._edge_valid(
+                right,
+                y,
+                observed_boundary,
+                green,
+                config.boundary_validation_radius_px,
+            )
+            edge_valid_count += int(left_valid and right_valid)
+            points.append((center, float(y)))
+            widths.append(float(right - left + 1))
+            previous_center = center
+        raw = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        span = (
+            float(raw[0, 1] - raw[-1, 1]) * ipm.meter_per_pixel
+            if len(raw) >= 2
+            else 0.0
+        )
+        boundary_ratio = edge_valid_count / max(1, len(raw))
+        status.update(
+            {
+                "yellow_corridor_valid_sample_count": len(raw),
+                "yellow_corridor_forward_span_m": span,
+                "yellow_corridor_width_px_mean": float(
+                    np.mean(widths) if widths else 0.0
+                ),
+                "yellow_corridor_width_px_std": float(
+                    np.std(widths) if widths else 0.0
+                ),
+                "yellow_corridor_boundary_valid_ratio": boundary_ratio,
+            }
+        )
+        reason = "valid"
+        if len(raw) < config.min_valid_samples:
+            reason = "yellow_corridor_too_few_samples"
+        elif span < config.min_forward_span_m:
+            reason = "yellow_corridor_span_too_short"
+        elif boundary_ratio < config.min_boundary_valid_ratio:
+            reason = "yellow_corridor_boundary_ratio_low"
+        status["yellow_corridor_reason"] = reason
+        status["yellow_corridor_valid"] = reason == "valid"
+        result = STAGE4.GeometryResult(
+            mode="yellow_corridor_dual_edge",
+            valid=False,
+            reason=reason,
+            confidence=float(
+                np.clip(
+                    0.72
+                    + 0.18 * boundary_ratio
+                    + 0.10
+                    * min(1.0, len(raw) / max(config.min_valid_samples, 1)),
+                    0.0,
+                    1.0,
+                )
+            ),
+            raw_points=raw,
+        )
+        return result, status
 
 
 @dataclass
@@ -390,6 +741,7 @@ class BoundaryEnhancementConfig:
     road_side_min_valid_samples: int = 5
     road_side_global_vote_min_ratio: float = 0.65
     road_side_global_yellow_margin: float = 0.08
+    fragment_neighbor_check_limit: int = 3
 
     def validate(self) -> None:
         if self.boundary_repair_max_gap_m <= 0:
@@ -413,6 +765,10 @@ class BoundaryEnhancementConfig:
         if not (0 < self.road_side_global_yellow_margin <= 1.0):
             raise ValueError(
                 "road_side_global_yellow_margin 必须位于 (0, 1]"
+            )
+        if not (1 <= self.fragment_neighbor_check_limit <= 10):
+            raise ValueError(
+                "fragment_neighbor_check_limit 必须位于 [1, 10]"
             )
 
     def max_gap_px(self, meter_per_pixel: float) -> int:
@@ -440,6 +796,7 @@ class BoundaryFragment:
     x_values: np.ndarray
     y_values: np.ndarray
     coefficients: np.ndarray
+    fit_residual: float
     y_min: int
     y_max: int
     x_median: float
@@ -460,6 +817,14 @@ class BoundaryRepairResult:
     repaired_component_count: int
     gap_count: int
     gap_max_px: int
+    candidate_pair_count: int = 0
+    fragment_count_before_filter: int = 0
+    fragment_count_after_filter: int = 0
+    polyfit_call_count: int = 0
+    descriptor_ms: float = 0.0
+    repair_ms: float = 0.0
+    fragments: Optional[List[BoundaryFragment]] = None
+    accepted_pairs: Optional[List[Tuple[int, int]]] = None
 
 
 class ConservativeBoundaryRepair:
@@ -508,6 +873,17 @@ class ConservativeBoundaryRepair:
             coefficients = np.polyfit(
                 unique_y.astype(np.float64), row_x, degree
             )
+            residual = float(
+                np.sqrt(
+                    np.mean(
+                        (
+                            row_x
+                            - np.polyval(coefficients, unique_y)
+                        )
+                        ** 2
+                    )
+                )
+            )
             fragments.append(
                 BoundaryFragment(
                     component_id=component_id,
@@ -515,6 +891,7 @@ class ConservativeBoundaryRepair:
                     x_values=row_x,
                     y_values=unique_y.astype(np.float64),
                     coefficients=coefficients,
+                    fit_residual=residual,
                     y_min=int(unique_y.min()),
                     y_max=int(unique_y.max()),
                     x_median=float(np.median(row_x)),
@@ -602,23 +979,6 @@ class ConservativeBoundaryRepair:
         )
         if lateral_error > config.max_lateral_px(ipm.meter_per_pixel):
             return False, gap, None
-        combined_y = np.concatenate((upper.y_values, lower.y_values))
-        combined_x = np.concatenate((upper.x_values, lower.x_values))
-        degree = min(2, len(combined_y) - 1)
-        coefficients = np.polyfit(combined_y, combined_x, degree)
-        residual = float(
-            np.sqrt(
-                np.mean(
-                    (
-                        combined_x
-                        - np.polyval(coefficients, combined_y)
-                    )
-                    ** 2
-                )
-            )
-        )
-        if residual > min(8.0, max(4.0, lateral_error * 0.50)):
-            return False, gap, None
         if gap <= 0:
             overlap_y0 = max(upper.y_min, lower.y_min)
             overlap_y1 = min(upper.y_max, lower.y_max)
@@ -640,7 +1000,19 @@ class ConservativeBoundaryRepair:
         )
         if len(bridge_y) == 0:
             return False, gap, None
-        bridge_x = np.polyval(coefficients, bridge_y)
+        # 复用两端缓存的切线，以 Hermite 插值桥接；候选比较不再调用 polyfit。
+        span = max(lower_y - upper_y, 1.0)
+        normalized = (bridge_y - upper_y) / span
+        h00 = 2 * normalized**3 - 3 * normalized**2 + 1
+        h10 = normalized**3 - 2 * normalized**2 + normalized
+        h01 = -2 * normalized**3 + 3 * normalized**2
+        h11 = normalized**3 - normalized**2
+        bridge_x = (
+            h00 * upper_x
+            + h10 * span * upper_slope
+            + h01 * lower_x
+            + h11 * span * lower_slope
+        )
         if np.any(
             (bridge_x - ipm.vehicle_center_x_px) * first_side <= 2.0
         ):
@@ -671,62 +1043,105 @@ class ConservativeBoundaryRepair:
         roi: Tuple[int, int],
         config: BoundaryEnhancementConfig,
     ) -> BoundaryRepairResult:
+        descriptor_started = time.perf_counter()
         observed_roi = cls._roi_mask(observed, roi)
         min_span = config.min_fragment_span_px(ipm.meter_per_pixel)
         fragments, observed_count = cls.fragments(
             observed_roi, roi, min_span
         )
+        descriptor_polyfit_count = len(fragments)
+        filtered_fragments: List[BoundaryFragment] = []
+        adjacency_radius = max(
+            3, int(round(0.035 / ipm.meter_per_pixel))
+        )
+        for fragment in fragments:
+            points = np.column_stack(
+                (fragment.x_values, fragment.y_values)
+            )
+            if fragment.pixel_count < max(5, min_span):
+                continue
+            if (
+                cls._boundary_adjacency_ratio(
+                    points,
+                    main_yellow,
+                    green,
+                    adjacency_radius,
+                )
+                < 0.15
+            ):
+                continue
+            filtered_fragments.append(fragment)
+        fragments = filtered_fragments
+        descriptor_ms = (
+            time.perf_counter() - descriptor_started
+        ) * 1000.0
+        repair_started = time.perf_counter()
         repaired = observed_roi.copy()
         gap_mask = np.zeros_like(observed_roi)
         accepted: List[Tuple[int, int]] = []
         used_endpoints: set = set()
         maximum_gap = 0
+        candidates: List[
+            Tuple[int, BoundaryFragment, BoundaryFragment, np.ndarray]
+        ] = []
         if config.boundary_repair_enable:
-            candidates: List[
-                Tuple[int, BoundaryFragment, BoundaryFragment, np.ndarray]
-            ] = []
-            for first_index in range(len(fragments)):
-                for second_index in range(first_index + 1, len(fragments)):
-                    first = fragments[first_index]
-                    second = fragments[second_index]
-                    compatible, gap, bridge = cls.compatible(
-                        first,
-                        second,
-                        main_yellow,
-                        green,
-                        ipm,
-                        config,
-                        require_positive_gap=True,
+            buckets: Dict[int, List[BoundaryFragment]] = {-1: [], 1: []}
+            for fragment in fragments:
+                side = cls._side(fragment, ipm.vehicle_center_x_px)
+                if side:
+                    buckets[side].append(fragment)
+            candidate_pair_count = 0
+            for bucket in buckets.values():
+                bucket.sort(key=lambda fragment: fragment.y_min)
+                for first_index, first in enumerate(bucket):
+                    end = min(
+                        len(bucket),
+                        first_index
+                        + 1
+                        + config.fragment_neighbor_check_limit,
                     )
-                    if compatible and bridge is not None:
-                        candidates.append((gap, first, second, bridge))
-            for gap, first, second, bridge in sorted(
-                candidates, key=lambda item: item[0]
-            ):
-                upper, lower = (
-                    (first, second)
-                    if first.y_min <= second.y_min
-                    else (second, first)
-                )
-                pair = tuple(sorted((upper.component_id, lower.component_id)))
-                if pair in accepted:
-                    continue
-                endpoints = (
-                    (upper.component_id, "near"),
-                    (lower.component_id, "far"),
-                )
-                if any(endpoint in used_endpoints for endpoint in endpoints):
-                    continue
-                points = np.round(bridge).astype(np.int32)
-                cv2.polylines(
-                    repaired, [points], False, 255, 2, cv2.LINE_8
-                )
-                cv2.polylines(
-                    gap_mask, [points], False, 255, 2, cv2.LINE_8
-                )
-                accepted.append(pair)
-                used_endpoints.update(endpoints)
-                maximum_gap = max(maximum_gap, int(gap))
+                    for second in bucket[first_index + 1 : end]:
+                        candidate_pair_count += 1
+                        compatible, gap, bridge = cls.compatible(
+                            first,
+                            second,
+                            main_yellow,
+                            green,
+                            ipm,
+                            config,
+                            require_positive_gap=True,
+                        )
+                        if compatible and bridge is not None:
+                            candidates.append((gap, first, second, bridge))
+        else:
+            candidate_pair_count = 0
+        for gap, first, second, bridge in sorted(
+            candidates, key=lambda item: item[0]
+        ):
+            upper, lower = (
+                (first, second)
+                if first.y_min <= second.y_min
+                else (second, first)
+            )
+            pair = tuple(sorted((upper.component_id, lower.component_id)))
+            if pair in accepted:
+                continue
+            endpoints = (
+                (upper.component_id, "near"),
+                (lower.component_id, "far"),
+            )
+            if any(endpoint in used_endpoints for endpoint in endpoints):
+                continue
+            points = np.round(bridge).astype(np.int32)
+            cv2.polylines(
+                repaired, [points], False, 255, 2, cv2.LINE_8
+            )
+            cv2.polylines(
+                gap_mask, [points], False, 255, 2, cv2.LINE_8
+            )
+            accepted.append(pair)
+            used_endpoints.update(endpoints)
+            maximum_gap = max(maximum_gap, int(gap))
         repaired = cls._roi_mask(repaired, roi)
         repaired_count = (
             cv2.connectedComponents(
@@ -745,7 +1160,136 @@ class ConservativeBoundaryRepair:
             repaired_component_count=int(repaired_count),
             gap_count=len(accepted),
             gap_max_px=maximum_gap,
+            candidate_pair_count=candidate_pair_count,
+            fragment_count_before_filter=observed_count,
+            fragment_count_after_filter=len(fragments),
+            polyfit_call_count=descriptor_polyfit_count,
+            descriptor_ms=descriptor_ms,
+            repair_ms=(time.perf_counter() - repair_started) * 1000.0,
+            fragments=fragments,
+            accepted_pairs=accepted,
         )
+
+
+class CachedBoundaryCurveBuilder:
+    """从已缓存片段描述构造曲线，不再次拟合单个边界分量。"""
+
+    @staticmethod
+    def build(
+        repair: BoundaryRepairResult,
+        ipm: Any,
+        geometry_config: Any,
+        roi: Tuple[int, int],
+    ) -> Tuple[List[Any], int]:
+        fragments = list(repair.fragments or [])
+        if not fragments:
+            return [], 0
+        by_id = {
+            fragment.component_id: index
+            for index, fragment in enumerate(fragments)
+        }
+        parents = list(range(len(fragments)))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(first: int, second: int) -> None:
+            first_root, second_root = find(first), find(second)
+            if first_root != second_root:
+                parents[second_root] = first_root
+
+        for first_id, second_id in repair.accepted_pairs or []:
+            if first_id in by_id and second_id in by_id:
+                union(by_id[first_id], by_id[second_id])
+        grouped: Dict[int, List[BoundaryFragment]] = {}
+        for index, fragment in enumerate(fragments):
+            grouped.setdefault(find(index), []).append(fragment)
+
+        max_area = (
+            (roi[1] - roi[0] + 1)
+            * ipm.output_width
+            * geometry_config.boundary_component_max_area_ratio
+        )
+        near_band_start = max(
+            roi[0], roi[1] - max(8, (roi[1] - roi[0]) // 5)
+        )
+        curves: List[Any] = []
+        extra_polyfit_calls = 0
+        for members in grouped.values():
+            pixel_count = sum(member.pixel_count for member in members)
+            y_min = min(member.y_min for member in members)
+            y_max = max(member.y_max for member in members)
+            if (
+                pixel_count
+                < geometry_config.boundary_component_min_pixels
+                or y_max - y_min + 1
+                < geometry_config.boundary_component_min_vertical_span_px
+                or pixel_count > max_area
+            ):
+                continue
+            if len(members) == 1:
+                coefficients = members[0].coefficients
+                residual = members[0].fit_residual
+                sample_y = members[0].y_values
+                sample_x = members[0].x_values
+            else:
+                sample_y = np.concatenate(
+                    [member.y_values for member in members]
+                )
+                sample_x = np.concatenate(
+                    [member.x_values for member in members]
+                )
+                try:
+                    coefficients, keep, residual = (
+                        STAGE4.RobustPolynomialFitter.fit(
+                            sample_y,
+                            sample_x,
+                            geometry_config.boundary_fit_degree,
+                            geometry_config.boundary_fit_min_points,
+                            geometry_config.boundary_fit_max_residual_px,
+                            geometry_config.boundary_fit_outlier_iterations,
+                        )
+                    )
+                except STAGE4.GeometryError:
+                    continue
+                extra_polyfit_calls += 1
+                sample_y, sample_x = sample_y[keep], sample_x[keep]
+            if residual > geometry_config.boundary_fit_max_residual_px:
+                continue
+            x_min, x_max = float(np.min(sample_x)), float(np.max(sample_x))
+            centroid_x = float(np.mean(sample_x))
+            centroid_y = float(np.mean(sample_y))
+            curves.append(
+                STAGE4.BoundaryCurve(
+                    component_id=min(
+                        member.component_id for member in members
+                    ),
+                    pixel_count=pixel_count,
+                    bbox=(
+                        int(math.floor(x_min)),
+                        y_min,
+                        max(1, int(math.ceil(x_max - x_min + 1))),
+                        y_max - y_min + 1,
+                    ),
+                    centroid=(centroid_x, centroid_y),
+                    vertical_span_px=y_max - y_min + 1,
+                    horizontal_span_px=max(
+                        1, int(math.ceil(x_max - x_min + 1))
+                    ),
+                    touches_near_band=y_max >= near_band_start,
+                    distance_to_vehicle_center_px=abs(
+                        centroid_x - ipm.vehicle_center_x_px
+                    ),
+                    coefficients=coefficients,
+                    fit_residual_px=float(residual),
+                    y_min=y_min,
+                    y_max=y_max,
+                )
+            )
+        return curves, extra_polyfit_calls
 
 
 class GlobalRoadSideClassifier:
@@ -811,12 +1355,13 @@ class GlobalRoadSideClassifier:
         positive_green: List[float] = []
         negative_green: List[float] = []
         margins: List[float] = []
-        for y in np.arange(
+        sample_rows = np.arange(
             curve.y_min,
             curve.y_max + 1,
             max(2, sample_step_px),
             dtype=np.float64,
-        ):
+        )
+        for y in sample_rows:
             pos_y, pos_g = cls._sample_side(
                 curve,
                 float(y),
@@ -908,6 +1453,16 @@ class GlobalRoadSideClassifier:
                 np.mean(negative_green) if negative_green else 0.0
             ),
         }
+        probe_distances = len(
+            range(
+                geometry_config.road_side_probe_min_px,
+                geometry_config.road_side_probe_max_px + 1,
+                geometry_config.road_side_probe_step_px,
+            )
+        )
+        curve.pipeline_probe_count = (
+            len(sample_rows) * 2 * probe_distances
+        )
         return curve
 
     @classmethod
@@ -937,9 +1492,9 @@ class BoundaryCurveAggregator:
         ipm: Any,
         geometry_config: Any,
         enhancement_config: BoundaryEnhancementConfig,
-    ) -> Tuple[List[Any], int]:
+    ) -> Tuple[List[Any], int, int, int]:
         if not curves:
-            return [], 0
+            return [], 0, 0, 0
         fragments = [
             BoundaryFragment(
                 component_id=curve.component_id,
@@ -951,6 +1506,7 @@ class BoundaryCurveAggregator:
                     curve.y_min, curve.y_max + 1, dtype=np.float64
                 ),
                 coefficients=curve.coefficients,
+                fit_residual=curve.fit_residual_px,
                 y_min=curve.y_min,
                 y_max=curve.y_max,
                 x_median=curve.centroid[0],
@@ -970,8 +1526,18 @@ class BoundaryCurveAggregator:
             if first_root != second_root:
                 parents[second_root] = first_root
 
-        for first_index in range(len(curves)):
-            for second_index in range(first_index + 1, len(curves)):
+        indices = list(range(len(curves)))
+        indices.sort(key=lambda index: curves[index].y_min)
+        candidate_pair_count = 0
+        for bucket_index, first_index in enumerate(indices):
+            end = min(
+                len(indices),
+                bucket_index
+                + 1
+                + enhancement_config.fragment_neighbor_check_limit,
+            )
+            for second_index in indices[bucket_index + 1 : end]:
+                candidate_pair_count += 1
                 first_curve, second_curve = (
                     curves[first_index],
                     curves[second_index],
@@ -979,7 +1545,8 @@ class BoundaryCurveAggregator:
                 if (
                     first_curve.inward_sign
                     and second_curve.inward_sign
-                    and first_curve.inward_sign != second_curve.inward_sign
+                    and first_curve.inward_sign
+                    != second_curve.inward_sign
                 ):
                     continue
                 compatible, _gap, _bridge = (
@@ -999,6 +1566,7 @@ class BoundaryCurveAggregator:
         for index, curve in enumerate(curves):
             groups.setdefault(find(index), []).append(curve)
         aggregated: List[Any] = []
+        aggregate_polyfit_calls = 0
         for members in groups.values():
             if len(members) == 1:
                 aggregated.append(members[0])
@@ -1024,6 +1592,7 @@ class BoundaryCurveAggregator:
                 ]
             )
             try:
+                aggregate_polyfit_calls += 1
                 coefficients, keep, residual = (
                     STAGE4.RobustPolynomialFitter.fit(
                         sample_y,
@@ -1050,8 +1619,7 @@ class BoundaryCurveAggregator:
             inherited_sign = (
                 next(iter(known_signs)) if len(known_signs) == 1 else 0
             )
-            aggregated.append(
-                STAGE4.BoundaryCurve(
+            merged_curve = STAGE4.BoundaryCurve(
                     component_id=min(
                         curve.component_id for curve in members
                     ),
@@ -1084,13 +1652,100 @@ class BoundaryCurveAggregator:
                     y_min=y_min,
                     y_max=y_max,
                     inward_sign=inherited_sign,
+                    road_side=(
+                        "yellow_right"
+                        if inherited_sign > 0
+                        else "yellow_left"
+                        if inherited_sign < 0
+                        else "unknown"
+                    ),
+                    side_confidence=float(
+                        max(
+                            (
+                                curve.side_confidence
+                                for curve in members
+                            ),
+                            default=0.0,
+                        )
+                    ),
                 )
+            statuses = [
+                getattr(
+                    curve,
+                    "pipeline_road_status",
+                    GlobalRoadSideClassifier.EMPTY_STATUS,
+                )
+                for curve in members
+            ]
+            valid_total = sum(
+                status["road_side_valid_sample_count"]
+                for status in statuses
             )
-        return aggregated, len(aggregated)
+            merged_curve.pipeline_road_status = {
+                "road_side_valid_sample_count": valid_total,
+                "road_side_positive_vote_count": sum(
+                    status["road_side_positive_vote_count"]
+                    for status in statuses
+                ),
+                "road_side_negative_vote_count": sum(
+                    status["road_side_negative_vote_count"]
+                    for status in statuses
+                ),
+                "road_side_global_vote_ratio": max(
+                    (
+                        status["road_side_global_vote_ratio"]
+                        for status in statuses
+                    ),
+                    default=0.0,
+                ),
+                "road_side_positive_yellow_ratio": float(
+                    np.mean(
+                        [
+                            status["road_side_positive_yellow_ratio"]
+                            for status in statuses
+                        ]
+                    )
+                ),
+                "road_side_negative_yellow_ratio": float(
+                    np.mean(
+                        [
+                            status["road_side_negative_yellow_ratio"]
+                            for status in statuses
+                        ]
+                    )
+                ),
+                "road_side_positive_green_ratio": float(
+                    np.mean(
+                        [
+                            status["road_side_positive_green_ratio"]
+                            for status in statuses
+                        ]
+                    )
+                ),
+                "road_side_negative_green_ratio": float(
+                    np.mean(
+                        [
+                            status["road_side_negative_green_ratio"]
+                            for status in statuses
+                        ]
+                    )
+                ),
+            }
+            merged_curve.pipeline_probe_count = sum(
+                int(getattr(curve, "pipeline_probe_count", 0))
+                for curve in members
+            )
+            aggregated.append(merged_curve)
+        return (
+            aggregated,
+            len(aggregated),
+            candidate_pair_count,
+            aggregate_polyfit_calls,
+        )
 
 
 class ConservativeDualBoundaryPlanner:
-    """仅将车辆中心轴两侧的曲线交给原第四阶段双边界配对器。"""
+    """复用第四阶段几何约束，不以车辆中心轴分居作为硬拒绝条件。"""
 
     @staticmethod
     def plan(
@@ -1101,30 +1756,14 @@ class ConservativeDualBoundaryPlanner:
         roi: Tuple[int, int],
         previous_center_x: Optional[float] = None,
     ) -> Optional[Any]:
-        best: Optional[Any] = None
-        best_score = -float("inf")
-        for first_index in range(len(curves)):
-            for second_index in range(first_index + 1, len(curves)):
-                first = curves[first_index]
-                second = curves[second_index]
-                first_side = first.centroid[0] - ipm.vehicle_center_x_px
-                second_side = second.centroid[0] - ipm.vehicle_center_x_px
-                if first_side * second_side >= 0:
-                    continue
-                candidate = STAGE4.DualBoundaryPlanner.plan(
-                    [first, second],
-                    main_yellow,
-                    ipm,
-                    geometry_config,
-                    roi,
-                    previous_center_x,
-                )
-                if candidate is None:
-                    continue
-                score = float(candidate.dual_pair_score)
-                if score > best_score:
-                    best, best_score = candidate, score
-        return best
+        return STAGE4.DualBoundaryPlanner.plan(
+            curves,
+            main_yellow,
+            ipm,
+            geometry_config,
+            roi,
+            previous_center_x,
+        )
 
 
 class LaneAlgorithm:
@@ -1137,6 +1776,7 @@ class LaneAlgorithm:
         geometry_config: Any,
         ipm: Any,
         enhancement_config: Optional[BoundaryEnhancementConfig] = None,
+        corridor_config: Optional[YellowCorridorConfig] = None,
     ) -> None:
         self.threshold = threshold
         self.segmentation_config = segmentation_config
@@ -1146,6 +1786,13 @@ class LaneAlgorithm:
             enhancement_config or BoundaryEnhancementConfig()
         )
         self.enhancement_config.validate()
+        self.corridor_config = corridor_config or YellowCorridorConfig()
+        self.corridor_config.validate()
+        (
+            self.roi_ipm,
+            self.resolved_forward_min_m,
+            self.resolved_forward_max_m,
+        ) = CroppedIpm.from_full(ipm, geometry_config)
         self.last_valid_points = np.empty((0, 2), dtype=np.float64)
         self.last_valid_time = 0.0
         self.last_center_x: Optional[float] = None
@@ -1168,94 +1815,211 @@ class LaneAlgorithm:
                 cv2.circle(output, tuple(point), max(1, thickness), 255, -1)
         return output
 
-    def _segment(
-        self, bgr: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-        values = STAGE2.GreenYellowSegmenter.segment(
+    def _segment(self, bgr: np.ndarray) -> Tuple[Any, ...]:
+        return STAGE2.GreenYellowSegmenter.segment(
             bgr, self.threshold, self.segmentation_config
         )
-        (
-            _yellow_raw,
-            _green_raw,
-            _unknown_raw,
-            yellow,
-            green,
-            unknown,
-            _hsv,
-            roi_start,
-            roi_end,
-            _overlap,
-            _yellow_stats,
-            _green_stats,
-        ) = values
-        boundary_result = STAGE2.BoundaryExtractor.extract(
-            yellow,
-            green,
-            unknown,
-            roi_start,
-            roi_end,
+
+    def _extract_boundary(self, values: Tuple[Any, ...]) -> Any:
+        return STAGE2.BoundaryExtractor.extract(
+            values[3],
+            values[4],
+            values[5],
+            int(values[7]),
+            int(values[8]),
             self.segmentation_config,
         )
-        return yellow, green, boundary_result.final, boundary_result.valid
 
-    def process(self, bgr: np.ndarray, processing_ms: float = 0.0) -> PipelineResult:
+    def _smooth(
+        self,
+        result: Any,
+        main_yellow: np.ndarray,
+        roi: Tuple[int, int],
+    ) -> float:
+        if not len(result.raw_points):
+            return 0.0
+        started = time.perf_counter()
+        (
+            result.final_points,
+            result.reason,
+            result.yellow_ratio,
+            result.forward_span_m,
+        ) = STAGE4.CenterlineSmoother.smooth(
+            result.raw_points,
+            main_yellow,
+            self.roi_ipm,
+            self.geometry_config,
+            roi,
+        )
+        result.valid = result.reason == "valid"
+        return (time.perf_counter() - started) * 1000.0
+
+    def process(self, bgr: np.ndarray) -> PipelineResult:
+        total_started = time.perf_counter()
+        timing = {name: 0.0 for name in TIMING_NAMES}
+        counters = {name: 0 for name in COUNTER_NAMES}
         if bgr.shape[:2] != (self.ipm.image_height, self.ipm.image_width):
             raise ValueError(
                 f"相机图像 {bgr.shape[1]}x{bgr.shape[0]} 与 IPM "
                 f"{self.ipm.image_width}x{self.ipm.image_height} 不一致"
             )
-        yellow, green, boundary, boundary_valid = self._segment(bgr)
+
+        started = time.perf_counter()
+        values = self._segment(bgr)
+        timing["segmentation_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        yellow, green = values[3], values[4]
+
+        started = time.perf_counter()
+        boundary_result = self._extract_boundary(values)
+        timing["boundary_extract_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        boundary = boundary_result.final
+        boundary_valid = bool(boundary_result.valid)
+
+        started = time.perf_counter()
         observed_ipm_boundary = STAGE4.MaskIpmTransformer.transform(
-            boundary, self.ipm
+            boundary, self.roi_ipm
         )
         transformed = {
-            "yellow": STAGE4.MaskIpmTransformer.transform(yellow, self.ipm),
-            "green": STAGE4.MaskIpmTransformer.transform(green, self.ipm),
+            "yellow": STAGE4.MaskIpmTransformer.transform(
+                yellow, self.roi_ipm
+            ),
+            "green": STAGE4.MaskIpmTransformer.transform(
+                green, self.roi_ipm
+            ),
         }
-        (
-            _forward_min,
-            _forward_max,
-            y_min,
-            y_max,
-        ) = self.ipm.planning_roi(self.geometry_config)
-        roi = (y_min, y_max)
+        timing["ipm_warp_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        roi = (0, self.roi_ipm.output_height - 1)
+
+        started = time.perf_counter()
         main_yellow, yellow_status = STAGE4.MainYellowSelector.select(
             transformed["yellow"],
-            self.ipm,
+            self.roi_ipm,
             self.geometry_config,
             roi,
         )
-        repair = ConservativeBoundaryRepair.repair(
-            observed_ipm_boundary,
-            main_yellow,
-            transformed["green"],
-            self.ipm,
-            roi,
-            self.enhancement_config,
+        timing["main_yellow_select_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+
+        started = time.perf_counter()
+        if yellow_status["main_yellow_valid"]:
+            corridor_result, corridor_status = YellowCorridorPlanner.plan(
+                main_yellow,
+                observed_ipm_boundary,
+                transformed["green"],
+                self.roi_ipm,
+                self.corridor_config,
+            )
+        else:
+            corridor_result = STAGE4.GeometryResult(
+                reason="main_yellow_missing"
+            )
+            corridor_status = copy.deepcopy(
+                YellowCorridorPlanner.EMPTY_STATUS
+            )
+            corridor_status["yellow_corridor_reason"] = (
+                "main_yellow_missing"
+            )
+        timing["yellow_corridor_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+
+        fast_valid = False
+        if corridor_status["yellow_corridor_valid"]:
+            timing["centerline_smooth_ms"] += self._smooth(
+                corridor_result, main_yellow, roi
+            )
+            fast_valid = bool(corridor_result.valid)
+            if not fast_valid:
+                corridor_status["yellow_corridor_valid"] = False
+                corridor_status["yellow_corridor_reason"] = (
+                    corridor_result.reason
+                )
+
+        empty = np.zeros(
+            (self.roi_ipm.output_height, self.roi_ipm.output_width),
+            dtype=np.uint8,
+        )
+        repair = BoundaryRepairResult(
+            observed=observed_ipm_boundary,
+            repaired=observed_ipm_boundary.copy(),
+            gap_mask=empty.copy(),
+            observed_component_count=0,
+            repaired_component_count=0,
+            gap_count=0,
+            gap_max_px=0,
         )
         transformed["boundary"] = repair.repaired
         curves: List[Any] = []
         raw_component_count = 0
         merged_group_count = 0
-        result = STAGE4.GeometryResult(reason="segmentation_invalid")
-        if boundary_valid and yellow_status["main_yellow_valid"]:
-            curves, raw_component_count = (
-                STAGE4.BoundaryComponentAnalyzer.analyze(
-                    transformed["boundary"],
-                    self.ipm,
+        fallback_used = not fast_valid
+        result = corridor_result if fast_valid else STAGE4.GeometryResult(
+            reason="segmentation_invalid"
+        )
+
+        if (
+            fallback_used
+            and boundary_valid
+            and yellow_status["main_yellow_valid"]
+        ):
+            repair = ConservativeBoundaryRepair.repair(
+                observed_ipm_boundary,
+                main_yellow,
+                transformed["green"],
+                self.roi_ipm,
+                roi,
+                self.enhancement_config,
+            )
+            transformed["boundary"] = repair.repaired
+            timing["fragment_descriptor_ms"] = repair.descriptor_ms
+            timing["boundary_repair_ms"] = repair.repair_ms
+            counters.update(
+                {
+                    "polyfit_call_count": repair.polyfit_call_count,
+                    "repair_candidate_pair_count": (
+                        repair.candidate_pair_count
+                    ),
+                    "repair_accepted_pair_count": repair.gap_count,
+                    "fragment_count_before_filter": (
+                        repair.fragment_count_before_filter
+                    ),
+                    "fragment_count_after_filter": (
+                        repair.fragment_count_after_filter
+                    ),
+                }
+            )
+
+            started = time.perf_counter()
+            curves, extra_polyfit_calls = (
+                CachedBoundaryCurveBuilder.build(
+                    repair,
+                    self.roi_ipm,
                     self.geometry_config,
                     roi,
                 )
             )
+            raw_component_count = repair.observed_component_count
+            timing["component_analysis_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            counters["polyfit_call_count"] += extra_polyfit_calls
             step_px = max(
                 2,
                 int(
                     round(
                         self.geometry_config.centerline_sample_step_m
-                        / self.ipm.meter_per_pixel
+                        / self.roi_ipm.meter_per_pixel
                     )
                 ),
             )
+            started = time.perf_counter()
             for curve in curves:
                 GlobalRoadSideClassifier.classify_curve(
                     curve,
@@ -1265,42 +2029,60 @@ class LaneAlgorithm:
                     self.enhancement_config,
                     step_px,
                 )
-            curves, merged_group_count = BoundaryCurveAggregator.aggregate(
+            timing["road_side_vote_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            counters["road_side_probe_count"] = sum(
+                int(getattr(curve, "pipeline_probe_count", 0))
+                for curve in curves
+            )
+
+            started = time.perf_counter()
+            (
+                curves,
+                merged_group_count,
+                merge_pair_count,
+                merge_polyfit_calls,
+            ) = BoundaryCurveAggregator.aggregate(
                 curves,
                 main_yellow,
                 transformed["green"],
-                self.ipm,
+                self.roi_ipm,
                 self.geometry_config,
                 self.enhancement_config,
             )
-            # 聚合后重新投票，避免仅继承某个短碎片的局部方向。
-            for curve in curves:
-                GlobalRoadSideClassifier.classify_curve(
-                    curve,
-                    main_yellow,
-                    transformed["green"],
-                    self.geometry_config,
-                    self.enhancement_config,
-                    step_px,
-                )
+            timing["boundary_merge_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            counters["merge_candidate_pair_count"] = merge_pair_count
+            counters["polyfit_call_count"] += merge_polyfit_calls
+
             if curves:
+                started = time.perf_counter()
                 result = ConservativeDualBoundaryPlanner.plan(
                     curves,
                     main_yellow,
-                    self.ipm,
+                    self.roi_ipm,
                     self.geometry_config,
                     roi,
                     self.last_center_x,
                 )
+                timing["dual_planner_ms"] = (
+                    time.perf_counter() - started
+                ) * 1000.0
                 if result is None:
+                    started = time.perf_counter()
                     result = STAGE4.SingleBoundaryPlanner.plan(
                         curves,
                         main_yellow,
                         transformed["green"],
-                        self.ipm,
+                        self.roi_ipm,
                         self.geometry_config,
                         roi,
                     )
+                    timing["single_planner_ms"] = (
+                        time.perf_counter() - started
+                    ) * 1000.0
                 if result is None:
                     reason = (
                         "single_boundary_side_unknown"
@@ -1310,25 +2092,18 @@ class LaneAlgorithm:
                     result = STAGE4.GeometryResult(reason=reason)
             else:
                 result = STAGE4.GeometryResult(reason="boundary_missing")
-        elif not yellow_status["main_yellow_valid"]:
+        elif fallback_used and not yellow_status["main_yellow_valid"]:
             result = STAGE4.GeometryResult(reason="main_yellow_missing")
+        elif fallback_used and not boundary_valid:
+            result = STAGE4.GeometryResult(reason="segmentation_invalid")
 
         if not bool(yellow_status.get("main_yellow_seed_connected", False)):
             result.confidence *= 0.80
-        if len(result.raw_points):
-            (
-                result.final_points,
-                result.reason,
-                result.yellow_ratio,
-                result.forward_span_m,
-            ) = STAGE4.CenterlineSmoother.smooth(
-                result.raw_points,
-                main_yellow,
-                self.ipm,
-                self.geometry_config,
-                roi,
+        if fallback_used and len(result.raw_points):
+            timing["centerline_smooth_ms"] += self._smooth(
+                result, main_yellow, roi
             )
-            result.valid = result.reason == "valid"
+
         if not result.valid and self.geometry_config.history_fallback_enable:
             age = time.monotonic() - self.last_valid_time
             lateral_change_ok = bool(
@@ -1339,7 +2114,7 @@ class LaneAlgorithm:
                         float(result.raw_points[0, 0])
                         - float(self.last_valid_points[0, 0])
                     )
-                    * self.ipm.meter_per_pixel
+                    * self.roi_ipm.meter_per_pixel
                     <= self.geometry_config.centerline_max_lateral_jump_m
                 )
             )
@@ -1361,29 +2136,20 @@ class LaneAlgorithm:
         else:
             result.confidence = 0.0
 
-        shape = (self.ipm.output_height, self.ipm.output_width)
-        selected = STAGE4.BoundaryComponentAnalyzer.component_mask(
-            transformed["boundary"], result.selected_curves, 3
+        shape = (
+            self.roi_ipm.output_height,
+            self.roi_ipm.output_width,
         )
-        centerline = self.points_mask(shape, result.final_points, 3)
-        raw_line = self.points_mask(shape, result.raw_points, 2)
-        overlay = self.make_overlay(
-            transformed,
-            main_yellow,
-            selected,
-            raw_line,
-            centerline,
-            result,
-            roi,
-            processing_ms,
-            repair.observed,
-            repair.gap_mask,
-            curves,
-        )
+        # 调试线条延迟到低频调试/Web 线程绘制，算法热路径只保留零画布。
+        selected = np.zeros(shape, dtype=np.uint8)
+        centerline = np.zeros(shape, dtype=np.uint8)
         road_curves = result.selected_curves or curves
         road_side_status = GlobalRoadSideClassifier.representative_status(
             road_curves
         )
+        timing["total_processing_ms"] = (
+            time.perf_counter() - total_started
+        ) * 1000.0
         return PipelineResult(
             boundary=boundary,
             yellow=yellow,
@@ -1396,10 +2162,10 @@ class LaneAlgorithm:
             candidate_curves=curves,
             selected_boundary=selected,
             centerline_mask=centerline,
-            overlay=overlay,
+            overlay=None,
             geometry=result,
             roi=roi,
-            boundary_valid=bool(boundary_valid),
+            boundary_valid=boundary_valid,
             yellow_status=yellow_status,
             observed_boundary_component_count=(
                 repair.observed_component_count
@@ -1413,6 +2179,11 @@ class LaneAlgorithm:
             road_side_status=road_side_status,
             boundary_component_count=raw_component_count,
             valid_boundary_component_count=len(curves),
+            roi_y_offset=self.roi_ipm.y_offset,
+            yellow_corridor_status=corridor_status,
+            fallback_boundary_pipeline_used=fallback_used,
+            timing_ms=timing,
+            counters=counters,
         )
 
     def make_overlay(
@@ -1454,8 +2225,8 @@ class LaneAlgorithm:
             overlay[repaired_gap_mask > 0] = (0, 140, 255)
         overlay[raw_line > 0] = (255, 255, 0)
         overlay[centerline > 0] = (0, 255, 255)
-        center_x = int(round(self.ipm.vehicle_center_x_px))
-        origin_y = int(round(self.ipm.vehicle_origin_y_px))
+        center_x = int(round(self.roi_ipm.vehicle_center_x_px))
+        origin_y = int(round(self.roi_ipm.vehicle_origin_y_px))
         cv2.line(
             overlay,
             (center_x, roi[0]),
@@ -1591,6 +2362,9 @@ img{display:block;width:100%;height:auto;background:#05080c}
 const fields=["centerline_mode","centerline_valid","centerline_confidence",
 "capture_fps","process_fps","path_publish_fps","end_to_end_ms",
 "dropped_frame_count","processing_time_ms",
+"yellow_corridor_valid","yellow_corridor_valid_sample_count",
+"yellow_corridor_forward_span_m","yellow_corridor_boundary_valid_ratio",
+"yellow_corridor_reason","fallback_boundary_pipeline_used",
 "observed_boundary_component_count","repaired_boundary_component_count",
 "merged_boundary_group_count","repaired_gap_count","repaired_gap_max_px",
 "road_side_valid_sample_count","road_side_positive_vote_count",
@@ -1605,6 +2379,12 @@ class PipelineWebServer:
         self.node = node
         self.server: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
+        self.client_lock = threading.Lock()
+        self.stream_client_count = 0
+
+    def has_stream_clients(self) -> bool:
+        with self.client_lock:
+            return self.stream_client_count > 0
 
     def handler_class(self) -> Any:
         owner = self
@@ -1646,6 +2426,8 @@ class PipelineWebServer:
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 last = -1
+                with owner.client_lock:
+                    owner.stream_client_count += 1
                 try:
                     while not owner.node.stop_event.is_set():
                         data, sequence = owner.node.web_jpeg.get()
@@ -1661,6 +2443,11 @@ class PipelineWebServer:
                         time.sleep(0.05)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                finally:
+                    with owner.client_lock:
+                        owner.stream_client_count = max(
+                            0, owner.stream_client_count - 1
+                        )
 
             def log_message(self, _format: str, *_args: Any) -> None:
                 pass
@@ -1687,6 +2474,14 @@ class PipelineWebServer:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
             self.thread = None
+
+
+@dataclass
+class DebugSnapshot:
+    raw: np.ndarray
+    result: PipelineResult
+    source: Image
+    sequence: int
 
 
 class LanePerceptionPipelineNode(Node):
@@ -1760,20 +2555,29 @@ class LanePerceptionPipelineNode(Node):
         self.capture_meter = RateMeter()
         self.process_meter = RateMeter()
         self.path_meter = RateMeter()
+        self.performance_window = PerformanceWindow()
         self.last_web_encode = 0.0
         self.last_debug_publish = 0.0
         self.process_thread: Optional[threading.Thread] = None
+        self.render_thread: Optional[threading.Thread] = None
+        self.debug_snapshot_lock = threading.Lock()
+        self.debug_snapshot: Optional[DebugSnapshot] = None
+        self.debug_snapshot_sequence = 0
+        self.overlay_build_count = 0
+        self.jpeg_encode_count = 0
         self.capture = CameraCapture(self, self.slot, self.stop_event)
         self.threshold, threshold_path = self._load_threshold()
         self.segmentation_config = self._load_segmentation_config()
         self.geometry_config, self.ipm = self._load_geometry()
         self.enhancement_config = self._load_enhancement_config()
+        self.corridor_config = self._load_corridor_config()
         self.algorithm = LaneAlgorithm(
             self.threshold,
             self.segmentation_config,
             self.geometry_config,
             self.ipm,
             self.enhancement_config,
+            self.corridor_config,
         )
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1817,6 +2621,13 @@ class LanePerceptionPipelineNode(Node):
             daemon=True,
         )
         self.process_thread.start()
+        if self.web_gui_enable or self.publish_overlay_compressed:
+            self.render_thread = threading.Thread(
+                target=self._render_loop,
+                name="lane-pipeline-web-render",
+                daemon=True,
+            )
+            self.render_thread.start()
         self.get_logger().info(
             "pipeline started: "
             f"device={self.device}, requested={self.request_width}x"
@@ -1827,7 +2638,11 @@ class LanePerceptionPipelineNode(Node):
             f"repair={self.enhancement_config.boundary_repair_enable}, "
             "repair_gap="
             f"{self.enhancement_config.boundary_repair_max_gap_m:.2f}m/"
-            f"{self.enhancement_config.max_gap_px(self.ipm.meter_per_pixel)}px"
+            f"{self.enhancement_config.max_gap_px(self.ipm.meter_per_pixel)}px, "
+            f"ipm_roi={self.algorithm.roi_ipm.output_width}x"
+            f"{self.algorithm.roi_ipm.output_height}@"
+            f"y{self.algorithm.roi_ipm.y_offset}, "
+            f"yellow_corridor={self.corridor_config.enable}"
         )
 
     def _declare_parameters(self) -> None:
@@ -1860,6 +2675,16 @@ class LanePerceptionPipelineNode(Node):
             "road_side_min_valid_samples": 5,
             "road_side_global_vote_min_ratio": 0.65,
             "road_side_global_yellow_margin": 0.08,
+            "fragment_neighbor_check_limit": 3,
+            "yellow_corridor_enable": True,
+            "yellow_corridor_sample_step_m": 0.05,
+            "yellow_corridor_width_min_ratio": 0.65,
+            "yellow_corridor_width_max_ratio": 1.40,
+            "yellow_corridor_center_jump_max_m": 0.15,
+            "yellow_corridor_min_valid_samples": 6,
+            "yellow_corridor_min_forward_span_m": 0.25,
+            "yellow_corridor_boundary_validation_radius_px": 5,
+            "yellow_corridor_min_boundary_valid_ratio": 0.45,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -1946,6 +2771,58 @@ class LanePerceptionPipelineNode(Node):
                     "road_side_global_yellow_margin"
                 ).value
             ),
+            fragment_neighbor_check_limit=int(
+                self.get_parameter("fragment_neighbor_check_limit").value
+            ),
+        )
+        config.validate()
+        return config
+
+    def _load_corridor_config(self) -> YellowCorridorConfig:
+        config = YellowCorridorConfig(
+            enable=bool(
+                self.get_parameter("yellow_corridor_enable").value
+            ),
+            sample_step_m=float(
+                self.get_parameter(
+                    "yellow_corridor_sample_step_m"
+                ).value
+            ),
+            width_min_ratio=float(
+                self.get_parameter(
+                    "yellow_corridor_width_min_ratio"
+                ).value
+            ),
+            width_max_ratio=float(
+                self.get_parameter(
+                    "yellow_corridor_width_max_ratio"
+                ).value
+            ),
+            center_jump_max_m=float(
+                self.get_parameter(
+                    "yellow_corridor_center_jump_max_m"
+                ).value
+            ),
+            min_valid_samples=int(
+                self.get_parameter(
+                    "yellow_corridor_min_valid_samples"
+                ).value
+            ),
+            min_forward_span_m=float(
+                self.get_parameter(
+                    "yellow_corridor_min_forward_span_m"
+                ).value
+            ),
+            boundary_validation_radius_px=int(
+                self.get_parameter(
+                    "yellow_corridor_boundary_validation_radius_px"
+                ).value
+            ),
+            min_boundary_valid_ratio=float(
+                self.get_parameter(
+                    "yellow_corridor_min_boundary_valid_ratio"
+                ).value
+            ),
         )
         config.validate()
         return config
@@ -1978,6 +2855,17 @@ class LanePerceptionPipelineNode(Node):
             "final_centerline_point_count": 0,
             "centerline_forward_span_m": 0.0,
             "centerline_yellow_ratio": 0.0,
+            "planning_roi_y_min_px": self.algorithm.roi_ipm.y_offset,
+            "planning_roi_y_max_px": (
+                self.algorithm.roi_ipm.y_offset
+                + self.algorithm.roi_ipm.output_height
+                - 1
+            ),
+            "planning_roi_height_px": (
+                self.algorithm.roi_ipm.output_height
+            ),
+            **copy.deepcopy(YellowCorridorPlanner.EMPTY_STATUS),
+            "fallback_boundary_pipeline_used": False,
             "boundary_repair_max_gap_px": (
                 self.enhancement_config.max_gap_px(
                     self.ipm.meter_per_pixel
@@ -1989,6 +2877,14 @@ class LanePerceptionPipelineNode(Node):
             "repaired_gap_count": 0,
             "repaired_gap_max_px": 0,
             **copy.deepcopy(GlobalRoadSideClassifier.EMPTY_STATUS),
+            **{name: 0.0 for name in TIMING_NAMES},
+            **{name: 0 for name in COUNTER_NAMES},
+            "timing_average_ms": {
+                name: 0.0 for name in TIMING_NAMES
+            },
+            "timing_p95_ms": {
+                name: 0.0 for name in TIMING_NAMES
+            },
             "last_error": "",
         }
 
@@ -2044,36 +2940,31 @@ class LanePerceptionPipelineNode(Node):
                 continue
             sequence = frame.sequence
             started = time.monotonic()
+            processing_started = time.perf_counter()
             age_ms = (started - frame.captured_monotonic) * 1000.0
             source = self._source_image(frame)
             try:
                 result = self.algorithm.process(frame.image)
-                processing_ms = (time.monotonic() - started) * 1000.0
-                result.overlay = self.algorithm.make_overlay(
-                    result.transformed,
-                    result.main_yellow,
-                    result.selected_boundary,
-                    self.algorithm.points_mask(
-                        result.centerline_mask.shape,
-                        result.geometry.raw_points,
-                        2,
-                    ),
-                    result.centerline_mask,
-                    result.geometry,
-                    result.roi,
-                    processing_ms,
-                    result.observed_ipm_boundary,
-                    result.repaired_gap_mask,
-                    result.candidate_curves,
+                path_started = time.perf_counter()
+                full_points = self.algorithm.roi_ipm.to_full_points(
+                    result.geometry.final_points
                 )
                 path = (
                     STAGE4.PathConverter.to_path(
-                        result.geometry.final_points, self.ipm, source
+                        full_points, self.ipm, source
                     )
                     if result.geometry.valid
                     else STAGE4.PathConverter.empty(self.ipm, source)
                 )
                 self.path_publisher.publish(path)
+                result.timing_ms["path_publish_ms"] = (
+                    time.perf_counter() - path_started
+                ) * 1000.0
+                processing_ms = (
+                    time.perf_counter() - processing_started
+                ) * 1000.0
+                result.timing_ms["total_processing_ms"] = processing_ms
+                self.performance_window.add(result.timing_ms)
                 path_fps = self.path_meter.tick()
                 process_fps = self.process_meter.tick()
                 end_to_end = (
@@ -2113,6 +3004,10 @@ class LanePerceptionPipelineNode(Node):
                             "centerline_yellow_ratio": float(
                                 result.geometry.yellow_ratio
                             ),
+                            **result.yellow_corridor_status,
+                            "fallback_boundary_pipeline_used": (
+                                result.fallback_boundary_pipeline_used
+                            ),
                             "observed_boundary_component_count": (
                                 result.observed_boundary_component_count
                             ),
@@ -2129,13 +3024,17 @@ class LanePerceptionPipelineNode(Node):
                                 result.repaired_gap_max_px
                             ),
                             **result.road_side_status,
+                            **result.timing_ms,
+                            **result.counters,
                             "last_error": ""
                             if result.geometry.valid
                             else result.geometry.reason,
                         }
                     )
             except Exception as exc:
-                processing_ms = (time.monotonic() - started) * 1000.0
+                processing_ms = (
+                    time.perf_counter() - processing_started
+                ) * 1000.0
                 self.path_publisher.publish(
                     STAGE4.PathConverter.empty(self.ipm, source)
                 )
@@ -2180,29 +3079,32 @@ class LanePerceptionPipelineNode(Node):
         self, raw: np.ndarray, result: PipelineResult, source: Image
     ) -> None:
         now = time.monotonic()
-        web_due = (
-            (self.web_gui_enable or self.publish_overlay_compressed)
-            and now - self.last_web_encode >= 1.0 / self.web_gui_max_fps
-        )
-        if web_due:
-            composite = self._make_web_composite(
-                raw, result.overlay, result.centerline_mask
-            )
-            payload = self.web_jpeg.update(
-                composite, self.web_gui_jpeg_quality
-            )
-            self.last_web_encode = now
-            if payload is not None and self.overlay_publisher is not None:
-                message = CompressedImage()
-                message.header = copy.deepcopy(source.header)
-                message.format = "jpeg"
-                message.data = payload
-                self.overlay_publisher.publish(message)
+        if self.web_gui_enable or self.publish_overlay_compressed:
+            with self.debug_snapshot_lock:
+                self.debug_snapshot_sequence += 1
+                self.debug_snapshot = DebugSnapshot(
+                    raw=raw,
+                    result=result,
+                    source=copy.deepcopy(source),
+                    sequence=self.debug_snapshot_sequence,
+                )
         if (
             self.publish_debug_raw_images
             and now - self.last_debug_publish
             >= 1.0 / self.debug_publish_fps
         ):
+            selected_mask = (
+                STAGE4.BoundaryComponentAnalyzer.component_mask(
+                    result.transformed["boundary"],
+                    result.geometry.selected_curves,
+                    3,
+                )
+            )
+            centerline_mask = self.algorithm.points_mask(
+                result.main_yellow.shape,
+                result.geometry.final_points,
+                3,
+            )
             images = {
                 "boundary": result.boundary,
                 "yellow": result.yellow,
@@ -2210,14 +3112,115 @@ class LanePerceptionPipelineNode(Node):
                 "ipm_observed": result.observed_ipm_boundary,
                 "ipm_repaired": result.repaired_ipm_boundary,
                 "repaired_gap": result.repaired_gap_mask,
-                "selected": result.selected_boundary,
-                "centerline": result.centerline_mask,
+                "selected": selected_mask,
+                "centerline": centerline_mask,
             }
             for name, image in images.items():
                 self.debug_publishers[name].publish(
                     self._mono_message(image, source)
                 )
             self.last_debug_publish = now
+
+    def _render_loop(self) -> None:
+        last_sequence = -1
+        while not self.stop_event.is_set():
+            should_render = bool(
+                self.publish_overlay_compressed
+                or self.web.has_stream_clients()
+            )
+            if not should_render:
+                self.stop_event.wait(0.10)
+                continue
+            now = time.monotonic()
+            remaining = (
+                1.0 / self.web_gui_max_fps
+                - (now - self.last_web_encode)
+            )
+            if remaining > 0:
+                self.stop_event.wait(min(remaining, 0.10))
+                continue
+            with self.debug_snapshot_lock:
+                snapshot = self.debug_snapshot
+            if snapshot is None or snapshot.sequence == last_sequence:
+                self.stop_event.wait(0.03)
+                continue
+            result = snapshot.result
+            overlay_started = time.perf_counter()
+            selected_mask = (
+                STAGE4.BoundaryComponentAnalyzer.component_mask(
+                    result.transformed["boundary"],
+                    result.geometry.selected_curves,
+                    3,
+                )
+            )
+            centerline_mask = self.algorithm.points_mask(
+                result.main_yellow.shape,
+                result.geometry.final_points,
+                3,
+            )
+            raw_line = self.algorithm.points_mask(
+                result.main_yellow.shape,
+                result.geometry.raw_points,
+                2,
+            )
+            local_overlay = self.algorithm.make_overlay(
+                result.transformed,
+                result.main_yellow,
+                selected_mask,
+                raw_line,
+                centerline_mask,
+                result.geometry,
+                result.roi,
+                result.timing_ms["total_processing_ms"],
+                result.observed_ipm_boundary,
+                result.repaired_gap_mask,
+                result.candidate_curves,
+            )
+            full_overlay = self.algorithm.roi_ipm.paste_color(
+                local_overlay
+            )
+            full_centerline = self.algorithm.roi_ipm.paste_mask(
+                centerline_mask
+            )
+            composite = self._make_web_composite(
+                snapshot.raw, full_overlay, full_centerline
+            )
+            overlay_ms = (
+                time.perf_counter() - overlay_started
+            ) * 1000.0
+            jpeg_started = time.perf_counter()
+            payload = self.web_jpeg.update(
+                composite, self.web_gui_jpeg_quality
+            )
+            jpeg_ms = (
+                time.perf_counter() - jpeg_started
+            ) * 1000.0
+            self.last_web_encode = time.monotonic()
+            last_sequence = snapshot.sequence
+            self.overlay_build_count += 1
+            if payload is not None:
+                self.jpeg_encode_count += 1
+            self.performance_window.update_latest(
+                {
+                    "overlay_build_ms": overlay_ms,
+                    "jpeg_encode_ms": jpeg_ms,
+                }
+            )
+            with self.lock:
+                self.status.update(
+                    {
+                        "overlay_build_ms": overlay_ms,
+                        "jpeg_encode_ms": jpeg_ms,
+                        "overlay_build_count": self.overlay_build_count,
+                        "jpeg_encode_count": self.jpeg_encode_count,
+                    }
+                )
+            if payload is not None and self.overlay_publisher is not None:
+                message = CompressedImage()
+                message.header = copy.deepcopy(snapshot.source.header)
+                message.format = "jpeg"
+                message.data = payload
+                self.overlay_publisher.publish(message)
 
     @staticmethod
     def _make_web_composite(
@@ -2297,22 +3300,58 @@ class LanePerceptionPipelineNode(Node):
         self.status_publisher.publish(message)
 
     def status_snapshot(self) -> Dict[str, Any]:
+        average, p95 = self.performance_window.summary()
         with self.lock:
             snapshot = copy.deepcopy(self.status)
             snapshot["capture_fps"] = self.capture_meter.value()
             snapshot["process_fps"] = self.process_meter.value()
             snapshot["path_publish_fps"] = self.path_meter.value()
             snapshot["dropped_frame_count"] = self.slot.dropped_count
+            snapshot["timing_average_ms"] = average
+            snapshot["timing_p95_ms"] = p95
             return snapshot
 
     def _log_statistics(self) -> None:
         status = self.status_snapshot()
+        average = status["timing_average_ms"]
+        p95 = status["timing_p95_ms"]
         self.get_logger().info(
             f"capture={status['capture_fps']:.1f} "
             f"process={status['process_fps']:.1f} "
             f"path={status['path_publish_fps']:.1f} "
             f"drop={status['dropped_frame_count']} "
-            f"processing_ms={status['processing_time_ms']:.1f}"
+            f"total={average['total_processing_ms']:.1f}/"
+            f"{p95['total_processing_ms']:.1f}ms "
+            f"seg={average['segmentation_ms']:.1f}/"
+            f"{p95['segmentation_ms']:.1f} "
+            f"boundary={average['boundary_extract_ms']:.1f}/"
+            f"{p95['boundary_extract_ms']:.1f} "
+            f"ipm={average['ipm_warp_ms']:.1f}/"
+            f"{p95['ipm_warp_ms']:.1f} "
+            f"corridor={average['yellow_corridor_ms']:.1f}/"
+            f"{p95['yellow_corridor_ms']:.1f} "
+            f"repair={average['boundary_repair_ms']:.1f}/"
+            f"{p95['boundary_repair_ms']:.1f} "
+            f"desc={average['fragment_descriptor_ms']:.1f}/"
+            f"{p95['fragment_descriptor_ms']:.1f} "
+            f"components={average['component_analysis_ms']:.1f}/"
+            f"{p95['component_analysis_ms']:.1f} "
+            f"merge={average['boundary_merge_ms']:.1f}/"
+            f"{p95['boundary_merge_ms']:.1f} "
+            f"vote={average['road_side_vote_ms']:.1f}/"
+            f"{p95['road_side_vote_ms']:.1f} "
+            f"dual={average['dual_planner_ms']:.1f}/"
+            f"{p95['dual_planner_ms']:.1f} "
+            f"single={average['single_planner_ms']:.1f}/"
+            f"{p95['single_planner_ms']:.1f} "
+            f"smooth={average['centerline_smooth_ms']:.1f}/"
+            f"{p95['centerline_smooth_ms']:.1f} "
+            f"pathpub={average['path_publish_ms']:.1f}/"
+            f"{p95['path_publish_ms']:.1f} "
+            f"overlay={average['overlay_build_ms']:.1f}/"
+            f"{p95['overlay_build_ms']:.1f} "
+            f"jpeg={average['jpeg_encode_ms']:.1f}/"
+            f"{p95['jpeg_encode_ms']:.1f}"
         )
 
     def destroy_node(self) -> bool:
@@ -2321,6 +3360,8 @@ class LanePerceptionPipelineNode(Node):
         self.slot.wake()
         if self.process_thread is not None:
             self.process_thread.join(timeout=2.0)
+        if self.render_thread is not None:
+            self.render_thread.join(timeout=2.0)
         self.web.stop()
         return super().destroy_node()
 
@@ -2558,10 +3599,25 @@ def run_self_tests() -> None:
         "14 perception only",
         not any(token in source_text for token in forbidden),
     )
+    local_overlay = algorithm.make_overlay(
+        result.transformed,
+        result.main_yellow,
+        result.selected_boundary,
+        algorithm.points_mask(
+            result.centerline_mask.shape, result.geometry.raw_points, 2
+        ),
+        result.centerline_mask,
+        result.geometry,
+        result.roi,
+        result.timing_ms["total_processing_ms"],
+        result.observed_ipm_boundary,
+        result.repaired_gap_mask,
+        result.candidate_curves,
+    )
     composite = LanePerceptionPipelineNode._make_web_composite(
         image,
-        result.overlay,
-        result.centerline_mask,
+        algorithm.roi_ipm.paste_color(local_overlay),
+        algorithm.roi_ipm.paste_mask(result.centerline_mask),
     )
     check(
         "15 one composite",
@@ -2690,7 +3746,12 @@ def run_self_tests() -> None:
             enhancement,
             step_px,
         )
-    aggregated_curves, aggregated_group_count = (
+    (
+        aggregated_curves,
+        aggregated_group_count,
+        _aggregate_pair_count,
+        _aggregate_polyfit_count,
+    ) = (
         BoundaryCurveAggregator.aggregate(
             fragment_curves,
             lane_yellow,
@@ -2790,7 +3851,7 @@ def run_self_tests() -> None:
             enhancement,
             step_px,
         )
-    dual_curves, _ = BoundaryCurveAggregator.aggregate(
+    dual_curves, _, _, _ = BoundaryCurveAggregator.aggregate(
         dual_curves,
         lane_yellow,
         lane_green,
@@ -2847,6 +3908,261 @@ def run_self_tests() -> None:
         and all(
             dual_samples[index + 1][0] > dual_samples[index][0]
             for index in range(len(dual_samples) - 1)
+        ),
+    )
+
+    # 28：直接裁剪 warp 必须与完整鸟瞰对应区域逐像素一致。
+    random_source = np.zeros((800, 600), dtype=np.uint8)
+    random_source[610:730:3, 120:480:7] = 255
+    full_warp = STAGE4.MaskIpmTransformer.transform(random_source, ipm)
+    cropped_warp = STAGE4.MaskIpmTransformer.transform(
+        random_source, algorithm.roi_ipm
+    )
+    check(
+        "28 cropped warp equals full crop",
+        np.array_equal(
+            cropped_warp,
+            full_warp[
+                algorithm.roi_ipm.y_offset :
+                algorithm.roi_ipm.y_offset
+                + algorithm.roi_ipm.output_height
+            ],
+        ),
+    )
+
+    # 29：局部 y 加回完整鸟瞰偏移后，米制坐标含义保持不变。
+    local_points = np.asarray(
+        [[300.0, 140.0], [300.0, 100.0], [300.0, 20.0]]
+    )
+    full_points = algorithm.roi_ipm.to_full_points(local_points)
+    local_samples = STAGE4.PathConverter.metric_samples(full_points, ipm)
+    expected_first_forward = (
+        ipm.vehicle_origin_y_px
+        - (140.0 + algorithm.roi_ipm.y_offset)
+    ) * ipm.meter_per_pixel
+    check(
+        "29 local y path conversion",
+        abs(local_samples[0][0] - expected_first_forward) < 1.0e-9,
+    )
+
+    local_shape = (
+        algorithm.roi_ipm.output_height,
+        algorithm.roi_ipm.output_width,
+    )
+    corridor_yellow = np.zeros(local_shape, dtype=np.uint8)
+    corridor_green = np.zeros(local_shape, dtype=np.uint8)
+    corridor_boundary = np.zeros(local_shape, dtype=np.uint8)
+    corridor_yellow[:, 250:351] = 255
+    corridor_green[:, :250] = 255
+    corridor_green[:, 351:] = 255
+    corridor_boundary[:, 250] = 255
+    corridor_boundary[:, 350] = 255
+    corridor_config = YellowCorridorConfig()
+    corridor_result, corridor_status = YellowCorridorPlanner.plan(
+        corridor_yellow,
+        corridor_boundary,
+        corridor_green,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    check(
+        "30 straight yellow corridor",
+        corridor_status["yellow_corridor_valid"]
+        and corridor_result.mode == "yellow_corridor_dual_edge"
+        and len(corridor_result.raw_points) >= 8,
+    )
+
+    isolated = corridor_yellow.copy()
+    isolated[30:80, 40:141] = 255
+    isolated_result, isolated_status = YellowCorridorPlanner.plan(
+        isolated,
+        corridor_boundary,
+        corridor_green,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    check(
+        "31 isolated yellow block ignored",
+        isolated_status["yellow_corridor_valid"]
+        and np.all(
+            np.abs(isolated_result.raw_points[:, 0] - 300.0) < 2.0
+        ),
+    )
+
+    two_regions = corridor_yellow.copy()
+    two_regions[:70, 410:511] = 255
+    two_result, two_status = YellowCorridorPlanner.plan(
+        two_regions,
+        corridor_boundary,
+        corridor_green,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    check(
+        "32 far second region keeps continuity",
+        two_status["yellow_corridor_valid"]
+        and np.max(two_result.raw_points[:, 0]) < 350.0,
+    )
+
+    curved_yellow = np.zeros(local_shape, dtype=np.uint8)
+    curved_green = np.zeros(local_shape, dtype=np.uint8)
+    curved_boundary = np.zeros(local_shape, dtype=np.uint8)
+    for local_y in range(local_shape[0]):
+        center = int(round(300.0 + 0.20 * (140 - local_y)))
+        left, right = center - 50, center + 50
+        curved_yellow[local_y, left : right + 1] = 255
+        curved_green[local_y, :left] = 255
+        curved_green[local_y, right + 1 :] = 255
+        curved_boundary[local_y, left] = 255
+        curved_boundary[local_y, right] = 255
+    curved_result, curved_status = YellowCorridorPlanner.plan(
+        curved_yellow,
+        curved_boundary,
+        curved_green,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    check(
+        "33 gentle curve center continuity",
+        curved_status["yellow_corridor_valid"]
+        and np.max(
+            np.abs(np.diff(curved_result.raw_points[:, 0]))
+        )
+        <= corridor_config.center_jump_max_m
+        / algorithm.roi_ipm.meter_per_pixel,
+    )
+
+    fast_hsv = np.zeros((800, 600, 3), dtype=np.uint8)
+    fast_hsv[:, :250] = (60, 220, 220)
+    fast_hsv[:, 250:351] = (30, 220, 220)
+    fast_hsv[:, 351:] = (60, 220, 220)
+    fast_image = cv2.cvtColor(fast_hsv, cv2.COLOR_HSV2BGR)
+    fast_algorithm = LaneAlgorithm(
+        threshold,
+        config,
+        geometry,
+        ipm,
+        BoundaryEnhancementConfig(),
+        YellowCorridorConfig(),
+    )
+    fast_pipeline_result = fast_algorithm.process(fast_image)
+    check(
+        "34 valid corridor skips repair",
+        fast_pipeline_result.geometry.valid
+        and fast_pipeline_result.geometry.mode
+        == "yellow_corridor_dual_edge"
+        and not fast_pipeline_result.fallback_boundary_pipeline_used
+        and len(fast_pipeline_result.geometry.final_points) >= 8
+        and fast_pipeline_result.geometry.forward_span_m >= 0.30
+        and fast_pipeline_result.counters[
+            "repair_candidate_pair_count"
+        ]
+        == 0,
+    )
+
+    disabled_corridor = YellowCorridorConfig(enable=False)
+    fallback_algorithm = LaneAlgorithm(
+        threshold,
+        config,
+        geometry,
+        ipm,
+        BoundaryEnhancementConfig(),
+        disabled_corridor,
+    )
+    fallback_result = fallback_algorithm.process(fast_image)
+    check(
+        "35 failed corridor enters fallback",
+        fallback_result.fallback_boundary_pipeline_used,
+    )
+
+    acute_yellow = np.zeros((800, 600), dtype=np.uint8)
+    acute_yellow[599:740, 350:451] = 255
+    acute_left = test_curve(350.0)
+    acute_right = test_curve(450.0)
+    acute_left.inward_sign = 1
+    acute_right.inward_sign = -1
+    acute_left.road_side = "yellow_right"
+    acute_right.road_side = "yellow_left"
+    acute_dual = ConservativeDualBoundaryPlanner.plan(
+        [acute_left, acute_right],
+        acute_yellow,
+        ipm,
+        geometry,
+        roi,
+    )
+    check(
+        "36 same vehicle side dual boundaries",
+        acute_dual is not None
+        and abs(acute_dual.measured_width_mean_px - 100.0) <= 2.0,
+    )
+
+    check(
+        "37 web off overlay count zero",
+        fast_pipeline_result.counters["overlay_build_count"] == 0
+        and fast_pipeline_result.overlay is None,
+    )
+    check(
+        "38 web off jpeg count zero",
+        fast_pipeline_result.counters["jpeg_encode_count"] == 0,
+    )
+
+    descriptor_test = ConservativeBoundaryRepair.repair(
+        fragmented_boundary(10, include_right=True),
+        lane_yellow,
+        lane_green,
+        ipm,
+        roi,
+        enhancement,
+    )
+    check(
+        "39 descriptor fitted once",
+        descriptor_test.polyfit_call_count
+        == descriptor_test.fragment_count_after_filter,
+    )
+
+    many_fragments = np.zeros((800, 600), dtype=np.uint8)
+    fragment_y = 600
+    for fragment_index in range(8):
+        cv2.line(
+            many_fragments,
+            (245, fragment_y),
+            (245, fragment_y + 10),
+            255,
+            1,
+        )
+        fragment_y += 17
+    limited_enhancement = BoundaryEnhancementConfig(
+        fragment_neighbor_check_limit=3
+    )
+    limited_pairs = ConservativeBoundaryRepair.repair(
+        many_fragments,
+        lane_yellow,
+        lane_green,
+        ipm,
+        roi,
+        limited_enhancement,
+    )
+    check(
+        "40 candidate pairs bounded",
+        limited_pairs.candidate_pair_count
+        <= limited_pairs.fragment_count_after_filter
+        * limited_enhancement.fragment_neighbor_check_limit,
+    )
+
+    local_monotonic_points = np.asarray(
+        [[300.0, 140.0], [302.0, 100.0], [305.0, 50.0], [308.0, 0.0]]
+    )
+    final_full_points = algorithm.roi_ipm.to_full_points(
+        local_monotonic_points
+    )
+    final_samples = STAGE4.PathConverter.metric_samples(
+        final_full_points, ipm
+    )
+    check(
+        "41 cropped path forward monotonic",
+        all(
+            final_samples[index + 1][0] > final_samples[index][0]
+            for index in range(len(final_samples) - 1)
         ),
     )
 
