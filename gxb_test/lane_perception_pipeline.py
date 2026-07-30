@@ -378,6 +378,7 @@ class PipelineResult:
     valid_boundary_component_count: int
     roi_y_offset: int
     yellow_corridor_status: Dict[str, Any]
+    yellow_corridor_samples: List[Dict[str, Any]]
     fallback_boundary_pipeline_used: bool
     timing_ms: Dict[str, float]
     counters: Dict[str, int]
@@ -554,6 +555,8 @@ class YellowCorridorConfig:
     min_forward_span_m: float = 0.25
     boundary_validation_radius_px: int = 5
     min_boundary_valid_ratio: float = 0.45
+    max_consecutive_invalid_samples: int = 2
+    max_small_gap_m: float = 0.10
 
     def validate(self) -> None:
         if self.sample_step_m <= 0 or self.center_jump_max_m <= 0:
@@ -566,15 +569,51 @@ class YellowCorridorConfig:
             raise ValueError("黄色通道边缘验证半径必须大于 0")
         if not (0 <= self.min_boundary_valid_ratio <= 1):
             raise ValueError("黄色通道边缘有效比例必须位于 [0, 1]")
+        if self.max_consecutive_invalid_samples < 0:
+            raise ValueError("yellow corridor invalid sample limit must be non-negative")
+        if self.max_small_gap_m < 0:
+            raise ValueError("yellow corridor small gap limit must be non-negative")
 
 
 class YellowCorridorPlanner:
-    """逐行跟踪主黄色连续区间的左右轮廓，优先生成轻量中心线。"""
+    """逐行跟踪主黄色连续区间，并为每个实际检查的采样行保留诊断结果。"""
 
+    REASONS = (
+        "accepted",
+        "reject_no_yellow_interval",
+        "reject_seed_or_continuity",
+        "reject_width_too_narrow",
+        "reject_width_too_wide",
+        "reject_center_jump",
+        "reject_left_edge_validation",
+        "reject_right_edge_validation",
+        "reject_boundary_ratio",
+        "reject_center_not_yellow",
+        "reject_out_of_roi",
+        "reject_other",
+    )
     EMPTY_STATUS: Dict[str, Any] = {
         "yellow_corridor_attempted": False,
         "yellow_corridor_valid": False,
         "yellow_corridor_valid_sample_count": 0,
+        "yellow_corridor_total_sample_count": 0,
+        "yellow_corridor_accepted_sample_count": 0,
+        "yellow_corridor_reject_no_yellow_interval_count": 0,
+        "yellow_corridor_reject_seed_or_continuity_count": 0,
+        "yellow_corridor_reject_width_too_narrow_count": 0,
+        "yellow_corridor_reject_width_too_wide_count": 0,
+        "yellow_corridor_reject_center_jump_count": 0,
+        "yellow_corridor_reject_left_edge_validation_count": 0,
+        "yellow_corridor_reject_right_edge_validation_count": 0,
+        "yellow_corridor_reject_boundary_ratio_count": 0,
+        "yellow_corridor_reject_center_not_yellow_count": 0,
+        "yellow_corridor_reject_out_of_roi_count": 0,
+        "yellow_corridor_reject_other_count": 0,
+        "yellow_corridor_first_accepted_forward_m": None,
+        "yellow_corridor_last_accepted_forward_m": None,
+        "yellow_corridor_first_rejected_forward_m": None,
+        "yellow_corridor_max_consecutive_rejected_samples": 0,
+        "yellow_corridor_termination_reason": "disabled",
         "yellow_corridor_forward_span_m": 0.0,
         "yellow_corridor_width_px_mean": 0.0,
         "yellow_corridor_width_px_std": 0.0,
@@ -612,6 +651,43 @@ class YellowCorridorPlanner:
         )
 
     @classmethod
+    def rejection_count_sum(cls, status: Dict[str, Any]) -> int:
+        return sum(
+            int(status.get(f"yellow_corridor_{reason}_count", 0))
+            for reason in cls.REASONS
+            if reason != "accepted"
+        )
+
+    @staticmethod
+    def _forward_m(y: int, ipm: Any) -> float:
+        return float(
+            (float(ipm.vehicle_origin_y_px) - float(y))
+            * float(ipm.meter_per_pixel)
+        )
+
+    @classmethod
+    def _record(
+        cls,
+        samples: List[Dict[str, Any]],
+        y: int,
+        ipm: Any,
+        reason: str,
+        left: Optional[int] = None,
+        right: Optional[int] = None,
+        center: Optional[float] = None,
+    ) -> None:
+        samples.append(
+            {
+                "y": int(y),
+                "forward_m": cls._forward_m(y, ipm),
+                "reason": reason,
+                "left": left,
+                "right": right,
+                "center": center,
+            }
+        )
+
+    @classmethod
     def plan(
         cls,
         main_yellow: np.ndarray,
@@ -621,8 +697,11 @@ class YellowCorridorPlanner:
         config: YellowCorridorConfig,
     ) -> Tuple[Any, Dict[str, Any]]:
         status = copy.deepcopy(cls.EMPTY_STATUS)
+        samples: List[Dict[str, Any]] = []
         if not config.enable:
-            return STAGE4.GeometryResult(reason="yellow_corridor_disabled"), status
+            result = STAGE4.GeometryResult(reason="yellow_corridor_disabled")
+            result.yellow_corridor_samples = samples
+            return result, status
         status["yellow_corridor_attempted"] = True
         step_px = max(2, int(round(config.sample_step_m / ipm.meter_per_pixel)))
         expected_width = ipm.expected_lane_width_px
@@ -633,54 +712,136 @@ class YellowCorridorPlanner:
         points: List[Tuple[float, float]] = []
         widths: List[float] = []
         edge_valid_count = 0
-        lost_rows = 0
+        consecutive_rejected = 0
+        max_consecutive_rejected = 0
+        termination_reason = "roi_exhausted"
+
         for y in range(main_yellow.shape[0] - 1, -1, -step_px):
-            candidates: List[Tuple[float, int, int, float]] = []
-            for left, right in cls._intervals(main_yellow[y]):
+            reason = "reject_other"
+            intervals = cls._intervals(main_yellow[y])
+            if not intervals:
+                reason = "reject_no_yellow_interval"
+
+            width_candidates: List[Tuple[int, int, float, float]] = []
+            for left, right in intervals:
                 width = float(right - left + 1)
                 if not (minimum_width <= width <= maximum_width):
                     continue
                 center = (left + right) / 2.0
                 jump = abs(center - previous_center)
+                width_candidates.append((left, right, center, jump))
+            if intervals and not width_candidates:
+                interval_widths = [
+                    float(right - left + 1) for left, right in intervals
+                ]
+                if max(interval_widths) < minimum_width:
+                    reason = "reject_width_too_narrow"
+                elif min(interval_widths) > maximum_width:
+                    reason = "reject_width_too_wide"
+
+            continuity_candidates: List[Tuple[int, int, float, float]] = []
+            for left, right, center, jump in width_candidates:
                 if points and jump > jump_limit:
                     continue
                 if not points and jump > expected_width:
                     continue
+                continuity_candidates.append((left, right, center, jump))
+            if width_candidates and not continuity_candidates:
+                reason = (
+                    "reject_center_jump"
+                    if points
+                    else "reject_seed_or_continuity"
+                )
+
+            candidates: List[
+                Tuple[float, int, int, float, bool, bool]
+            ] = []
+            center_rejected = False
+            for left, right, center, jump in continuity_candidates:
                 center_index = int(round(center))
                 if not (
                     0 <= center_index < main_yellow.shape[1]
                     and main_yellow[y, center_index] > 0
                 ):
+                    center_rejected = True
                     continue
+                left_valid = cls._edge_valid(
+                    left,
+                    y,
+                    observed_boundary,
+                    green,
+                    config.boundary_validation_radius_px,
+                )
+                right_valid = cls._edge_valid(
+                    right,
+                    y,
+                    observed_boundary,
+                    green,
+                    config.boundary_validation_radius_px,
+                )
+                width = float(right - left + 1)
                 score = jump + abs(width - expected_width) * 0.15
-                candidates.append((score, left, right, center))
-            if not candidates:
-                lost_rows += 1
-                if points and lost_rows > 1:
-                    break
+                candidates.append(
+                    (score, left, right, center, left_valid, right_valid)
+                )
+            if continuity_candidates and not candidates and center_rejected:
+                reason = "reject_center_not_yellow"
+
+            accepted_candidates = [
+                item for item in candidates if item[4] and item[5]
+            ]
+            if candidates and not accepted_candidates:
+                best = min(candidates, key=lambda item: item[0])
+                reason = (
+                    "reject_left_edge_validation"
+                    if not best[4]
+                    else "reject_right_edge_validation"
+                )
+            if accepted_candidates:
+                _score, left, right, center, _left_ok, _right_ok = min(
+                    accepted_candidates, key=lambda item: item[0]
+                )
+                reason = "accepted"
+
+            if reason != "accepted":
+                rejected_center = (
+                    min(candidates, key=lambda item: item[0])[3]
+                    if candidates
+                    else previous_center
+                )
+                cls._record(
+                    samples,
+                    y,
+                    ipm,
+                    reason,
+                    center=float(rejected_center),
+                )
+                consecutive_rejected += 1
+                max_consecutive_rejected = max(
+                    max_consecutive_rejected, consecutive_rejected
+                )
+                if points:
+                    missing_gap_m = (
+                        consecutive_rejected * config.sample_step_m
+                    )
+                    if (
+                        consecutive_rejected
+                        > config.max_consecutive_invalid_samples
+                    ):
+                        termination_reason = "consecutive_invalid_limit"
+                        break
+                    if missing_gap_m > config.max_small_gap_m + 1.0e-9:
+                        termination_reason = "small_gap_limit"
+                        break
                 continue
-            lost_rows = 0
-            _score, left, right, center = min(
-                candidates, key=lambda item: item[0]
-            )
-            left_valid = cls._edge_valid(
-                left,
-                y,
-                observed_boundary,
-                green,
-                config.boundary_validation_radius_px,
-            )
-            right_valid = cls._edge_valid(
-                right,
-                y,
-                observed_boundary,
-                green,
-                config.boundary_validation_radius_px,
-            )
-            edge_valid_count += int(left_valid and right_valid)
+
+            consecutive_rejected = 0
+            edge_valid_count += 1
             points.append((center, float(y)))
             widths.append(float(right - left + 1))
             previous_center = center
+            cls._record(samples, y, ipm, reason, left, right, center)
+
         raw = np.asarray(points, dtype=np.float64).reshape(-1, 2)
         span = (
             float(raw[0, 1] - raw[-1, 1]) * ipm.meter_per_pixel
@@ -688,9 +849,45 @@ class YellowCorridorPlanner:
             else 0.0
         )
         boundary_ratio = edge_valid_count / max(1, len(raw))
+        reason_counts = {
+            reason: sum(sample["reason"] == reason for sample in samples)
+            for reason in cls.REASONS
+        }
+        accepted_forwards = [
+            sample["forward_m"]
+            for sample in samples
+            if sample["reason"] == "accepted"
+        ]
+        rejected_forwards = [
+            sample["forward_m"]
+            for sample in samples
+            if sample["reason"] != "accepted"
+        ]
         status.update(
             {
                 "yellow_corridor_valid_sample_count": len(raw),
+                "yellow_corridor_total_sample_count": len(samples),
+                "yellow_corridor_accepted_sample_count": reason_counts[
+                    "accepted"
+                ],
+                **{
+                    f"yellow_corridor_{reason}_count": count
+                    for reason, count in reason_counts.items()
+                    if reason != "accepted"
+                },
+                "yellow_corridor_first_accepted_forward_m": (
+                    accepted_forwards[0] if accepted_forwards else None
+                ),
+                "yellow_corridor_last_accepted_forward_m": (
+                    accepted_forwards[-1] if accepted_forwards else None
+                ),
+                "yellow_corridor_first_rejected_forward_m": (
+                    rejected_forwards[0] if rejected_forwards else None
+                ),
+                "yellow_corridor_max_consecutive_rejected_samples": (
+                    max_consecutive_rejected
+                ),
+                "yellow_corridor_termination_reason": termination_reason,
                 "yellow_corridor_forward_span_m": span,
                 "yellow_corridor_width_px_mean": float(
                     np.mean(widths) if widths else 0.0
@@ -726,6 +923,7 @@ class YellowCorridorPlanner:
             ),
             raw_points=raw,
         )
+        result.yellow_corridor_samples = samples
         return result, status
 
 
@@ -1920,6 +2118,7 @@ class LaneAlgorithm:
             corridor_result = STAGE4.GeometryResult(
                 reason="main_yellow_missing"
             )
+            corridor_result.yellow_corridor_samples = []
             corridor_status = copy.deepcopy(
                 YellowCorridorPlanner.EMPTY_STATUS
             )
@@ -2144,9 +2343,15 @@ class LaneAlgorithm:
         selected = np.zeros(shape, dtype=np.uint8)
         centerline = np.zeros(shape, dtype=np.uint8)
         road_curves = result.selected_curves or curves
-        road_side_status = GlobalRoadSideClassifier.representative_status(
-            road_curves
-        )
+        if result.mode == "yellow_corridor_dual_edge":
+            road_side_status = {
+                key: "N/A"
+                for key in GlobalRoadSideClassifier.EMPTY_STATUS
+            }
+        else:
+            road_side_status = GlobalRoadSideClassifier.representative_status(
+                road_curves
+            )
         timing["total_processing_ms"] = (
             time.perf_counter() - total_started
         ) * 1000.0
@@ -2181,6 +2386,9 @@ class LaneAlgorithm:
             valid_boundary_component_count=len(curves),
             roi_y_offset=self.roi_ipm.y_offset,
             yellow_corridor_status=corridor_status,
+            yellow_corridor_samples=list(
+                getattr(corridor_result, "yellow_corridor_samples", [])
+            ),
             fallback_boundary_pipeline_used=fallback_used,
             timing_ms=timing,
             counters=counters,
@@ -2199,6 +2407,8 @@ class LaneAlgorithm:
         observed_boundary: Optional[np.ndarray] = None,
         repaired_gap_mask: Optional[np.ndarray] = None,
         diagnostic_curves: Optional[Sequence[Any]] = None,
+        corridor_samples: Optional[Sequence[Dict[str, Any]]] = None,
+        corridor_status: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         height, width = main_yellow.shape
         overlay = np.zeros((height, width, 3), dtype=np.uint8)
@@ -2239,6 +2449,71 @@ class LaneAlgorithm:
         cv2.rectangle(
             overlay, (0, roi[0]), (width - 1, roi[1]), (255, 255, 255), 1
         )
+        reject_colors = {
+            "reject_no_yellow_interval": (125, 125, 125),
+            "reject_width_too_narrow": (0, 140, 255),
+            "reject_width_too_wide": (0, 140, 255),
+            "reject_center_jump": (0, 0, 255),
+            "reject_seed_or_continuity": (0, 0, 255),
+            "reject_left_edge_validation": (255, 255, 0),
+            "reject_right_edge_validation": (255, 255, 0),
+            "reject_boundary_ratio": (255, 255, 0),
+            "reject_center_not_yellow": (180, 0, 180),
+        }
+        for sample in corridor_samples or ():
+            y = int(sample["y"])
+            center = int(
+                round(
+                    sample["center"]
+                    if sample.get("center") is not None
+                    else center_x
+                )
+            )
+            if sample["reason"] == "accepted":
+                cv2.circle(
+                    overlay, (int(sample["left"]), y), 3, (255, 0, 0), -1
+                )
+                cv2.circle(
+                    overlay, (int(sample["right"]), y), 3, (255, 0, 255), -1
+                )
+                cv2.circle(overlay, (center, y), 3, (0, 255, 255), -1)
+            else:
+                color = reject_colors.get(sample["reason"], (160, 160, 160))
+                cv2.drawMarker(
+                    overlay,
+                    (int(np.clip(center, 0, width - 1)), y),
+                    color,
+                    cv2.MARKER_TILTED_CROSS,
+                    7,
+                    1,
+                    cv2.LINE_AA,
+                )
+        near_forward = (
+            self.roi_ipm.vehicle_origin_y_px - float(roi[1])
+        ) * self.roi_ipm.meter_per_pixel
+        far_forward = (
+            self.roi_ipm.vehicle_origin_y_px - float(roi[0])
+        ) * self.roi_ipm.meter_per_pixel
+        cv2.putText(
+            overlay,
+            f"FAR {far_forward:.2f}m",
+            (width - 112, 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            f"NEAR {near_forward:.2f}m",
+            (width - 120, height - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
         display_curves = (
             result.selected_curves
             if result.selected_curves
@@ -2269,23 +2544,27 @@ class LaneAlgorithm:
         vote_status = GlobalRoadSideClassifier.representative_status(
             display_curves
         )
+        fast_mode = result.mode == "yellow_corridor_dual_edge"
+        sample_summary = corridor_status or {}
         lines = (
             f"mode={result.mode}",
             f"valid={result.valid} confidence={result.confidence:.2f}",
             f"points={len(result.final_points)} span={result.forward_span_m:.2f}m",
             (
-                "side_votes="
-                f"+{vote_status['road_side_positive_vote_count']}/"
-                f"-{vote_status['road_side_negative_vote_count']} "
-                f"ratio={vote_status['road_side_global_vote_ratio']:.2f}"
+                "samples="
+                f"{sample_summary.get('yellow_corridor_accepted_sample_count', 0)}/"
+                f"{sample_summary.get('yellow_corridor_total_sample_count', 0)} "
+                f"term={sample_summary.get('yellow_corridor_termination_reason', 'N/A')}"
             ),
             (
-                "Y(+/-)="
-                f"{vote_status['road_side_positive_yellow_ratio']:.2f}/"
-                f"{vote_status['road_side_negative_yellow_ratio']:.2f} "
-                "G(+/-)="
-                f"{vote_status['road_side_positive_green_ratio']:.2f}/"
-                f"{vote_status['road_side_negative_green_ratio']:.2f}"
+                "side_votes=N/A Y/G=N/A"
+                if fast_mode
+                else (
+                    "side_votes="
+                    f"+{vote_status['road_side_positive_vote_count']}/"
+                    f"-{vote_status['road_side_negative_vote_count']} "
+                    f"ratio={vote_status['road_side_global_vote_ratio']:.2f}"
+                )
             ),
             f"time={processing_ms:.1f}ms",
         )
@@ -2356,14 +2635,31 @@ img{display:block;width:100%;height:auto;background:#05080c}
 .item{background:#111a26;padding:8px;border-radius:5px}.good{color:#6fe29b}.bad{color:#ff6b6b}
 @media(max-width:760px){.stats{grid-template-columns:1fr 1fr}}</style></head>
 <body><header><h1>一体化车道感知（gxb_lane_pipeline_v1）</h1>
-<div>综合图从左到右：相机缩略图、鸟瞰 Overlay、最终中心线。</div></header>
+<div>左侧为相机缩略图；右侧放大显示有效 planning ROI、局部中心线与采样诊断。</div></header>
 <main class="page"><section class="panel"><img src="/stream/overlay">
 <div class="stats" id="stats"></div></section></main><script>
 const fields=["centerline_mode","centerline_valid","centerline_confidence",
 "capture_fps","process_fps","path_publish_fps","end_to_end_ms",
 "dropped_frame_count","processing_time_ms",
-"yellow_corridor_valid","yellow_corridor_valid_sample_count",
+"yellow_corridor_valid","yellow_corridor_accepted_sample_count",
+"yellow_corridor_total_sample_count",
 "yellow_corridor_forward_span_m","yellow_corridor_boundary_valid_ratio",
+"yellow_corridor_width_px_mean","yellow_corridor_width_px_std",
+"yellow_corridor_reject_no_yellow_interval_count",
+"yellow_corridor_reject_seed_or_continuity_count",
+"yellow_corridor_reject_width_too_narrow_count",
+"yellow_corridor_reject_width_too_wide_count",
+"yellow_corridor_reject_center_jump_count",
+"yellow_corridor_reject_left_edge_validation_count",
+"yellow_corridor_reject_right_edge_validation_count",
+"yellow_corridor_reject_boundary_ratio_count",
+"yellow_corridor_reject_center_not_yellow_count",
+"yellow_corridor_reject_other_count",
+"yellow_corridor_first_accepted_forward_m",
+"yellow_corridor_last_accepted_forward_m",
+"yellow_corridor_first_rejected_forward_m",
+"yellow_corridor_max_consecutive_rejected_samples",
+"yellow_corridor_termination_reason",
 "yellow_corridor_reason","fallback_boundary_pipeline_used",
 "observed_boundary_component_count","repaired_boundary_component_count",
 "merged_boundary_group_count","repaired_gap_count","repaired_gap_max_px",
@@ -2685,6 +2981,8 @@ class LanePerceptionPipelineNode(Node):
             "yellow_corridor_min_forward_span_m": 0.25,
             "yellow_corridor_boundary_validation_radius_px": 5,
             "yellow_corridor_min_boundary_valid_ratio": 0.45,
+            "yellow_corridor_max_consecutive_invalid_samples": 2,
+            "yellow_corridor_max_small_gap_m": 0.10,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -2821,6 +3119,16 @@ class LanePerceptionPipelineNode(Node):
             min_boundary_valid_ratio=float(
                 self.get_parameter(
                     "yellow_corridor_min_boundary_valid_ratio"
+                ).value
+            ),
+            max_consecutive_invalid_samples=int(
+                self.get_parameter(
+                    "yellow_corridor_max_consecutive_invalid_samples"
+                ).value
+            ),
+            max_small_gap_m=float(
+                self.get_parameter(
+                    "yellow_corridor_max_small_gap_m"
                 ).value
             ),
         )
@@ -3175,15 +3483,14 @@ class LanePerceptionPipelineNode(Node):
                 result.observed_ipm_boundary,
                 result.repaired_gap_mask,
                 result.candidate_curves,
-            )
-            full_overlay = self.algorithm.roi_ipm.paste_color(
-                local_overlay
-            )
-            full_centerline = self.algorithm.roi_ipm.paste_mask(
-                centerline_mask
+                result.yellow_corridor_samples,
+                result.yellow_corridor_status,
             )
             composite = self._make_web_composite(
-                snapshot.raw, full_overlay, full_centerline
+                snapshot.raw,
+                local_overlay,
+                centerline_mask,
+                self._corridor_status_lines(result),
             )
             overlay_ms = (
                 time.perf_counter() - overlay_started
@@ -3223,44 +3530,122 @@ class LanePerceptionPipelineNode(Node):
                 self.overlay_publisher.publish(message)
 
     @staticmethod
+    def _format_optional_m(value: Any) -> str:
+        return "N/A" if value is None else f"{float(value):.2f}m"
+
+    @classmethod
+    def _corridor_status_lines(
+        cls, result: PipelineResult
+    ) -> List[str]:
+        status = result.yellow_corridor_status
+        return [
+            (
+                "samples="
+                f"{status.get('yellow_corridor_accepted_sample_count', 0)}/"
+                f"{status.get('yellow_corridor_total_sample_count', 0)} "
+                f"span={status.get('yellow_corridor_forward_span_m', 0.0):.2f}m"
+            ),
+            (
+                "width="
+                f"{status.get('yellow_corridor_width_px_mean', 0.0):.1f}"
+                f"+/-{status.get('yellow_corridor_width_px_std', 0.0):.1f}px "
+                "boundary="
+                f"{status.get('yellow_corridor_boundary_valid_ratio', 0.0):.2f}"
+            ),
+            (
+                "reject noY/seed/narrow/wide/jump="
+                f"{status.get('yellow_corridor_reject_no_yellow_interval_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_seed_or_continuity_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_width_too_narrow_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_width_too_wide_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_center_jump_count', 0)}"
+            ),
+            (
+                "reject edgeL/edgeR/boundary/center/other="
+                f"{status.get('yellow_corridor_reject_left_edge_validation_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_right_edge_validation_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_boundary_ratio_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_center_not_yellow_count', 0)}/"
+                f"{status.get('yellow_corridor_reject_other_count', 0)}"
+            ),
+            (
+                "accepted first/last="
+                f"{cls._format_optional_m(status.get('yellow_corridor_first_accepted_forward_m'))}/"
+                f"{cls._format_optional_m(status.get('yellow_corridor_last_accepted_forward_m'))} "
+                "first reject="
+                f"{cls._format_optional_m(status.get('yellow_corridor_first_rejected_forward_m'))}"
+            ),
+            (
+                "max consecutive reject="
+                f"{status.get('yellow_corridor_max_consecutive_rejected_samples', 0)} "
+                "termination="
+                f"{status.get('yellow_corridor_termination_reason', 'N/A')}"
+            ),
+            (
+                "side_votes=N/A yellow/green=N/A"
+                if result.geometry.mode == "yellow_corridor_dual_edge"
+                else "side_votes and yellow/green ratios: see status API"
+            ),
+        ]
+
+    @staticmethod
     def _make_web_composite(
-        raw: np.ndarray, overlay: np.ndarray, centerline: np.ndarray
+        raw: np.ndarray,
+        overlay: np.ndarray,
+        centerline: np.ndarray,
+        status_lines: Optional[Sequence[str]] = None,
     ) -> np.ndarray:
-        panel_height = max(360, overlay.shape[0])
-        raw_width = max(
-            1, int(round(raw.shape[1] * panel_height / raw.shape[0]))
+        canvas_height, canvas_width = 600, 1200
+        left_width, right_x, right_width = 350, 370, 810
+        composite = np.full(
+            (canvas_height, canvas_width, 3), (16, 22, 31), dtype=np.uint8
         )
-        overlay_width = max(
-            1,
-            int(round(overlay.shape[1] * panel_height / overlay.shape[0])),
+        camera_height = min(
+            420, int(round(raw.shape[0] * left_width / raw.shape[1]))
         )
-        raw_panel = cv2.resize(
-            raw, (raw_width, panel_height), interpolation=cv2.INTER_AREA
+        camera_panel = cv2.resize(
+            raw, (left_width, camera_height), interpolation=cv2.INTER_AREA
+        )
+        composite[40 : 40 + camera_height, 10 : 10 + left_width] = camera_panel
+
+        roi_height = max(
+            1, int(round(overlay.shape[0] * right_width / overlay.shape[1]))
         )
         overlay_panel = cv2.resize(
-            overlay,
-            (overlay_width, panel_height),
-            interpolation=cv2.INTER_AREA,
+            overlay, (right_width, roi_height), interpolation=cv2.INTER_NEAREST
         )
-        center_bgr = cv2.cvtColor(centerline, cv2.COLOR_GRAY2BGR)
+        overlay_y = 35
+        composite[
+            overlay_y : overlay_y + roi_height,
+            right_x : right_x + right_width,
+        ] = overlay_panel
+
+        center_bgr = np.zeros_like(overlay)
+        center_bgr[:] = (overlay.astype(np.uint16) // 5).astype(np.uint8)
+        center_bgr[centerline > 0] = (0, 0, 255)
         center_panel = cv2.resize(
             center_bgr,
-            (overlay_width, panel_height),
+            (right_width, roi_height),
             interpolation=cv2.INTER_NEAREST,
         )
-        composite = np.hstack((raw_panel, overlay_panel, center_panel))
+        center_y = overlay_y + roi_height + 42
+        composite[
+            center_y : center_y + roi_height,
+            right_x : right_x + right_width,
+        ] = center_panel
+
         labels = (
-            ("CAMERA", 8),
-            ("BIRDVIEW OVERLAY", raw_width + 8),
-            ("FINAL CENTERLINE", raw_width + overlay_width + 8),
+            ("CAMERA THUMBNAIL", 10, 26),
+            ("PLANNING ROI OVERLAY", right_x, 24),
+            ("FINAL CENTERLINE (LOCAL ROI)", right_x, center_y - 10),
         )
-        for text, x in labels:
+        for text, x, y in labels:
             cv2.putText(
                 composite,
                 text,
-                (x, 26),
+                (x, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.58,
                 (0, 0, 0),
                 4,
                 cv2.LINE_AA,
@@ -3268,10 +3653,42 @@ class LanePerceptionPipelineNode(Node):
             cv2.putText(
                 composite,
                 text,
-                (x, 26),
+                (x, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.58,
                 (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        legend = (
+            "accepted: left BLUE / right MAGENTA",
+            "accepted center: YELLOW / final: RED",
+            "reject: gray noY, orange width",
+            "red jump, cyan edge, purple center",
+        )
+        for index, text in enumerate(legend):
+            cv2.putText(
+                composite,
+                text,
+                (14, 475 + index * 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.43,
+                (205, 215, 225),
+                1,
+                cv2.LINE_AA,
+            )
+        status_y = center_y + roi_height + 24
+        for index, text in enumerate(status_lines or ()):
+            y = status_y + index * 17
+            if y >= canvas_height - 5:
+                break
+            cv2.putText(
+                composite,
+                text,
+                (right_x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (225, 232, 240),
                 1,
                 cv2.LINE_AA,
             )
@@ -3613,11 +4030,13 @@ def run_self_tests() -> None:
         result.observed_ipm_boundary,
         result.repaired_gap_mask,
         result.candidate_curves,
+        result.yellow_corridor_samples,
+        result.yellow_corridor_status,
     )
     composite = LanePerceptionPipelineNode._make_web_composite(
         image,
-        algorithm.roi_ipm.paste_color(local_overlay),
-        algorithm.roi_ipm.paste_mask(result.centerline_mask),
+        local_overlay,
+        result.centerline_mask,
     )
     check(
         "15 one composite",
@@ -4161,6 +4580,154 @@ def run_self_tests() -> None:
     check(
         "41 cropped path forward monotonic",
         all(
+            final_samples[index + 1][0] > final_samples[index][0]
+            for index in range(len(final_samples) - 1)
+        ),
+    )
+
+    # 42-53：黄色走廊逐行诊断、保守短缺口恢复与紧凑 Web 布局。
+    classified_reasons = {
+        sample["reason"]
+        for sample in corridor_result.yellow_corridor_samples
+    }
+    check(
+        "42 every corridor row classified",
+        len(corridor_result.yellow_corridor_samples)
+        == corridor_status["yellow_corridor_total_sample_count"]
+        and classified_reasons.issubset(set(YellowCorridorPlanner.REASONS)),
+    )
+    check(
+        "43 corridor reason counts sum",
+        corridor_status["yellow_corridor_accepted_sample_count"]
+        + YellowCorridorPlanner.rejection_count_sum(corridor_status)
+        == corridor_status["yellow_corridor_total_sample_count"],
+    )
+
+    def corridor_with_missing_rows(
+        missing_rows: Sequence[int],
+        recovered_center_x: int = 300,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        yellow_mask = corridor_yellow.copy()
+        green_mask = corridor_green.copy()
+        boundary_mask = corridor_boundary.copy()
+        for sample_y in missing_rows:
+            yellow_mask[sample_y, :] = 0
+        if recovered_center_x != 300 and missing_rows:
+            farthest_missing = min(missing_rows)
+            left = recovered_center_x - 50
+            right = recovered_center_x + 50
+            yellow_mask[:farthest_missing, :] = 0
+            green_mask[:farthest_missing, :] = 0
+            boundary_mask[:farthest_missing, :] = 0
+            yellow_mask[:farthest_missing, left : right + 1] = 255
+            green_mask[:farthest_missing, :left] = 255
+            green_mask[:farthest_missing, right + 1 :] = 255
+            boundary_mask[:farthest_missing, left] = 255
+            boundary_mask[:farthest_missing, right] = 255
+        return yellow_mask, boundary_mask, green_mask
+
+    one_gap_masks = corridor_with_missing_rows([110])
+    one_gap_result, one_gap_status = YellowCorridorPlanner.plan(
+        *one_gap_masks, algorithm.roi_ipm, corridor_config
+    )
+    check(
+        "44 one invalid row recovers",
+        one_gap_status["yellow_corridor_valid"]
+        and one_gap_status[
+            "yellow_corridor_reject_no_yellow_interval_count"
+        ]
+        == 1
+        and np.any(one_gap_result.raw_points[:, 1] < 110),
+    )
+
+    two_gap_masks = corridor_with_missing_rows([110, 100])
+    two_gap_result, two_gap_status = YellowCorridorPlanner.plan(
+        *two_gap_masks, algorithm.roi_ipm, corridor_config
+    )
+    check(
+        "45 two invalid rows recover",
+        two_gap_status["yellow_corridor_valid"]
+        and two_gap_status[
+            "yellow_corridor_max_consecutive_rejected_samples"
+        ]
+        == 2
+        and np.any(two_gap_result.raw_points[:, 1] < 100),
+    )
+
+    three_gap_masks = corridor_with_missing_rows([110, 100, 90])
+    three_gap_result, three_gap_status = YellowCorridorPlanner.plan(
+        *three_gap_masks, algorithm.roi_ipm, corridor_config
+    )
+    check(
+        "46 excessive invalid rows terminate",
+        three_gap_status["yellow_corridor_termination_reason"]
+        == "consecutive_invalid_limit"
+        and not np.any(three_gap_result.raw_points[:, 1] < 90),
+    )
+
+    distance_limited_config = copy.deepcopy(corridor_config)
+    distance_limited_config.max_consecutive_invalid_samples = 4
+    distance_limited_result, distance_limited_status = (
+        YellowCorridorPlanner.plan(
+            *three_gap_masks,
+            algorithm.roi_ipm,
+            distance_limited_config,
+        )
+    )
+    check(
+        "47 gap over point one meter not interpolated",
+        distance_limited_status["yellow_corridor_termination_reason"]
+        == "small_gap_limit"
+        and not np.any(distance_limited_result.raw_points[:, 1] < 90),
+    )
+
+    recovered_masks = corridor_with_missing_rows([110], 320)
+    recovered_result, recovered_status = YellowCorridorPlanner.plan(
+        *recovered_masks, algorithm.roi_ipm, corridor_config
+    )
+    check(
+        "48 recovered center obeys continuity",
+        recovered_status["yellow_corridor_valid"]
+        and np.max(np.abs(np.diff(recovered_result.raw_points[:, 0])))
+        <= corridor_config.center_jump_max_m
+        / algorithm.roi_ipm.meter_per_pixel,
+    )
+
+    check(
+        "49 multiple intervals prefer previous center",
+        two_status["yellow_corridor_valid"]
+        and np.max(two_result.raw_points[:, 0]) < 350.0,
+    )
+    check(
+        "50 fast mode road side is N/A",
+        fast_pipeline_result.geometry.mode == "yellow_corridor_dual_edge"
+        and all(
+            value == "N/A"
+            for value in fast_pipeline_result.road_side_status.values()
+        ),
+    )
+
+    compact_composite = LanePerceptionPipelineNode._make_web_composite(
+        image,
+        local_overlay,
+        result.centerline_mask,
+        ["samples=6/9", "termination=roi_exhausted"],
+    )
+    check(
+        "51 web composite uses compact local ROI",
+        compact_composite.shape == (600, 1200, 3)
+        and np.any(compact_composite[35:226, 370:1180] != 0),
+    )
+    check(
+        "52 web off still skips overlay",
+        fast_pipeline_result.overlay is None
+        and fast_pipeline_result.counters["overlay_build_count"] == 0
+        and fast_pipeline_result.timing_ms["overlay_build_ms"] == 0.0,
+    )
+    check(
+        "53 final path forward monotonic",
+        len(final_samples) > 1
+        and all(
             final_samples[index + 1][0] > final_samples[index][0]
             for index in range(len(final_samples) - 1)
         ),
