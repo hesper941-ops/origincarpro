@@ -108,6 +108,38 @@ def finite_float(value: Any, default: float = 0.0) -> float:
     return result if math.isfinite(result) else default
 
 
+def to_json_safe(value: Any) -> Any:
+    """Recursively convert NumPy values into strict JSON-compatible values."""
+    if isinstance(value, np.generic):
+        return to_json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return [to_json_safe(item) for item in value.tolist()]
+    if isinstance(value, dict):
+        return {
+            str(key): to_json_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [to_json_safe(item) for item in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    raise TypeError(
+        f"unsupported JSON value type: {type(value).__name__}"
+    )
+
+
+def serialize_json(value: Any) -> str:
+    """The single strict JSON serialization boundary used by this file."""
+    return json.dumps(
+        to_json_safe(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def normalize_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
@@ -338,12 +370,16 @@ def interpolate_y_at_forward(
     if len(values) == 0:
         raise ValueError("empty path")
     if target_x <= values[0, 0]:
-        return float(values[0, 0]), float(values[0, 1]), target_x < values[0, 0]
+        return (
+            float(values[0, 0]),
+            float(values[0, 1]),
+            bool(target_x < values[0, 0]),
+        )
     if target_x >= values[-1, 0]:
         return (
             float(values[-1, 0]),
             float(values[-1, 1]),
-            target_x > values[-1, 0],
+            bool(target_x > values[-1, 0]),
         )
     upper = int(np.searchsorted(values[:, 0], target_x, side="left"))
     lower = max(0, upper - 1)
@@ -414,21 +450,26 @@ def validate_path(
         if len(values) < config.min_path_points:
             analysis.reason = "path_too_few_points"
             return analysis
-        if not np.all(np.isfinite(values)):
+        if not bool(np.all(np.isfinite(values))):
             analysis.reason = "path_non_finite"
             return analysis
         delta_x = np.diff(values[:, 0])
-        if np.any(delta_x <= 0.0):
+        if bool(np.any(delta_x <= 0.0)):
             analysis.reason = "path_forward_not_monotonic"
             return analysis
-        if not np.any(values[:, 0] > 0.0):
+        if not bool(np.any(values[:, 0] > 0.0)):
             analysis.reason = "path_no_positive_forward_point"
             return analysis
         analysis.span_m = float(values[-1, 0] - values[0, 0])
         if analysis.span_m < config.min_path_span_m:
             analysis.reason = "path_span_too_short"
             return analysis
-        if np.any(np.abs(np.diff(values[:, 1])) > config.max_point_lateral_jump_m):
+        if bool(
+            np.any(
+                np.abs(np.diff(values[:, 1]))
+                > config.max_point_lateral_jump_m
+            )
+        ):
             analysis.reason = "path_lateral_jump"
             return analysis
 
@@ -550,23 +591,23 @@ def compute_preview_command(
     )
     preview = ControllerPreview(
         timestamp=datetime.now(timezone.utc).isoformat(),
-        controller_ready=not reason,
+        controller_ready=bool(not reason),
         control_block_reason=reason,
-        degraded_mode=degraded,
-        path_received=path_age_sec >= 0.0,
-        status_received=perception.received,
+        degraded_mode=bool(degraded),
+        path_received=bool(path_age_sec >= 0.0),
+        status_received=bool(perception.received),
         path_frame_id=analysis.frame_id,
         path_point_count=analysis.point_count,
         path_span_m=analysis.span_m,
         path_age_ms=path_age_sec * 1000.0 if path_age_sec >= 0.0 else -1.0,
         status_age_ms=status_age_sec * 1000.0 if status_age_sec >= 0.0 else -1.0,
-        centerline_valid=perception.centerline_valid,
+        centerline_valid=bool(perception.centerline_valid),
         centerline_mode=perception.centerline_mode,
         centerline_confidence=perception.centerline_confidence,
-        fallback_boundary_pipeline_used=(
+        fallback_boundary_pipeline_used=bool(
             perception.fallback_boundary_pipeline_used
         ),
-        green_boundary_fast_path_used=(
+        green_boundary_fast_path_used=bool(
             perception.green_boundary_fast_path_used
         ),
         processing_time_ms=perception.processing_time_ms,
@@ -576,12 +617,12 @@ def compute_preview_command(
         near_error_distance_m=analysis.near_error_distance_m,
         lateral_error_m=analysis.lateral_error_m,
         lateral_error_abs_m=abs(analysis.lateral_error_m),
-        near_error_clamped=analysis.near_error_clamped,
+        near_error_clamped=bool(analysis.near_error_clamped),
         lookahead_distance_m=analysis.lookahead_distance_m,
         lookahead_target_x_m=analysis.lookahead_target_x_m,
         lookahead_target_y_m=analysis.lookahead_target_y_m,
         lookahead_target_distance_m=analysis.lookahead_target_distance_m,
-        lookahead_clamped=analysis.lookahead_clamped,
+        lookahead_clamped=bool(analysis.lookahead_clamped),
         heading_fit_point_count=analysis.heading_fit_point_count,
         heading_slope=analysis.heading_slope,
         heading_error_rad=analysis.heading_error_rad,
@@ -703,6 +744,7 @@ class LanePathControllerNode(Node):
         self.preview = ControllerPreview()
         self.path_rate = RateMeter()
         self.last_log_monotonic = 0.0
+        self.last_exception_log_monotonic = 0.0
         qos = make_observation_qos()
         self.path_subscription = self.create_subscription(
             RosPath,
@@ -786,15 +828,16 @@ class LanePathControllerNode(Node):
         )
 
     def _publish_observation(self) -> None:
+        try:
+            self._publish_observation_impl()
+        except Exception as exc:
+            self._handle_observation_exception(exc)
+
+    def _publish_observation_impl(self) -> None:
         now = time.monotonic()
         self._refresh_preview(now)
         message = String()
-        message.data = json.dumps(
-            self.preview.to_dict(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
+        message.data = serialize_json(self.preview.to_dict())
         self.controller_status_publisher.publish(message)
         if now - self.last_log_monotonic >= 1.0 / self.config.log_rate_hz:
             self.last_log_monotonic = now
@@ -818,6 +861,40 @@ class LanePathControllerNode(Node):
                     f"path_age={self.preview.path_age_ms:.0f}ms "
                     f"status_age={self.preview.status_age_ms:.0f}ms"
                 )
+
+    def _handle_observation_exception(self, exc: Exception) -> None:
+        """Contain one failed timer cycle; never rethrow into the executor."""
+        now = time.monotonic()
+        self.preview = ControllerPreview(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            controller_ready=False,
+            control_block_reason="controller_exception",
+            degraded_mode=False,
+            suggested_linear_x=0.0,
+            suggested_angular_z_raw=0.0,
+            suggested_angular_z=0.0,
+            controller_confidence=0.0,
+        )
+        # This minimal fault status contains Python-native values only. Even its
+        # construction, conversion, or publication is isolated from the timer.
+        try:
+            message = String()
+            message.data = serialize_json(self.preview.to_dict())
+            self.controller_status_publisher.publish(message)
+        except Exception:
+            pass
+        try:
+            if (
+                now - self.last_exception_log_monotonic
+                >= 1.0 / self.config.log_rate_hz
+            ):
+                self.last_exception_log_monotonic = now
+                self.get_logger().error(
+                    "controller observation exception: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        except Exception:
+            pass
 
 
 def _healthy_perception(
@@ -1049,7 +1126,7 @@ def run_self_test() -> None:
         preview = compute_preview_command(
             result, _healthy_perception(), config, 0.01, 0.01
         )
-        packed = json.dumps(preview.to_dict(), allow_nan=False)
+        packed = serialize_json(preview.to_dict())
         assert json.loads(packed)["controller_ready"]
 
     @test("25 compatible best effort QoS")
@@ -1127,6 +1204,141 @@ def run_self_test() -> None:
             0.01,
         )
         assert preview.control_block_reason == "centerline_mode_not_allowed"
+
+    @test("35 numpy true becomes JSON true")
+    def _() -> None:
+        packed = serialize_json({"value": np.bool_(True)})
+        assert json.loads(packed)["value"] is True
+
+    @test("36 numpy false becomes JSON false")
+    def _() -> None:
+        packed = serialize_json({"value": np.bool_(False)})
+        assert json.loads(packed)["value"] is False
+
+    @test("37 numpy integers become integers")
+    def _() -> None:
+        packed = serialize_json(
+            {"small": np.int32(7), "large": np.int64(9)}
+        )
+        assert json.loads(packed) == {"small": 7, "large": 9}
+
+    @test("38 numpy floats become numbers")
+    def _() -> None:
+        packed = serialize_json(
+            {"single": np.float32(1.25), "double": np.float64(2.5)}
+        )
+        document = json.loads(packed)
+        assert abs(document["single"] - 1.25) < 1.0e-6
+        assert abs(document["double"] - 2.5) < 1.0e-12
+
+    @test("39 ndarray recursively becomes list")
+    def _() -> None:
+        document = json.loads(
+            serialize_json(np.array([[1, 2], [3, 4]], dtype=np.int32))
+        )
+        assert document == [[1, 2], [3, 4]]
+
+    @test("40 nested numpy values are safe")
+    def _() -> None:
+        value = {
+            5: [
+                np.bool_(True),
+                {"count": np.int64(3), "ratio": np.float32(0.5)},
+            ]
+        }
+        document = json.loads(serialize_json(value))
+        assert document == {
+            "5": [True, {"count": 3, "ratio": 0.5}]
+        }
+
+    @test("41 nonfinite floats become null")
+    def _() -> None:
+        value = [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            np.float64(np.nan),
+        ]
+        assert json.loads(serialize_json(value)) == [None, None, None, None]
+
+    @test("42 strict JSON accepts converted payload")
+    def _() -> None:
+        packed = serialize_json(
+            {"flag": np.bool_(True), "bad": np.float32(np.inf)}
+        )
+        assert json.loads(packed) == {"flag": True, "bad": None}
+
+    @test("43 complete real path preview is serializable")
+    def _() -> None:
+        result = validate_path(
+            "base_link",
+            _path_points(lateral=0.02, slope=0.05),
+            config,
+        )
+        preview = compute_preview_command(
+            result, _healthy_perception(), config, 0.01, 0.01, 6.5
+        )
+        document = json.loads(serialize_json(preview.to_dict()))
+        assert document["controller_ready"] is True
+        assert document["path_point_count"] == 15
+
+    @test("44 numpy lookahead clamp cannot break JSON")
+    def _() -> None:
+        preview = ControllerPreview(lookahead_clamped=np.bool_(True))
+        document = json.loads(serialize_json(preview.to_dict()))
+        assert document["lookahead_clamped"] is True
+
+    @test("45 numpy angular saturation cannot break JSON")
+    def _() -> None:
+        preview = ControllerPreview(
+            angular_command_saturated=np.bool_(True)
+        )
+        document = json.loads(serialize_json(preview.to_dict()))
+        assert document["angular_command_saturated"] is True
+
+    @test("46 exception handler never rethrows")
+    def _() -> None:
+        class FailingPublisher:
+            def publish(self, _message: Any) -> None:
+                raise RuntimeError("simulated publish failure")
+
+        class FailingLogger:
+            def error(self, _message: str) -> None:
+                raise RuntimeError("simulated log failure")
+
+        node = LanePathControllerNode.__new__(LanePathControllerNode)
+        node.config = config
+        node.path_received_monotonic = 1.0
+        node.perception = _healthy_perception()
+        node.path_analysis = validate_path(
+            "base_link", _path_points(), config
+        )
+        node.controller_status_publisher = FailingPublisher()
+        node.last_exception_log_monotonic = 0.0
+        node.get_logger = lambda: FailingLogger()
+        node._handle_observation_exception(RuntimeError("simulated"))
+        assert not node.preview.controller_ready
+        assert node.preview.control_block_reason == "controller_exception"
+
+    @test("47 timer exception stays contained and zero preview")
+    def _() -> None:
+        node = LanePathControllerNode.__new__(LanePathControllerNode)
+        handled: List[Exception] = []
+        node._publish_observation_impl = (
+            lambda: (_ for _ in ()).throw(TypeError("simulated"))
+        )
+        node._handle_observation_exception = handled.append
+        node._publish_observation()
+        assert len(handled) == 1
+        fault = ControllerPreview(
+            controller_ready=False,
+            control_block_reason="controller_exception",
+            suggested_linear_x=0.0,
+            suggested_angular_z=0.0,
+        )
+        assert not fault.controller_ready
+        assert fault.suggested_linear_x == 0.0
+        assert fault.suggested_angular_z == 0.0
 
     failures: List[str] = []
     for name, function in tests:
