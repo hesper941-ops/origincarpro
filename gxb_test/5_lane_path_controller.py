@@ -82,18 +82,18 @@ PREFERRED_MODES = frozenset(
         "green_dual_inner_edge",
         "yellow_corridor_dual_edge",
         "yellow_corridor_center_gap_filled",
-        # 一体化节点在两种快速结果共同参与时使用此实际模式名。
-        "green_yellow_hybrid",
     }
 )
 DEGRADED_MODES = frozenset(
     {
-        "single_green_width_offset",
-        "single_boundary_normal_offset",
+        "green_yellow_hybrid",
+        # Two independently fitted physical boundaries remain dual-source,
+        # but this fallback is intentionally capped at degraded quality.
         "dual_boundary_midpoint",
-        "history_fallback",
     }
 )
+RECOVERY_MODES = frozenset({"single_green_width_offset"})
+UNSUPPORTED_SINGLE_MODES = frozenset({"single_boundary_normal_offset"})
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -144,6 +144,10 @@ def normalize_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def angle_difference(target: float, reference: float) -> float:
+    return normalize_angle(target - reference)
+
+
 def make_observation_qos() -> QoSProfile:
     """Match the integrated pipeline's BEST_EFFORT depth-one publishers."""
     return QoSProfile(
@@ -169,23 +173,56 @@ class ControllerConfig:
     log_rate_hz: float = 2.0
     status_publish_rate_hz: float = 5.0
     min_path_points: int = 6
-    min_path_span_m: float = 0.45
+    min_path_span_m: float = 0.25
     path_timeout_sec: float = 0.40
     status_timeout_sec: float = 0.40
     max_point_lateral_jump_m: float = 0.15
-    min_centerline_confidence: float = 0.80
-    min_centerline_span_m: float = 0.45
+    min_centerline_confidence: float = 0.70
+    min_centerline_span_m: float = 0.25
     min_process_fps: float = 4.0
     max_perception_age_ms: float = 350.0
-    near_error_distance_m: float = 0.25
-    lookahead_distance_m: float = 0.40
-    heading_fit_start_m: float = 0.25
-    heading_fit_end_m: float = 0.60
+    near_error_distance_m: float = 0.35
+    lookahead_distance_m: float = 0.45
+    heading_fit_start_m: float = 0.30
+    heading_fit_end_m: float = 0.55
+    min_heading_segment_dx_m: float = 0.025
+    heading_outlier_mad_scale: float = 3.0
+    heading_outlier_min_threshold_deg: float = 3.0
+    max_heading_estimator_disagreement_deg: float = 8.0
+    max_heading_chord_disagreement_deg: float = 8.0
+    heading_filter_time_constant_sec: float = 0.25
+    heading_state_reset_timeout_sec: float = 0.80
+    max_heading_rate_deg_per_sec: float = 60.0
     lateral_gain: float = 1.8
     heading_gain: float = 1.2
     max_suggested_angular_z: float = 0.60
     nominal_suggested_linear_x: float = 0.10
-    degraded_suggested_linear_x: float = 0.05
+    normal_min_path_points: int = 10
+    normal_min_path_span_m: float = 0.45
+    normal_min_confidence: float = 0.80
+    normal_suggested_linear_x: float = 0.10
+    normal_max_angular_z: float = 0.60
+    degraded_min_path_points: int = 6
+    degraded_min_path_span_m: float = 0.25
+    degraded_min_confidence: float = 0.75
+    degraded_suggested_linear_x: float = 0.02
+    degraded_max_angular_z: float = 0.30
+    recovery_min_path_points: int = 6
+    recovery_min_path_span_m: float = 0.25
+    recovery_min_confidence: float = 0.70
+    recovery_required_stable_frames: int = 4
+    recovery_suggested_linear_x: float = 0.01
+    recovery_max_angular_z: float = 0.20
+    recovery_max_heading_std_deg: float = 4.0
+    recovery_max_target_y_delta_m: float = 0.025
+    recovery_max_lateral_delta_m: float = 0.025
+    recovery_max_direction_flips: int = 0
+    recovery_history_size: int = 5
+    max_angular_accel_rad_s2: float = 0.60
+    max_angular_decel_rad_s2: float = 1.00
+    direction_flip_deadband_rad_s: float = 0.03
+    direction_flip_window_size: int = 6
+    max_direction_flips_in_window: int = 1
 
     def validate(self) -> None:
         if self.min_path_points < 3:
@@ -198,6 +235,34 @@ class ControllerConfig:
             "near_error_distance_m": self.near_error_distance_m,
             "lookahead_distance_m": self.lookahead_distance_m,
             "max_suggested_angular_z": self.max_suggested_angular_z,
+            "min_heading_segment_dx_m": self.min_heading_segment_dx_m,
+            "heading_filter_time_constant_sec": (
+                self.heading_filter_time_constant_sec
+            ),
+            "heading_state_reset_timeout_sec": (
+                self.heading_state_reset_timeout_sec
+            ),
+            "max_heading_rate_deg_per_sec": (
+                self.max_heading_rate_deg_per_sec
+            ),
+            "max_angular_accel_rad_s2": self.max_angular_accel_rad_s2,
+            "max_angular_decel_rad_s2": self.max_angular_decel_rad_s2,
+            "normal_min_path_span_m": self.normal_min_path_span_m,
+            "degraded_min_path_span_m": self.degraded_min_path_span_m,
+            "recovery_min_path_span_m": self.recovery_min_path_span_m,
+            "normal_max_angular_z": self.normal_max_angular_z,
+            "degraded_max_angular_z": self.degraded_max_angular_z,
+            "recovery_max_angular_z": self.recovery_max_angular_z,
+            "heading_outlier_mad_scale": self.heading_outlier_mad_scale,
+            "heading_outlier_min_threshold_deg": (
+                self.heading_outlier_min_threshold_deg
+            ),
+            "max_heading_estimator_disagreement_deg": (
+                self.max_heading_estimator_disagreement_deg
+            ),
+            "max_heading_chord_disagreement_deg": (
+                self.max_heading_chord_disagreement_deg
+            ),
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -206,6 +271,22 @@ class ControllerConfig:
             raise ValueError("heading fit end must exceed start")
         if not 0.0 <= self.min_centerline_confidence <= 1.0:
             raise ValueError("min_centerline_confidence must be in [0, 1]")
+        for name in (
+            "normal_min_confidence",
+            "degraded_min_confidence",
+            "recovery_min_confidence",
+        ):
+            if not 0.0 <= float(getattr(self, name)) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        for name in (
+            "normal_min_path_points",
+            "degraded_min_path_points",
+            "recovery_min_path_points",
+        ):
+            if int(getattr(self, name)) < self.min_path_points:
+                raise ValueError(
+                    f"{name} cannot be below min_path_points"
+                )
         self.log_rate_hz = max(0.1, finite_float(self.log_rate_hz, 2.0))
         self.status_publish_rate_hz = max(
             0.1, finite_float(self.status_publish_rate_hz, 5.0)
@@ -213,8 +294,30 @@ class ControllerConfig:
         self.nominal_suggested_linear_x = max(
             0.0, finite_float(self.nominal_suggested_linear_x)
         )
+        self.normal_suggested_linear_x = max(
+            0.0, finite_float(self.normal_suggested_linear_x)
+        )
         self.degraded_suggested_linear_x = max(
             0.0, finite_float(self.degraded_suggested_linear_x)
+        )
+        self.recovery_suggested_linear_x = max(
+            0.0, finite_float(self.recovery_suggested_linear_x)
+        )
+        self.recovery_required_stable_frames = max(
+            1, int(self.recovery_required_stable_frames)
+        )
+        self.recovery_history_size = max(
+            self.recovery_required_stable_frames,
+            int(self.recovery_history_size),
+        )
+        self.direction_flip_window_size = max(
+            2, int(self.direction_flip_window_size)
+        )
+        self.recovery_max_direction_flips = max(
+            0, int(self.recovery_max_direction_flips)
+        )
+        self.max_direction_flips_in_window = max(
+            0, int(self.max_direction_flips_in_window)
         )
         self.dry_run = enforce_dry_run(self.dry_run)
         assert self.dry_run is True
@@ -273,6 +376,26 @@ class PerceptionSnapshot:
 
 
 @dataclass
+class HeadingEstimate:
+    valid: bool = False
+    reason: str = "heading_estimation_failed"
+    method: str = "segment_mad_weighted_mean"
+    fit_point_count: int = 0
+    segment_count_raw: int = 0
+    segment_count_used: int = 0
+    segment_median_rad: float = 0.0
+    segment_mad_rad: float = 0.0
+    ols_slope: float = 0.0
+    ols_rad: float = 0.0
+    robust_rad: float = 0.0
+    chord_rad: float = 0.0
+    estimator_disagreement: bool = False
+    estimator_disagreement_deg: float = 0.0
+    chord_disagreement: bool = False
+    chord_disagreement_deg: float = 0.0
+
+
+@dataclass
 class PathAnalysis:
     valid: bool = False
     reason: str = "path_not_received"
@@ -294,6 +417,49 @@ class PathAnalysis:
     heading_fit_point_count: int = 0
     heading_slope: float = 0.0
     heading_error_rad: float = 0.0
+    heading_method: str = ""
+    heading_segment_count_raw: int = 0
+    heading_segment_count_used: int = 0
+    heading_segment_median_rad: float = 0.0
+    heading_segment_mad_rad: float = 0.0
+    heading_ols_rad: float = 0.0
+    heading_robust_rad: float = 0.0
+    heading_chord_rad: float = 0.0
+    heading_estimator_disagreement: bool = False
+    heading_estimator_disagreement_deg: float = 0.0
+    heading_chord_disagreement: bool = False
+    heading_chord_disagreement_deg: float = 0.0
+
+
+@dataclass
+class ControllerRuntimeState:
+    last_heading_error_rad: Optional[float] = None
+    last_heading_timestamp: float = 0.0
+    last_suggested_angular_z: float = 0.0
+    last_angular_timestamp: float = 0.0
+    last_centerline_mode: str = ""
+    last_path_span_m: float = 0.0
+    recovery_stable_frame_count: int = 0
+    recovery_heading_history: List[float] = field(default_factory=list)
+    recovery_target_y_history: List[float] = field(default_factory=list)
+    recovery_lateral_history: List[float] = field(default_factory=list)
+    angular_direction_history: List[int] = field(default_factory=list)
+
+    def reset(self) -> None:
+        self.last_heading_error_rad = None
+        self.last_heading_timestamp = 0.0
+        self.last_suggested_angular_z = 0.0
+        self.last_angular_timestamp = 0.0
+        self.last_centerline_mode = ""
+        self.last_path_span_m = 0.0
+        self.reset_recovery()
+        self.angular_direction_history.clear()
+
+    def reset_recovery(self) -> None:
+        self.recovery_stable_frame_count = 0
+        self.recovery_heading_history.clear()
+        self.recovery_target_y_history.clear()
+        self.recovery_lateral_history.clear()
 
 
 @dataclass
@@ -302,6 +468,11 @@ class ControllerPreview:
     controller_ready: bool = False
     control_block_reason: str = "waiting_for_path"
     degraded_mode: bool = False
+    control_quality_level: str = "blocked"
+    mode_policy_reason: str = "waiting_for_path"
+    normal_mode_active: bool = False
+    degraded_mode_active: bool = False
+    recovery_mode_active: bool = False
     path_received: bool = False
     status_received: bool = False
     path_frame_id: str = ""
@@ -329,12 +500,53 @@ class ControllerPreview:
     lookahead_clamped: bool = False
     heading_fit_point_count: int = 0
     heading_slope: float = 0.0
+    heading_method: str = ""
+    heading_segment_count_raw: int = 0
+    heading_segment_count_used: int = 0
+    heading_segment_median_rad: float = 0.0
+    heading_segment_median_deg: float = 0.0
+    heading_segment_mad_rad: float = 0.0
+    heading_segment_mad_deg: float = 0.0
+    heading_ols_rad: float = 0.0
+    heading_ols_deg: float = 0.0
+    heading_robust_rad: float = 0.0
+    heading_robust_deg: float = 0.0
+    heading_chord_rad: float = 0.0
+    heading_chord_deg: float = 0.0
+    heading_estimator_disagreement: bool = False
+    heading_estimator_disagreement_deg: float = 0.0
+    heading_chord_disagreement: bool = False
+    heading_chord_disagreement_deg: float = 0.0
+    heading_error_raw_rad: float = 0.0
+    heading_error_raw_deg: float = 0.0
+    heading_error_filtered_rad: float = 0.0
+    heading_error_filtered_deg: float = 0.0
+    heading_temporal_filter_used: bool = False
+    heading_rate_limited: bool = False
+    heading_dt_sec: float = 0.0
     heading_error_rad: float = 0.0
     heading_error_deg: float = 0.0
+    recovery_stable_frame_count: int = 0
+    recovery_required_stable_frames: int = 0
+    recovery_history_size: int = 0
+    recovery_heading_std_deg: float = 0.0
+    recovery_target_y_delta_m: float = 0.0
+    recovery_lateral_delta_m: float = 0.0
     suggested_linear_x: float = 0.0
     suggested_angular_z_raw: float = 0.0
+    suggested_angular_z_unfiltered: float = 0.0
+    suggested_angular_z_mode_limited: float = 0.0
+    suggested_angular_z_rate_limited: float = 0.0
     suggested_angular_z: float = 0.0
     angular_command_saturated: bool = False
+    angular_rate_limited: bool = False
+    angular_delta_raw: float = 0.0
+    angular_delta_limited: float = 0.0
+    angular_dt_sec: float = 0.0
+    previous_preview_angular_z: float = 0.0
+    angular_direction_sign: int = 0
+    angular_direction_flip_count: int = 0
+    angular_direction_unstable: bool = False
     controller_confidence: float = 0.0
     update_rate_hz: float = 0.0
     calculation_time_ms: float = 0.0
@@ -401,35 +613,103 @@ def select_lookahead_target(
 
 
 def estimate_heading(
-    points: np.ndarray, fit_start_m: float, fit_end_m: float
-) -> Tuple[int, float, float]:
+    points: np.ndarray,
+    config: ControllerConfig,
+    near_point: Tuple[float, float],
+    lookahead_point: Tuple[float, float],
+) -> HeadingEstimate:
+    """Estimate heading from robust local segments, retaining OLS diagnostics."""
     values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    result = HeadingEstimate()
+    finite = np.all(np.isfinite(values), axis=1)
+    values = values[finite]
+    if len(values) < 3:
+        result.reason = "heading_too_few_finite_points"
+        return result
     selected = values[
-        (values[:, 0] >= fit_start_m) & (values[:, 0] <= fit_end_m)
+        (values[:, 0] >= config.heading_fit_start_m)
+        & (values[:, 0] <= config.heading_fit_end_m)
     ]
-    if len(selected) >= 3:
-        design = np.column_stack(
-            (selected[:, 0], np.ones(len(selected), dtype=np.float64))
-        )
-        coefficients, _, _, _ = np.linalg.lstsq(
-            design, selected[:, 1], rcond=None
-        )
-        slope = float(coefficients[0])
-        if not math.isfinite(slope):
-            raise ValueError("heading fit is not finite")
-        return len(selected), slope, normalize_angle(math.atan(slope))
+    result.fit_point_count = int(len(selected))
+    if len(selected) < 3:
+        result.reason = "heading_fit_interval_too_few_points"
+        return result
 
-    if len(values) < 2:
-        raise ValueError("not enough points for heading")
-    midpoint = 0.5 * (fit_start_m + fit_end_m)
-    upper = int(np.searchsorted(values[:, 0], midpoint, side="left"))
-    upper = min(max(1, upper), len(values) - 1)
-    lower = upper - 1
-    dx = float(values[upper, 0] - values[lower, 0])
-    if dx <= 1.0e-9:
-        raise ValueError("invalid adjacent heading segment")
-    slope = float((values[upper, 1] - values[lower, 1]) / dx)
-    return len(selected), slope, normalize_angle(math.atan(slope))
+    delta = np.diff(selected, axis=0)
+    valid_segments = (
+        np.isfinite(delta[:, 0])
+        & np.isfinite(delta[:, 1])
+        & (delta[:, 0] >= config.min_heading_segment_dx_m)
+    )
+    segment_delta = delta[valid_segments]
+    if len(segment_delta) < 2:
+        result.reason = "heading_too_few_valid_segments"
+        return result
+    headings = np.arctan2(segment_delta[:, 1], segment_delta[:, 0])
+    weights = segment_delta[:, 0]
+    result.segment_count_raw = int(len(headings))
+    median = float(np.median(headings))
+    deviations = np.array(
+        [abs(angle_difference(float(item), median)) for item in headings],
+        dtype=np.float64,
+    )
+    mad = float(np.median(deviations))
+    threshold = max(
+        math.radians(config.heading_outlier_min_threshold_deg),
+        config.heading_outlier_mad_scale * mad,
+    )
+    keep = deviations <= threshold
+    used = headings[keep]
+    used_weights = weights[keep]
+    result.segment_count_used = int(len(used))
+    result.segment_median_rad = normalize_angle(median)
+    result.segment_mad_rad = mad
+    if len(used) < 2:
+        result.reason = "heading_too_few_inlier_segments"
+        return result
+
+    sine = float(np.sum(np.sin(used) * used_weights))
+    cosine = float(np.sum(np.cos(used) * used_weights))
+    if abs(sine) + abs(cosine) <= 1.0e-12:
+        result.reason = "heading_robust_mean_undefined"
+        return result
+    result.robust_rad = normalize_angle(math.atan2(sine, cosine))
+
+    design = np.column_stack(
+        (selected[:, 0], np.ones(len(selected), dtype=np.float64))
+    )
+    coefficients, _, _, _ = np.linalg.lstsq(
+        design, selected[:, 1], rcond=None
+    )
+    result.ols_slope = float(coefficients[0])
+    if not math.isfinite(result.ols_slope):
+        result.reason = "heading_ols_not_finite"
+        return result
+    result.ols_rad = normalize_angle(math.atan(result.ols_slope))
+
+    chord_dx = float(lookahead_point[0] - near_point[0])
+    chord_dy = float(lookahead_point[1] - near_point[1])
+    if chord_dx < config.min_heading_segment_dx_m:
+        result.reason = "heading_chord_too_short"
+        return result
+    result.chord_rad = normalize_angle(math.atan2(chord_dy, chord_dx))
+    result.estimator_disagreement_deg = math.degrees(
+        abs(angle_difference(result.ols_rad, result.robust_rad))
+    )
+    result.estimator_disagreement = bool(
+        result.estimator_disagreement_deg
+        > config.max_heading_estimator_disagreement_deg
+    )
+    result.chord_disagreement_deg = math.degrees(
+        abs(angle_difference(result.chord_rad, result.robust_rad))
+    )
+    result.chord_disagreement = bool(
+        result.chord_disagreement_deg
+        > config.max_heading_chord_disagreement_deg
+    )
+    result.valid = True
+    result.reason = ""
+    return result
 
 
 def validate_path(
@@ -461,7 +741,7 @@ def validate_path(
             analysis.reason = "path_no_positive_forward_point"
             return analysis
         analysis.span_m = float(values[-1, 0] - values[0, 0])
-        if analysis.span_m < config.min_path_span_m:
+        if analysis.span_m + 1.0e-9 < config.min_path_span_m:
             analysis.reason = "path_span_too_short"
             return analysis
         if bool(
@@ -474,7 +754,7 @@ def validate_path(
             return analysis
 
         (
-            _,
+            near_x,
             analysis.lateral_error_m,
             analysis.near_error_clamped,
         ) = interpolate_y_at_forward(values, config.near_error_distance_m)
@@ -484,12 +764,39 @@ def validate_path(
             analysis.lookahead_target_distance_m,
             analysis.lookahead_clamped,
         ) = select_lookahead_target(values, config.lookahead_distance_m)
-        (
-            analysis.heading_fit_point_count,
-            analysis.heading_slope,
-            analysis.heading_error_rad,
-        ) = estimate_heading(
-            values, config.heading_fit_start_m, config.heading_fit_end_m
+        heading = estimate_heading(
+            values,
+            config,
+            (near_x, analysis.lateral_error_m),
+            (
+                analysis.lookahead_target_x_m,
+                analysis.lookahead_target_y_m,
+            ),
+        )
+        if not heading.valid:
+            analysis.reason = "heading_estimation_failed"
+            analysis.heading_method = heading.reason
+            return analysis
+        analysis.heading_fit_point_count = heading.fit_point_count
+        analysis.heading_slope = heading.ols_slope
+        analysis.heading_error_rad = heading.robust_rad
+        analysis.heading_method = heading.method
+        analysis.heading_segment_count_raw = heading.segment_count_raw
+        analysis.heading_segment_count_used = heading.segment_count_used
+        analysis.heading_segment_median_rad = heading.segment_median_rad
+        analysis.heading_segment_mad_rad = heading.segment_mad_rad
+        analysis.heading_ols_rad = heading.ols_rad
+        analysis.heading_robust_rad = heading.robust_rad
+        analysis.heading_chord_rad = heading.chord_rad
+        analysis.heading_estimator_disagreement = (
+            heading.estimator_disagreement
+        )
+        analysis.heading_estimator_disagreement_deg = (
+            heading.estimator_disagreement_deg
+        )
+        analysis.heading_chord_disagreement = heading.chord_disagreement
+        analysis.heading_chord_disagreement_deg = (
+            heading.chord_disagreement_deg
         )
         analysis.valid = True
         analysis.reason = ""
@@ -499,44 +806,114 @@ def validate_path(
     return analysis
 
 
-def compute_controller_confidence(
+def basic_block_reason(
+    analysis: PathAnalysis,
+    perception: PerceptionSnapshot,
+    path_age_sec: float,
+    status_age_sec: float,
+    config: ControllerConfig,
+) -> str:
+    if path_age_sec < 0.0:
+        return "path_not_received"
+    if path_age_sec > config.path_timeout_sec:
+        return "path_timeout"
+    if not analysis.valid:
+        return analysis.reason or "path_invalid"
+    if not perception.received:
+        return "status_not_received"
+    if perception.parse_error:
+        return "status_json_invalid"
+    if status_age_sec > config.status_timeout_sec:
+        return "status_timeout"
+    if not perception.centerline_valid:
+        return "centerline_invalid"
+    if perception.capture_to_process_age_ms > config.max_perception_age_ms:
+        return "perception_age_too_high"
+    if perception.process_fps < config.min_process_fps:
+        return "process_fps_too_low"
+    return ""
+
+
+def evaluate_mode_policy(
     analysis: PathAnalysis,
     perception: PerceptionSnapshot,
     config: ControllerConfig,
-    degraded_mode: bool,
-    angular_saturated: bool,
-) -> float:
-    if not analysis.valid or not perception.received:
-        return 0.0
-    point_factor = clamp(
-        analysis.point_count / max(float(config.min_path_points * 2), 1.0),
-        0.55,
-        1.0,
-    )
-    span_factor = clamp(
-        analysis.span_m / max(config.lookahead_distance_m * 1.5, 1.0e-6),
-        0.55,
-        1.0,
-    )
-    heading_factor = (
-        1.0
-        if analysis.heading_fit_point_count >= 3
-        else 0.82
-    )
-    coverage_factor = 0.85 if analysis.lookahead_clamped else 1.0
-    mode_factor = 0.68 if degraded_mode else 1.0
-    saturation_factor = 0.82 if angular_saturated else 1.0
-    return clamp(
-        perception.centerline_confidence
-        * point_factor
-        * span_factor
-        * heading_factor
-        * coverage_factor
-        * mode_factor
-        * saturation_factor,
-        0.0,
-        1.0,
-    )
+) -> Tuple[str, str]:
+    mode = perception.centerline_mode
+    if mode in UNSUPPORTED_SINGLE_MODES:
+        return "blocked", "unsupported_single_boundary_mode"
+    if mode in PREFERRED_MODES:
+        level = "normal"
+        requirements = (
+            (
+                analysis.point_count >= config.normal_min_path_points,
+                "normal_path_points_low",
+            ),
+            (
+                min(
+                    analysis.span_m,
+                    perception.centerline_forward_span_m,
+                )
+                + 1.0e-9
+                >= config.normal_min_path_span_m,
+                "normal_path_span_low",
+            ),
+            (
+                perception.centerline_confidence
+                >= config.normal_min_confidence,
+                "normal_confidence_low",
+            ),
+        )
+    elif mode in DEGRADED_MODES:
+        level = "degraded"
+        requirements = (
+            (
+                analysis.point_count >= config.degraded_min_path_points,
+                "degraded_path_points_low",
+            ),
+            (
+                min(
+                    analysis.span_m,
+                    perception.centerline_forward_span_m,
+                )
+                + 1.0e-9
+                >= config.degraded_min_path_span_m,
+                "degraded_path_span_low",
+            ),
+            (
+                perception.centerline_confidence
+                >= config.degraded_min_confidence,
+                "degraded_confidence_low",
+            ),
+        )
+    elif mode in RECOVERY_MODES:
+        level = "recovery"
+        requirements = (
+            (
+                analysis.point_count >= config.recovery_min_path_points,
+                "recovery_path_points_low",
+            ),
+            (
+                min(
+                    analysis.span_m,
+                    perception.centerline_forward_span_m,
+                )
+                + 1.0e-9
+                >= config.recovery_min_path_span_m,
+                "recovery_path_span_low",
+            ),
+            (
+                perception.centerline_confidence
+                >= config.recovery_min_confidence,
+                "recovery_confidence_low",
+            ),
+        )
+    else:
+        return "blocked", "centerline_mode_not_allowed"
+    for passed, reason in requirements:
+        if not passed:
+            return "blocked", reason
+    return level, f"{level}_mode_accepted"
 
 
 def determine_block_reason(
@@ -546,35 +923,271 @@ def determine_block_reason(
     status_age_sec: float,
     config: ControllerConfig,
 ) -> Tuple[str, bool]:
-    if path_age_sec < 0.0:
-        return "path_not_received", False
-    if path_age_sec > config.path_timeout_sec:
-        return "path_timeout", False
-    if not analysis.valid:
-        return analysis.reason or "path_invalid", False
-    if not perception.received:
-        return "status_not_received", False
-    if perception.parse_error:
-        return "status_json_invalid", False
-    if status_age_sec > config.status_timeout_sec:
-        return "status_timeout", False
-    if not perception.centerline_valid:
-        return "centerline_invalid", False
-    if perception.centerline_mode in PREFERRED_MODES:
-        degraded = False
-    elif perception.centerline_mode in DEGRADED_MODES:
-        degraded = True
+    reason = basic_block_reason(
+        analysis, perception, path_age_sec, status_age_sec, config
+    )
+    if reason:
+        return reason, False
+    level, policy_reason = evaluate_mode_policy(analysis, perception, config)
+    return (
+        (policy_reason if level == "blocked" else ""),
+        level in {"degraded", "recovery"},
+    )
+
+
+def filter_heading_temporal(
+    raw_heading: float,
+    now: float,
+    mode: str,
+    state: ControllerRuntimeState,
+    config: ControllerConfig,
+    advance_state: bool,
+) -> Tuple[float, bool, bool, float]:
+    previous = state.last_heading_error_rad
+    dt = now - state.last_heading_timestamp
+    reset = (
+        previous is None
+        or state.last_heading_timestamp <= 0.0
+        or dt <= 0.0
+        or dt > config.heading_state_reset_timeout_sec
+    )
+    if reset:
+        filtered = normalize_angle(raw_heading)
+        used = False
+        rate_limited = False
+        reported_dt = 0.0
+    elif not advance_state:
+        filtered = float(previous)
+        used = True
+        rate_limited = False
+        reported_dt = 0.0
     else:
-        return "centerline_mode_not_allowed", False
-    if perception.centerline_confidence < config.min_centerline_confidence:
-        return "centerline_confidence_low", degraded
-    if perception.centerline_forward_span_m < config.min_centerline_span_m:
-        return "centerline_span_too_short", degraded
-    if perception.capture_to_process_age_ms > config.max_perception_age_ms:
-        return "perception_age_too_high", degraded
-    if perception.process_fps < config.min_process_fps:
-        return "process_fps_too_low", degraded
-    return "", degraded
+        alpha = dt / (config.heading_filter_time_constant_sec + dt)
+        previous_rank = (
+            0
+            if state.last_centerline_mode in PREFERRED_MODES
+            else 1
+            if state.last_centerline_mode in DEGRADED_MODES
+            else 2
+        )
+        current_rank = (
+            0 if mode in PREFERRED_MODES else 1 if mode in DEGRADED_MODES else 2
+        )
+        if current_rank > previous_rank:
+            alpha *= 0.5
+        raw_delta = angle_difference(raw_heading, float(previous))
+        candidate_delta = alpha * raw_delta
+        maximum_delta = math.radians(
+            config.max_heading_rate_deg_per_sec
+        ) * dt
+        rate_limited = abs(raw_delta) > maximum_delta
+        candidate_delta = clamp(
+            candidate_delta, -maximum_delta, maximum_delta
+        )
+        filtered = normalize_angle(float(previous) + candidate_delta)
+        used = True
+        reported_dt = dt
+    if advance_state:
+        state.last_heading_error_rad = float(filtered)
+        state.last_heading_timestamp = float(now)
+        state.last_centerline_mode = str(mode)
+    return float(filtered), used, rate_limited, float(reported_dt)
+
+
+def angular_slew_limit(
+    target: float,
+    now: float,
+    state: ControllerRuntimeState,
+    config: ControllerConfig,
+    advance_state: bool,
+) -> Tuple[float, bool, float, float, float, float]:
+    previous = float(state.last_suggested_angular_z)
+    dt = now - state.last_angular_timestamp
+    if (
+        state.last_angular_timestamp <= 0.0
+        or dt <= 0.0
+        or dt > config.heading_state_reset_timeout_sec
+    ):
+        limited = float(target)
+        was_limited = False
+        dt = 0.0
+    elif not advance_state:
+        limited = previous
+        was_limited = False
+        dt = 0.0
+    else:
+        raw_delta = target - previous
+        if target * previous < 0.0:
+            time_to_zero = (
+                abs(previous) / config.max_angular_decel_rad_s2
+            )
+            if dt <= time_to_zero:
+                limited = math.copysign(
+                    max(
+                        0.0,
+                        abs(previous)
+                        - config.max_angular_decel_rad_s2 * dt,
+                    ),
+                    previous,
+                )
+            else:
+                remaining = dt - time_to_zero
+                limited = math.copysign(
+                    min(
+                        abs(target),
+                        config.max_angular_accel_rad_s2 * remaining,
+                    ),
+                    target,
+                )
+        else:
+            increasing = abs(target) > abs(previous)
+            rate = (
+                config.max_angular_accel_rad_s2
+                if increasing
+                else config.max_angular_decel_rad_s2
+            )
+            limited_delta = clamp(raw_delta, -rate * dt, rate * dt)
+            limited = previous + limited_delta
+        limited_delta = limited - previous
+        was_limited = not math.isclose(
+            limited_delta, raw_delta, rel_tol=1.0e-9, abs_tol=1.0e-9
+        )
+    raw_delta = float(target - previous)
+    limited_delta = float(limited - previous)
+    if advance_state:
+        state.last_suggested_angular_z = float(limited)
+        state.last_angular_timestamp = float(now)
+    return (
+        float(limited),
+        bool(was_limited),
+        raw_delta,
+        limited_delta,
+        float(dt),
+        previous,
+    )
+
+
+def angular_direction_sign(value: float, deadband: float) -> int:
+    if abs(value) < deadband:
+        return 0
+    return 1 if value > 0.0 else -1
+
+
+def update_direction_history(
+    value: float,
+    state: ControllerRuntimeState,
+    config: ControllerConfig,
+    advance_state: bool,
+) -> Tuple[int, int]:
+    sign = angular_direction_sign(
+        value, config.direction_flip_deadband_rad_s
+    )
+    if advance_state and sign:
+        state.angular_direction_history.append(sign)
+        state.angular_direction_history = state.angular_direction_history[
+            -config.direction_flip_window_size :
+        ]
+    history = state.angular_direction_history
+    flips = sum(
+        1
+        for first, second in zip(history, history[1:])
+        if first != second
+    )
+    return sign, int(flips)
+
+
+def update_recovery_stability(
+    analysis: PathAnalysis,
+    heading_raw: float,
+    heading_rate_limited: bool,
+    direction_flip_count: int,
+    state: ControllerRuntimeState,
+    config: ControllerConfig,
+    advance_state: bool,
+) -> Tuple[int, float, float, float, bool]:
+    if advance_state:
+        state.recovery_heading_history.append(float(heading_raw))
+        state.recovery_target_y_history.append(
+            float(analysis.lookahead_target_y_m)
+        )
+        state.recovery_lateral_history.append(
+            float(analysis.lateral_error_m)
+        )
+        size = config.recovery_history_size
+        state.recovery_heading_history = state.recovery_heading_history[-size:]
+        state.recovery_target_y_history = (
+            state.recovery_target_y_history[-size:]
+        )
+        state.recovery_lateral_history = state.recovery_lateral_history[-size:]
+    headings = state.recovery_heading_history
+    targets = state.recovery_target_y_history
+    laterals = state.recovery_lateral_history
+    heading_std = (
+        math.degrees(float(np.std(headings))) if headings else 0.0
+    )
+    target_delta = max(targets) - min(targets) if targets else 0.0
+    lateral_delta = max(laterals) - min(laterals) if laterals else 0.0
+    stable = bool(
+        headings
+        and math.isfinite(heading_raw)
+        and not heading_rate_limited
+        and not analysis.heading_chord_disagreement
+        and heading_std <= config.recovery_max_heading_std_deg
+        and target_delta <= config.recovery_max_target_y_delta_m
+        and lateral_delta <= config.recovery_max_lateral_delta_m
+        and direction_flip_count <= config.recovery_max_direction_flips
+    )
+    if advance_state:
+        if stable:
+            state.recovery_stable_frame_count += 1
+        else:
+            state.reset_recovery()
+    return (
+        int(state.recovery_stable_frame_count),
+        float(heading_std),
+        float(target_delta),
+        float(lateral_delta),
+        stable,
+    )
+
+
+def compute_controller_confidence(
+    analysis: PathAnalysis,
+    perception: PerceptionSnapshot,
+    preview: ControllerPreview,
+    config: ControllerConfig,
+) -> float:
+    if not analysis.valid or not preview.controller_ready:
+        return 0.0
+    if preview.control_quality_level == "normal":
+        point_min = config.normal_min_path_points
+        span_min = config.normal_min_path_span_m
+        cap = 1.0
+    elif preview.control_quality_level == "degraded":
+        point_min = config.degraded_min_path_points
+        span_min = config.degraded_min_path_span_m
+        cap = 0.70
+    else:
+        point_min = config.recovery_min_path_points
+        span_min = config.recovery_min_path_span_m
+        cap = 0.35
+    confidence = perception.centerline_confidence
+    confidence *= clamp(analysis.point_count / max(point_min * 1.5, 1.0), 0.6, 1.0)
+    confidence *= clamp(analysis.span_m / max(span_min * 1.25, 1.0e-6), 0.6, 1.0)
+    confidence *= clamp(analysis.heading_segment_count_used / 4.0, 0.65, 1.0)
+    if analysis.lookahead_clamped:
+        confidence *= 0.86
+    if analysis.heading_estimator_disagreement:
+        confidence *= 0.72
+    if analysis.heading_chord_disagreement:
+        confidence *= 0.72
+    if preview.heading_rate_limited:
+        confidence *= 0.78
+    if preview.angular_rate_limited:
+        confidence *= 0.88
+    if preview.angular_direction_unstable:
+        confidence *= 0.55
+    return clamp(confidence, 0.0, cap)
 
 
 def compute_preview_command(
@@ -584,16 +1197,45 @@ def compute_preview_command(
     path_age_sec: float,
     status_age_sec: float,
     update_rate_hz: float = 0.0,
+    runtime_state: Optional[ControllerRuntimeState] = None,
+    now: Optional[float] = None,
+    advance_state: bool = True,
 ) -> ControllerPreview:
     started = time.perf_counter()
-    reason, degraded = determine_block_reason(
+    instant = time.monotonic() if now is None else float(now)
+    state = runtime_state if runtime_state is not None else ControllerRuntimeState()
+    reason = basic_block_reason(
         analysis, perception, path_age_sec, status_age_sec, config
     )
+    level = "blocked"
+    policy_reason = reason
+    if not reason:
+        level, policy_reason = evaluate_mode_policy(
+            analysis, perception, config
+        )
+        if level == "blocked":
+            reason = policy_reason
+    if (
+        not reason
+        and level == "normal"
+        and (
+            analysis.heading_estimator_disagreement
+            or analysis.heading_chord_disagreement
+        )
+    ):
+        level = "degraded"
+        policy_reason = "heading_diagnostic_disagreement"
+    degraded = level in {"degraded", "recovery"}
     preview = ControllerPreview(
         timestamp=datetime.now(timezone.utc).isoformat(),
         controller_ready=bool(not reason),
         control_block_reason=reason,
         degraded_mode=bool(degraded),
+        control_quality_level=level if not reason else "blocked",
+        mode_policy_reason=policy_reason,
+        normal_mode_active=bool(level == "normal"),
+        degraded_mode_active=bool(level == "degraded"),
+        recovery_mode_active=bool(level == "recovery"),
         path_received=bool(path_age_sec >= 0.0),
         status_received=bool(perception.received),
         path_frame_id=analysis.frame_id,
@@ -625,37 +1267,204 @@ def compute_preview_command(
         lookahead_clamped=bool(analysis.lookahead_clamped),
         heading_fit_point_count=analysis.heading_fit_point_count,
         heading_slope=analysis.heading_slope,
-        heading_error_rad=analysis.heading_error_rad,
-        heading_error_deg=math.degrees(analysis.heading_error_rad),
+        heading_method=analysis.heading_method,
+        heading_segment_count_raw=analysis.heading_segment_count_raw,
+        heading_segment_count_used=analysis.heading_segment_count_used,
+        heading_segment_median_rad=analysis.heading_segment_median_rad,
+        heading_segment_median_deg=math.degrees(
+            analysis.heading_segment_median_rad
+        ),
+        heading_segment_mad_rad=analysis.heading_segment_mad_rad,
+        heading_segment_mad_deg=math.degrees(
+            analysis.heading_segment_mad_rad
+        ),
+        heading_ols_rad=analysis.heading_ols_rad,
+        heading_ols_deg=math.degrees(analysis.heading_ols_rad),
+        heading_robust_rad=analysis.heading_robust_rad,
+        heading_robust_deg=math.degrees(analysis.heading_robust_rad),
+        heading_chord_rad=analysis.heading_chord_rad,
+        heading_chord_deg=math.degrees(analysis.heading_chord_rad),
+        heading_estimator_disagreement=bool(
+            analysis.heading_estimator_disagreement
+        ),
+        heading_estimator_disagreement_deg=(
+            analysis.heading_estimator_disagreement_deg
+        ),
+        heading_chord_disagreement=bool(
+            analysis.heading_chord_disagreement
+        ),
+        heading_chord_disagreement_deg=(
+            analysis.heading_chord_disagreement_deg
+        ),
+        heading_error_raw_rad=analysis.heading_robust_rad,
+        heading_error_raw_deg=math.degrees(analysis.heading_robust_rad),
+        heading_error_rad=analysis.heading_robust_rad,
+        heading_error_deg=math.degrees(analysis.heading_robust_rad),
+        recovery_stable_frame_count=state.recovery_stable_frame_count,
+        recovery_required_stable_frames=(
+            config.recovery_required_stable_frames
+        ),
+        recovery_history_size=config.recovery_history_size,
         update_rate_hz=max(0.0, update_rate_hz),
     )
-    if preview.controller_ready:
-        preview.suggested_angular_z_raw = (
-            config.lateral_gain * preview.lateral_error_m
-            + config.heading_gain * preview.heading_error_rad
+    if reason:
+        if advance_state:
+            state.reset()
+        preview.calculation_time_ms = (
+            time.perf_counter() - started
+        ) * 1000.0
+        return preview
+
+    (
+        filtered_heading,
+        heading_filter_used,
+        heading_rate_limited,
+        heading_dt,
+    ) = filter_heading_temporal(
+        analysis.heading_robust_rad,
+        instant,
+        perception.centerline_mode,
+        state,
+        config,
+        advance_state,
+    )
+    preview.heading_error_filtered_rad = filtered_heading
+    preview.heading_error_filtered_deg = math.degrees(filtered_heading)
+    preview.heading_temporal_filter_used = bool(heading_filter_used)
+    preview.heading_rate_limited = bool(heading_rate_limited)
+    preview.heading_dt_sec = heading_dt
+    preview.heading_error_rad = filtered_heading
+    preview.heading_error_deg = math.degrees(filtered_heading)
+
+    preview.suggested_angular_z_unfiltered = (
+        config.lateral_gain * preview.lateral_error_m
+        + config.heading_gain * filtered_heading
+    )
+    preview.suggested_angular_z_raw = (
+        preview.suggested_angular_z_unfiltered
+    )
+    if level == "normal":
+        angular_limit = config.normal_max_angular_z
+        base_speed = config.normal_suggested_linear_x
+    elif level == "degraded":
+        angular_limit = config.degraded_max_angular_z
+        base_speed = config.degraded_suggested_linear_x
+    else:
+        angular_limit = config.recovery_max_angular_z
+        base_speed = config.recovery_suggested_linear_x
+    preview.suggested_angular_z_mode_limited = clamp(
+        preview.suggested_angular_z_unfiltered,
+        -angular_limit,
+        angular_limit,
+    )
+    preview.angular_command_saturated = not math.isclose(
+        preview.suggested_angular_z_mode_limited,
+        preview.suggested_angular_z_unfiltered,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-9,
+    )
+    (
+        preview.suggested_angular_z_rate_limited,
+        preview.angular_rate_limited,
+        preview.angular_delta_raw,
+        preview.angular_delta_limited,
+        preview.angular_dt_sec,
+        preview.previous_preview_angular_z,
+    ) = angular_slew_limit(
+        preview.suggested_angular_z_mode_limited,
+        instant,
+        state,
+        config,
+        advance_state,
+    )
+    capped_rate_limited = clamp(
+        preview.suggested_angular_z_rate_limited,
+        -angular_limit,
+        angular_limit,
+    )
+    if not math.isclose(
+        capped_rate_limited,
+        preview.suggested_angular_z_rate_limited,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-9,
+    ):
+        preview.angular_rate_limited = True
+        preview.suggested_angular_z_rate_limited = capped_rate_limited
+        preview.angular_delta_limited = (
+            capped_rate_limited - preview.previous_preview_angular_z
         )
-        preview.suggested_angular_z = clamp(
-            preview.suggested_angular_z_raw,
-            -config.max_suggested_angular_z,
-            config.max_suggested_angular_z,
+        if advance_state:
+            state.last_suggested_angular_z = capped_rate_limited
+    preview.angular_direction_sign, preview.angular_direction_flip_count = (
+        update_direction_history(
+            preview.suggested_angular_z_rate_limited,
+            state,
+            config,
+            advance_state,
         )
-        preview.angular_command_saturated = not math.isclose(
-            preview.suggested_angular_z,
-            preview.suggested_angular_z_raw,
-            rel_tol=1.0e-9,
-            abs_tol=1.0e-9,
+    )
+    flip_limit = (
+        config.recovery_max_direction_flips
+        if level == "recovery"
+        else config.max_direction_flips_in_window
+    )
+    preview.angular_direction_unstable = bool(
+        preview.angular_direction_flip_count > flip_limit
+    )
+
+    if level == "recovery":
+        (
+            preview.recovery_stable_frame_count,
+            preview.recovery_heading_std_deg,
+            preview.recovery_target_y_delta_m,
+            preview.recovery_lateral_delta_m,
+            recovery_stable,
+        ) = update_recovery_stability(
+            analysis,
+            analysis.heading_robust_rad,
+            preview.heading_rate_limited,
+            preview.angular_direction_flip_count,
+            state,
+            config,
+            advance_state,
+        )
+        if (
+            not recovery_stable
+            or preview.recovery_stable_frame_count
+            < config.recovery_required_stable_frames
+        ):
+            reason = "recovery_not_stable"
+    elif advance_state:
+        state.reset_recovery()
+
+    if (
+        level in {"degraded", "recovery"}
+        and preview.angular_direction_unstable
+    ):
+        reason = "angular_direction_unstable"
+
+    if reason:
+        preview.controller_ready = False
+        preview.control_block_reason = reason
+        preview.control_quality_level = "blocked"
+        preview.mode_policy_reason = reason
+        preview.suggested_linear_x = 0.0
+        preview.suggested_angular_z = 0.0
+        if advance_state:
+            state.last_suggested_angular_z = 0.0
+            state.last_angular_timestamp = instant
+            if reason != "recovery_not_stable":
+                state.reset_recovery()
+        preview.controller_confidence = 0.0
+    else:
+        preview.suggested_angular_z = (
+            preview.suggested_angular_z_rate_limited
         )
         preview.controller_confidence = compute_controller_confidence(
             analysis,
             perception,
+            preview,
             config,
-            degraded,
-            preview.angular_command_saturated,
-        )
-        base_speed = (
-            config.degraded_suggested_linear_x
-            if degraded
-            else config.nominal_suggested_linear_x
         )
         confidence_factor = clamp(
             0.55 + 0.45 * preview.controller_confidence, 0.45, 1.0
@@ -669,6 +1478,25 @@ def compute_preview_command(
             1.0,
         )
         coverage_factor = 0.80 if preview.lookahead_clamped else 1.0
+        angular_factor = clamp(
+            1.0
+            - abs(preview.suggested_angular_z)
+            / max(2.0 * angular_limit, 1.0e-6),
+            0.55,
+            1.0,
+        )
+        continuity_factor = (
+            0.82
+            if preview.heading_rate_limited
+            or preview.angular_rate_limited
+            else 1.0
+        )
+        disagreement_factor = (
+            0.80
+            if preview.heading_estimator_disagreement
+            or preview.heading_chord_disagreement
+            else 1.0
+        )
         fps_factor = clamp(
             perception.process_fps / max(config.min_process_fps * 1.5, 1.0),
             0.70,
@@ -681,8 +1509,13 @@ def compute_preview_command(
             * lateral_factor
             * heading_factor
             * coverage_factor
+            * angular_factor
+            * continuity_factor
+            * disagreement_factor
             * fps_factor,
         )
+    if advance_state:
+        state.last_path_span_m = float(analysis.span_m)
     preview.calculation_time_ms = (
         time.perf_counter() - started
     ) * 1000.0
@@ -696,6 +1529,9 @@ def safe_compute_preview(
     path_age_sec: float,
     status_age_sec: float,
     update_rate_hz: float = 0.0,
+    runtime_state: Optional[ControllerRuntimeState] = None,
+    now: Optional[float] = None,
+    advance_state: bool = True,
 ) -> ControllerPreview:
     try:
         return compute_preview_command(
@@ -705,6 +1541,9 @@ def safe_compute_preview(
             path_age_sec,
             status_age_sec,
             update_rate_hz,
+            runtime_state,
+            now,
+            advance_state,
         )
     except Exception as exc:
         return ControllerPreview(
@@ -742,6 +1581,9 @@ class LanePathControllerNode(Node):
         self.path_analysis = PathAnalysis()
         self.path_received_monotonic = 0.0
         self.preview = ControllerPreview()
+        self.runtime_state = ControllerRuntimeState()
+        self.path_sequence = 0
+        self.processed_path_sequence = -1
         self.path_rate = RateMeter()
         self.last_log_monotonic = 0.0
         self.last_exception_log_monotonic = 0.0
@@ -790,6 +1632,7 @@ class LanePathControllerNode(Node):
                 reason=f"path_callback_error:{type(exc).__name__}"
             )
         self.path_received_monotonic = now
+        self.path_sequence += 1
         self.path_rate.tick(now)
         self._refresh_preview(now)
 
@@ -818,6 +1661,10 @@ class LanePathControllerNode(Node):
             if self.perception.received
             else -1.0
         )
+        advance_state = bool(
+            self.path_sequence != self.processed_path_sequence
+            and (self.perception.received or not self.path_analysis.valid)
+        )
         self.preview = safe_compute_preview(
             self.path_analysis,
             self.perception,
@@ -825,7 +1672,18 @@ class LanePathControllerNode(Node):
             path_age,
             status_age,
             self.path_rate.value(),
+            self.runtime_state,
+            now,
+            advance_state,
         )
+        if advance_state:
+            self.processed_path_sequence = self.path_sequence
+        if (
+            not self.preview.controller_ready
+            and self.preview.control_block_reason
+            != "recovery_not_stable"
+        ):
+            self.runtime_state.reset()
 
     def _publish_observation(self) -> None:
         try:
@@ -842,24 +1700,23 @@ class LanePathControllerNode(Node):
         if now - self.last_log_monotonic >= 1.0 / self.config.log_rate_hz:
             self.last_log_monotonic = now
             if self.preview.controller_ready:
-                level = "DEGRADED" if self.preview.degraded_mode else "READY"
                 self.get_logger().info(
-                    f"{level} mode={self.preview.centerline_mode} "
+                    f"READY quality={self.preview.control_quality_level} "
+                    f"mode={self.preview.centerline_mode} "
                     f"lat={self.preview.lateral_error_m:+.3f}m "
+                    f"heading_raw={self.preview.heading_error_raw_deg:+.1f}deg "
                     f"heading={self.preview.heading_error_deg:+.1f}deg "
-                    f"target=({self.preview.lookahead_target_x_m:.2f},"
-                    f"{self.preview.lookahead_target_y_m:+.3f}) "
-                    f"preview_v={self.preview.suggested_linear_x:.3f}m/s "
-                    f"preview_w={self.preview.suggested_angular_z:+.3f}rad/s "
-                    f"confidence={self.preview.controller_confidence:.2f} "
-                    f"path_age={self.preview.path_age_ms:.0f}ms"
+                    f"v={self.preview.suggested_linear_x:.3f} "
+                    f"w={self.preview.suggested_angular_z:+.3f} "
+                    f"conf={self.preview.controller_confidence:.2f}"
                 )
             else:
                 self.get_logger().warning(
                     f"BLOCKED reason={self.preview.control_block_reason} "
                     f"mode={self.preview.centerline_mode or '-'} "
-                    f"path_age={self.preview.path_age_ms:.0f}ms "
-                    f"status_age={self.preview.status_age_ms:.0f}ms"
+                    f"stable={self.preview.recovery_stable_frame_count}/"
+                    f"{self.preview.recovery_required_stable_frames} "
+                    f"path_age={self.preview.path_age_ms:.0f}ms"
                 )
 
     def _handle_observation_exception(self, exc: Exception) -> None:
@@ -875,6 +1732,10 @@ class LanePathControllerNode(Node):
             suggested_angular_z=0.0,
             controller_confidence=0.0,
         )
+        try:
+            self.runtime_state.reset()
+        except Exception:
+            pass
         # This minimal fault status contains Python-native values only. Even its
         # construction, conversion, or publication is isolated from the timer.
         try:
@@ -1016,7 +1877,7 @@ def run_self_test() -> None:
     @test("13 short span blocks")
     def _() -> None:
         result = validate_path(
-            "base_link", _path_points(start=0.1, end=0.4), config
+            "base_link", _path_points(start=0.1, end=0.3), config
         )
         assert not result.valid and result.reason == "path_span_too_short"
 
@@ -1075,7 +1936,7 @@ def run_self_test() -> None:
             0.01,
             0.01,
         )
-        assert preview.control_block_reason == "centerline_confidence_low"
+        assert preview.control_block_reason == "normal_confidence_low"
 
     @test("21 degraded reduces speed and confidence")
     def _() -> None:
@@ -1085,7 +1946,7 @@ def run_self_test() -> None:
         )
         degraded = compute_preview_command(
             result,
-            _healthy_perception(mode="single_green_width_offset"),
+            _healthy_perception(mode="green_yellow_hybrid"),
             config,
             0.01,
             0.01,
@@ -1161,7 +2022,7 @@ def run_self_test() -> None:
     @test("30 calculation exception safely blocks")
     def _() -> None:
         result = validate_path("base_link", _path_points(), config)
-        broken = ControllerConfig(max_suggested_angular_z="broken")  # type: ignore[arg-type]
+        broken = ControllerConfig(normal_max_angular_z="broken")  # type: ignore[arg-type]
         preview = safe_compute_preview(
             result, _healthy_perception(), broken, 0.01, 0.01
         )
@@ -1339,6 +2200,679 @@ def run_self_test() -> None:
         assert not fault.controller_ready
         assert fault.suggested_linear_x == 0.0
         assert fault.suggested_angular_z == 0.0
+
+    @test("48 robust straight heading zero")
+    def _() -> None:
+        result = validate_path("base_link", _path_points(), config)
+        assert abs(result.heading_robust_rad) < 1.0e-9
+
+    @test("49 robust left heading positive")
+    def _() -> None:
+        result = validate_path(
+            "base_link", _path_points(slope=0.08), config
+        )
+        assert result.heading_robust_rad > 0.0
+
+    @test("50 robust right heading negative")
+    def _() -> None:
+        result = validate_path(
+            "base_link", _path_points(slope=-0.08), config
+        )
+        assert result.heading_robust_rad < 0.0
+
+    @test("51 one far outlier does not create heading jump")
+    def _() -> None:
+        points = _path_points(start=0.30, end=0.55, count=6, slope=0.05)
+        points[-1, 1] += 0.08
+        result = validate_path("base_link", points, config)
+        assert result.valid
+        assert abs(math.degrees(result.heading_robust_rad)) < 6.0
+
+    @test("52 segment median matches constant slope")
+    def _() -> None:
+        result = validate_path(
+            "base_link", _path_points(slope=0.10), config
+        )
+        assert abs(result.heading_segment_median_rad - math.atan(0.10)) < 1e-9
+
+    @test("53 MAD removes segment outlier")
+    def _() -> None:
+        points = _path_points(start=0.30, end=0.55, count=6, slope=0.05)
+        points[-1, 1] += 0.08
+        result = validate_path("base_link", points, config)
+        assert result.heading_segment_count_used < result.heading_segment_count_raw
+
+    @test("54 OLS disagreement retains robust heading")
+    def _() -> None:
+        points = _path_points(start=0.30, end=0.55, count=6, slope=0.05)
+        points[-1, 1] += 0.12
+        result = validate_path("base_link", points, config)
+        assert result.heading_estimator_disagreement
+        assert result.heading_error_rad == result.heading_robust_rad
+
+    @test("55 chord heading is correct")
+    def _() -> None:
+        result = validate_path(
+            "base_link", _path_points(slope=0.10), config
+        )
+        assert abs(result.heading_chord_rad - math.atan(0.10)) < 1e-9
+
+    @test("56 chord disagreement is diagnosed")
+    def _() -> None:
+        points = _path_points(start=0.30, end=0.60, count=7, slope=0.04)
+        points[3, 1] += 0.10
+        result = validate_path("base_link", points, config)
+        assert result.valid
+        assert result.heading_chord_disagreement or result.heading_estimator_disagreement
+
+    @test("57 tiny dx segment is excluded")
+    def _() -> None:
+        x = np.array([0.30, 0.305, 0.35, 0.40, 0.45, 0.50, 0.55])
+        points = np.column_stack((x, 0.05 * x))
+        result = validate_path("base_link", points, config)
+        assert result.valid
+        assert result.heading_segment_count_raw == 5
+
+    @test("58 insufficient valid segments fails safely")
+    def _() -> None:
+        x = np.array([0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.55])
+        points = np.column_stack((x, 0.05 * x))
+        result = validate_path("base_link", points, config)
+        assert not result.valid
+        assert result.reason == "heading_estimation_failed"
+
+    @test("59 first heading frame initializes directly")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        value, used, limited, dt = filter_heading_temporal(
+            0.10, 1.0, "green_dual_inner_edge", state, config, True
+        )
+        assert abs(value - 0.10) < 1e-9 and not used and not limited and dt == 0
+
+    @test("60 small heading change is filtered normally")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_heading_error_rad=0.05,
+            last_heading_timestamp=1.0,
+            last_centerline_mode="green_dual_inner_edge",
+        )
+        value, used, limited, _ = filter_heading_temporal(
+            0.06, 1.2, "green_dual_inner_edge", state, config, True
+        )
+        assert 0.05 < value < 0.06 and used and not limited
+
+    @test("61 one-frame heading jump is rate limited")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_heading_error_rad=math.radians(3.0),
+            last_heading_timestamp=1.0,
+            last_centerline_mode="green_dual_inner_edge",
+        )
+        value, _, limited, _ = filter_heading_temporal(
+            math.radians(18.0),
+            1.1,
+            "single_green_width_offset",
+            state,
+            config,
+            True,
+        )
+        assert limited and math.degrees(value) < 10.0
+
+    @test("62 sustained turn is followed over time")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        values = []
+        for index in range(12):
+            value, _, _, _ = filter_heading_temporal(
+                math.radians(15.0),
+                1.0 + 0.2 * index,
+                "green_dual_inner_edge",
+                state,
+                config,
+                True,
+            )
+            values.append(value)
+        assert values[-1] > math.radians(14.0)
+
+    @test("63 heading history resets after timeout")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_heading_error_rad=0.0,
+            last_heading_timestamp=1.0,
+            last_centerline_mode="green_dual_inner_edge",
+        )
+        value, used, _, _ = filter_heading_temporal(
+            0.20, 2.0, "green_dual_inner_edge", state, config, True
+        )
+        assert abs(value - 0.20) < 1e-9 and not used
+
+    @test("64 explicit blocked reset clears heading")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_heading_error_rad=0.1, last_heading_timestamp=1.0
+        )
+        state.reset()
+        assert state.last_heading_error_rad is None
+
+    @test("65 backward timestamp resets heading")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_heading_error_rad=0.1,
+            last_heading_timestamp=2.0,
+            last_centerline_mode="green_dual_inner_edge",
+        )
+        value, used, _, _ = filter_heading_temporal(
+            -0.1, 1.0, "green_dual_inner_edge", state, config, True
+        )
+        assert abs(value + 0.1) < 1e-9 and not used
+
+    @test("66 normal mode policy")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        level, reason = evaluate_mode_policy(
+            analysis, _healthy_perception(), config
+        )
+        assert level == "normal" and reason == "normal_mode_accepted"
+
+    @test("67 hybrid short path enters degraded")
+    def _() -> None:
+        points = _path_points(start=0.30, end=0.60, count=7, slope=0.05)
+        analysis = validate_path("base_link", points, config)
+        snapshot = _healthy_perception(
+            mode="green_yellow_hybrid", confidence=0.90
+        )
+        level, _ = evaluate_mode_policy(analysis, snapshot, config)
+        assert level == "degraded"
+
+    @test("68 recovery first frame is blocked")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        analysis = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.60, count=7, slope=0.05),
+            config,
+        )
+        preview = compute_preview_command(
+            analysis,
+            _healthy_perception(
+                mode="single_green_width_offset", confidence=0.80
+            ),
+            config,
+            0.01,
+            0.01,
+            runtime_state=state,
+            now=1.0,
+        )
+        assert not preview.controller_ready
+        assert preview.control_block_reason == "recovery_not_stable"
+
+    @test("69 recovery becomes ready on fourth stable frame")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        analysis = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.60, count=7, slope=0.05),
+            config,
+        )
+        snapshot = _healthy_perception(
+            mode="single_green_width_offset", confidence=0.80
+        )
+        previews = [
+            compute_preview_command(
+                analysis,
+                snapshot,
+                config,
+                0.01,
+                0.01,
+                runtime_state=state,
+                now=1.0 + 0.2 * index,
+            )
+            for index in range(4)
+        ]
+        assert all(not item.controller_ready for item in previews[:3])
+        assert previews[3].controller_ready
+        assert previews[3].control_quality_level == "recovery"
+
+    @test("70 recovery anomaly resets stable count")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        snapshot = _healthy_perception(
+            mode="single_green_width_offset", confidence=0.80
+        )
+        stable = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.60, count=7, slope=0.03),
+            config,
+        )
+        compute_preview_command(
+            stable, snapshot, config, 0.01, 0.01,
+            runtime_state=state, now=1.0
+        )
+        unstable = validate_path(
+            "base_link",
+            _path_points(
+                lateral=0.04, start=0.30, end=0.60, count=7, slope=0.03
+            ),
+            config,
+        )
+        preview = compute_preview_command(
+            unstable, snapshot, config, 0.01, 0.01,
+            runtime_state=state, now=1.2
+        )
+        assert preview.recovery_stable_frame_count == 0
+
+    @test("71 unsupported single boundary always blocks")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis,
+            _healthy_perception(mode="single_boundary_normal_offset"),
+            config, 0.01, 0.01
+        )
+        assert preview.control_block_reason == "unsupported_single_boundary_mode"
+
+    @test("72 invalid mode always blocks")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(mode="invalid"),
+            config, 0.01, 0.01
+        )
+        assert not preview.controller_ready
+
+    @test("73 unknown mode always blocks")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(mode="mystery"),
+            config, 0.01, 0.01
+        )
+        assert preview.control_block_reason == "centerline_mode_not_allowed"
+
+    @test("74 recovery span below minimum blocks")
+    def _() -> None:
+        local = ControllerConfig(min_path_span_m=0.20)
+        local.validate()
+        analysis = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.52, count=6),
+            local,
+        )
+        level, reason = evaluate_mode_policy(
+            analysis,
+            _healthy_perception(mode="single_green_width_offset"),
+            local,
+        )
+        assert level == "blocked" and reason == "recovery_path_span_low"
+
+    @test("75 recovery low confidence blocks")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.60, count=7),
+            config,
+        )
+        level, reason = evaluate_mode_policy(
+            analysis,
+            _healthy_perception(
+                mode="single_green_width_offset", confidence=0.69
+            ),
+            config,
+        )
+        assert level == "blocked" and reason == "recovery_confidence_low"
+
+    @test("76 left curve angular remains positive")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(slope=0.10), config
+        )
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        assert preview.suggested_angular_z > 0
+
+    @test("77 right curve angular remains negative")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(slope=-0.10), config
+        )
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        assert preview.suggested_angular_z < 0
+
+    @test("78 normal angular mode limit")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(lateral=0.14, slope=0.4), config
+        )
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        assert abs(preview.suggested_angular_z_mode_limited) <= 0.60
+
+    @test("79 degraded angular mode limit")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(lateral=0.14, slope=0.4), config
+        )
+        preview = compute_preview_command(
+            analysis,
+            _healthy_perception(mode="green_yellow_hybrid"),
+            config, 0.01, 0.01
+        )
+        assert abs(preview.suggested_angular_z_mode_limited) <= 0.30
+
+    @test("80 recovery angular mode limit")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link",
+            _path_points(
+                lateral=0.10, start=0.30, end=0.60, count=7, slope=0.2
+            ),
+            config,
+        )
+        preview = compute_preview_command(
+            analysis,
+            _healthy_perception(mode="single_green_width_offset"),
+            config, 0.01, 0.01
+        )
+        assert abs(preview.suggested_angular_z_mode_limited) <= 0.20
+
+    @test("81 angular slew rate limit")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_suggested_angular_z=0.10,
+            last_angular_timestamp=1.0,
+        )
+        value, limited, _, _, _, _ = angular_slew_limit(
+            0.30, 1.2, state, config, True
+        )
+        assert limited and value <= 0.2200001
+
+    @test("82 blocked command is immediately zero")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(valid=False),
+            config, 0.01, 0.01
+        )
+        assert preview.suggested_angular_z == 0.0
+
+    @test("83 measured angular jump is suppressed")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_suggested_angular_z=0.115,
+            last_angular_timestamp=1.0,
+        )
+        value, limited, _, _, _, _ = angular_slew_limit(
+            0.300, 1.2, state, config, True
+        )
+        assert limited and value < 0.300
+
+    @test("84 sustained angular target is eventually reached")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_suggested_angular_z=0.0,
+            last_angular_timestamp=1.0,
+        )
+        value = 0.0
+        for index in range(1, 8):
+            value, _, _, _, _, _ = angular_slew_limit(
+                0.30, 1.0 + 0.2 * index, state, config, True
+            )
+        assert abs(value - 0.30) < 1e-9
+
+    @test("85 frequent direction flips are detected")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        flips = 0
+        for value in (0.1, -0.1, 0.1, -0.1):
+            _, flips = update_direction_history(
+                value, state, config, True
+            )
+        assert flips == 3
+
+    @test("86 deadband values do not count as flips")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        for value in (0.01, -0.02, 0.0):
+            sign, flips = update_direction_history(
+                value, state, config, True
+            )
+            assert sign == 0 and flips == 0
+
+    @test("87 normal speed exceeds degraded")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        normal = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        degraded = compute_preview_command(
+            analysis,
+            _healthy_perception(mode="green_yellow_hybrid"),
+            config, 0.01, 0.01
+        )
+        assert normal.suggested_linear_x > degraded.suggested_linear_x
+
+    @test("88 degraded base speed is at least recovery base")
+    def _() -> None:
+        assert (
+            config.degraded_suggested_linear_x
+            >= config.recovery_suggested_linear_x
+        )
+
+    @test("89 blocked linear speed is zero")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(valid=False),
+            config, 0.01, 0.01
+        )
+        assert preview.suggested_linear_x == 0.0
+
+    @test("90 recovery confidence cap")
+    def _() -> None:
+        state = ControllerRuntimeState()
+        analysis = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.60, count=7, slope=0.03),
+            config,
+        )
+        snapshot = _healthy_perception(
+            mode="single_green_width_offset", confidence=0.99
+        )
+        preview = None
+        for index in range(4):
+            preview = compute_preview_command(
+                analysis, snapshot, config, 0.01, 0.01,
+                runtime_state=state, now=1.0 + 0.2 * index
+            )
+        assert preview is not None
+        assert preview.controller_confidence <= 0.35
+
+    @test("91 estimator disagreement lowers confidence")
+    def _() -> None:
+        clean = validate_path("base_link", _path_points(slope=0.05), config)
+        points = _path_points(start=0.30, end=0.55, count=6, slope=0.05)
+        points[-1, 1] += 0.12
+        noisy = validate_path("base_link", points, config)
+        clean_preview = compute_preview_command(
+            clean, _healthy_perception(), config, 0.01, 0.01
+        )
+        noisy_preview = compute_preview_command(
+            noisy,
+            _healthy_perception(mode="green_yellow_hybrid"),
+            config, 0.01, 0.01
+        )
+        assert noisy_preview.controller_confidence < clean_preview.controller_confidence
+
+    @test("92 heading rate limit lowers confidence")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(slope=0.30), config
+        )
+        state = ControllerRuntimeState(
+            last_heading_error_rad=0.0,
+            last_heading_timestamp=1.0,
+            last_centerline_mode="green_dual_inner_edge",
+            last_suggested_angular_z=0.0,
+            last_angular_timestamp=1.0,
+        )
+        limited = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01,
+            runtime_state=state, now=1.1
+        )
+        baseline = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        assert limited.heading_rate_limited
+        assert limited.controller_confidence < baseline.controller_confidence
+
+    @test("93 new status fields serialize")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        document = json.loads(serialize_json(preview.to_dict()))
+        for key in (
+            "control_quality_level",
+            "heading_method",
+            "heading_robust_rad",
+            "heading_chord_rad",
+            "heading_error_filtered_rad",
+            "suggested_angular_z_mode_limited",
+            "angular_direction_flip_count",
+        ):
+            assert key in document
+
+    @test("94 numpy values remain serializable")
+    def _() -> None:
+        assert json.loads(
+            serialize_json({"flag": np.bool_(True), "value": np.float32(1.0)})
+        ) == {"flag": True, "value": 1.0}
+
+    @test("95 timer containment remains active")
+    def _() -> None:
+        node = LanePathControllerNode.__new__(LanePathControllerNode)
+        handled: List[Exception] = []
+        node._publish_observation_impl = (
+            lambda: (_ for _ in ()).throw(RuntimeError("test"))
+        )
+        node._handle_observation_exception = handled.append
+        node._publish_observation()
+        assert len(handled) == 1
+
+    @test("96 source has no forbidden message import")
+    def _() -> None:
+        source = FilePath(__file__).read_text(encoding="utf-8")
+        message_name = "Twi" + "st"
+        package_name = "geometry" + "_msgs.msg"
+        assert f"from {package_name} import {message_name}" not in source
+
+    @test("97 exactly one ROS publisher call remains")
+    def _() -> None:
+        source = FilePath(__file__).read_text(encoding="utf-8")
+        assert source.count("self.create_" + "publisher(") == 1
+
+    @test("98 source has no standard speed topic")
+    def _() -> None:
+        source = FilePath(__file__).read_text(encoding="utf-8")
+        assert ("/" + "cmd" + "_vel") not in source
+
+    @test("99 false dry run still forced true")
+    def _() -> None:
+        assert enforce_dry_run(False)
+
+    @test("100 exception preview has zero commands")
+    def _() -> None:
+        preview = ControllerPreview(
+            controller_ready=False,
+            control_block_reason="controller_exception",
+        )
+        assert preview.suggested_linear_x == 0.0
+        assert preview.suggested_angular_z == 0.0
+
+    @test("101 angular direction switch decelerates through zero")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_suggested_angular_z=0.10,
+            last_angular_timestamp=1.0,
+        )
+        value, limited, _, _, _, _ = angular_slew_limit(
+            -0.10, 1.2, state, config, True
+        )
+        assert limited
+        assert -0.061 <= value <= -0.059
+
+    @test("102 perception span participates in mode gate")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        snapshot = _healthy_perception()
+        snapshot.centerline_forward_span_m = 0.30
+        level, reason = evaluate_mode_policy(analysis, snapshot, config)
+        assert level == "blocked" and reason == "normal_path_span_low"
+
+    @test("103 degraded direction instability blocks")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            angular_direction_history=[1, -1, 1]
+        )
+        analysis = validate_path(
+            "base_link", _path_points(slope=0.05), config
+        )
+        preview = compute_preview_command(
+            analysis,
+            _healthy_perception(mode="green_yellow_hybrid"),
+            config,
+            0.01,
+            0.01,
+            runtime_state=state,
+            now=1.0,
+        )
+        assert not preview.controller_ready
+        assert preview.control_block_reason == "angular_direction_unstable"
+
+    @test("104 mode cap holds without new path state advance")
+    def _() -> None:
+        state = ControllerRuntimeState(
+            last_heading_error_rad=0.2,
+            last_heading_timestamp=1.0,
+            last_suggested_angular_z=0.5,
+            last_angular_timestamp=1.0,
+            last_centerline_mode="green_dual_inner_edge",
+        )
+        analysis = validate_path(
+            "base_link", _path_points(slope=0.2), config
+        )
+        preview = compute_preview_command(
+            analysis,
+            _healthy_perception(mode="green_yellow_hybrid"),
+            config,
+            0.01,
+            0.01,
+            runtime_state=state,
+            now=1.2,
+            advance_state=False,
+        )
+        assert abs(preview.suggested_angular_z) <= 0.30
+
+    @test("105 dual boundary midpoint is capped degraded")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link",
+            _path_points(start=0.30, end=0.60, count=7),
+            config,
+        )
+        level, _ = evaluate_mode_policy(
+            analysis,
+            _healthy_perception(
+                mode="dual_boundary_midpoint", confidence=0.85
+            ),
+            config,
+        )
+        assert level == "degraded"
 
     failures: List[str] = []
     for name, function in tests:
