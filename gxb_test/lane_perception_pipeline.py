@@ -567,6 +567,8 @@ class YellowCorridorConfig:
     center_gap_fill_max_ratio: float = 0.25
     center_smooth_enable: bool = True
     center_smooth_lambda: float = 2.0
+    green_outer_seed_max_gap_px: int = 8
+    green_min_outer_run_width_px: int = 8
 
     def validate(self) -> None:
         if self.sample_step_m <= 0 or self.center_jump_max_m <= 0:
@@ -591,6 +593,10 @@ class YellowCorridorConfig:
             raise ValueError("center gap fill ratio must be in [0, 1]")
         if self.center_smooth_lambda < 0:
             raise ValueError("center smoothing lambda must be non-negative")
+        if self.green_outer_seed_max_gap_px < 0:
+            raise ValueError("green outer seed gap must be non-negative")
+        if self.green_min_outer_run_width_px < 1:
+            raise ValueError("green outer run width must be positive")
 
 
 class YellowCorridorPlanner:
@@ -1650,36 +1656,65 @@ class GreenBoundaryFastPlanner:
         "green_corridor_green_intrusion_ratio": 0.0,
         "green_boundary_fast_path_used": False,
         "green_boundary_fast_path_reason": "not_attempted",
+        "green_reject_no_valid_ipm_span_count": 0,
+        "green_reject_left_outer_run_missing_count": 0,
+        "green_reject_right_outer_run_missing_count": 0,
+        "green_reject_left_outer_gap_count": 0,
+        "green_reject_right_outer_gap_count": 0,
+        "green_reject_left_run_too_short_count": 0,
+        "green_reject_right_run_too_short_count": 0,
+        "green_reject_width_count": 0,
+        "green_reject_center_jump_count": 0,
+        "green_reject_green_intrusion_count": 0,
+        "green_valid_span_left_x_mean": 0.0,
+        "green_valid_span_right_x_mean": 0.0,
+        "green_left_outer_gap_px_mean": 0.0,
+        "green_right_outer_gap_px_mean": 0.0,
     }
 
     @staticmethod
     def _side_interval(
         intervals: Sequence[Tuple[int, int]],
-        row_width: int,
         side: str,
         center_x: int,
+        valid_left_x: int,
+        valid_right_x: int,
         previous_inner_x: Optional[float],
         continuity_limit_px: float,
         minimum_span_px: int,
-    ) -> Optional[Tuple[int, int, bool]]:
-        candidates: List[Tuple[int, float, int, int, bool]] = []
+        outer_seed_max_gap_px: int,
+    ) -> Tuple[Optional[Tuple[int, int, bool, int]], str, Optional[int]]:
+        candidates: List[Tuple[int, int, float, int, int, bool]] = []
+        side_run_found = False
+        long_run_found = False
+        observed_outer_gaps: List[int] = []
         for left, right in intervals:
+            left = max(int(left), valid_left_x)
+            right = min(int(right), valid_right_x)
+            if right < left:
+                continue
             if side == "left":
                 if right >= center_x:
                     continue
-                connected = left == 0
                 inner_x = float(right)
+                outer_gap = left - valid_left_x
             else:
                 if left <= center_x:
                     continue
-                connected = right == row_width - 1
                 inner_x = float(left)
+                outer_gap = valid_right_x - right
+            side_run_found = True
             span = right - left + 1
+            if span < minimum_span_px:
+                continue
+            long_run_found = True
+            observed_outer_gaps.append(int(outer_gap))
+            seeded = outer_gap <= outer_seed_max_gap_px
             continuous = bool(
                 previous_inner_x is not None
                 and abs(inner_x - previous_inner_x) <= continuity_limit_px
             )
-            if span < minimum_span_px or not (connected or continuous):
+            if not (seeded or continuous):
                 continue
             distance = (
                 abs(inner_x - previous_inner_x)
@@ -1687,27 +1722,47 @@ class GreenBoundaryFastPlanner:
                 else 0.0
             )
             candidates.append(
-                (0 if connected else 1, distance, left, right, connected)
+                (
+                    0 if seeded else 1,
+                    int(outer_gap),
+                    distance,
+                    left,
+                    right,
+                    seeded,
+                )
             )
         if not candidates:
-            return None
-        _priority, _distance, left, right, connected = min(
-            candidates, key=lambda item: (item[0], item[1], -item[3] + item[2])
+            if not side_run_found:
+                return None, "outer_run_missing", None
+            if not long_run_found:
+                return None, "run_too_short", None
+            return None, "outer_gap", min(observed_outer_gaps)
+        _priority, outer_gap, _distance, left, right, seeded = min(
+            candidates,
+            key=lambda item: (item[0], item[1], item[2], item[3] - item[4]),
         )
-        return int(left), int(right), bool(connected)
+        return (
+            (int(left), int(right), bool(seeded), int(outer_gap)),
+            "valid",
+            int(outer_gap),
+        )
 
     @staticmethod
     def _corridor_evidence(
         green_row: np.ndarray,
         yellow_row: np.ndarray,
+        valid_row: np.ndarray,
         left_inner: int,
         right_inner: int,
     ) -> Tuple[float, float, float]:
         start, end = left_inner + 1, right_inner
         if end <= start:
             return 0.0, 1.0, 1.0
-        green_inside = green_row[start:end] > 0
-        yellow_inside = yellow_row[start:end] > 0
+        valid_inside = valid_row[start:end]
+        if not np.any(valid_inside):
+            return 0.0, 0.0, 0.0
+        green_inside = green_row[start:end][valid_inside] > 0
+        yellow_inside = yellow_row[start:end][valid_inside] > 0
         yellow_ratio = float(np.mean(yellow_inside))
         intrusion_ratio = float(np.mean(green_inside))
         unknown_ratio = float(np.mean(~green_inside & ~yellow_inside))
@@ -1721,15 +1776,23 @@ class GreenBoundaryFastPlanner:
         ipm: Any,
         config: YellowCorridorConfig,
         seed_center_x: Optional[float] = None,
+        ipm_valid_mask: Optional[np.ndarray] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         status = copy.deepcopy(cls.EMPTY_STATUS)
         samples: List[Dict[str, Any]] = []
+        valid_mask = (
+            np.ones_like(green, dtype=bool)
+            if ipm_valid_mask is None
+            else np.asarray(ipm_valid_mask, dtype=bool)
+        )
+        if valid_mask.shape != green.shape or yellow.shape != green.shape:
+            raise ValueError("green/yellow/ipm_valid_mask shape mismatch")
         step_px = max(2, int(round(config.sample_step_m / ipm.meter_per_pixel)))
         expected_width = float(ipm.expected_lane_width_px)
         minimum_width = expected_width * config.width_min_ratio
         maximum_width = expected_width * config.width_max_ratio
         continuity_limit = config.center_jump_max_m / ipm.meter_per_pixel
-        minimum_green_span = max(4, int(round(expected_width * 0.15)))
+        minimum_green_span = config.green_min_outer_run_width_px
         center_axis = int(round(ipm.vehicle_center_x_px))
         previous_left: Optional[float] = None
         previous_right: Optional[float] = None
@@ -1743,26 +1806,69 @@ class GreenBoundaryFastPlanner:
         yellow_ratios: List[float] = []
         unknown_ratios: List[float] = []
         intrusion_ratios: List[float] = []
+        valid_left_values: List[int] = []
+        valid_right_values: List[int] = []
+        left_outer_gaps: List[int] = []
+        right_outer_gaps: List[int] = []
 
         for y in range(green.shape[0] - 1, -1, -step_px):
-            row_intervals = YellowCorridorPlanner._intervals(green[y])
-            left_interval = cls._side_interval(
+            valid_x = np.flatnonzero(valid_mask[y])
+            if not len(valid_x):
+                status["green_reject_no_valid_ipm_span_count"] += 1
+                status["green_left_inner_edge_missing_count"] += 1
+                status["green_right_inner_edge_missing_count"] += 1
+                samples.append(
+                    {
+                        "y": int(y),
+                        "forward_m": YellowCorridorPlanner._forward_m(y, ipm),
+                        "reason": "green_reject_no_valid_ipm_span",
+                        "classification": "missing",
+                        "source_type": "missing",
+                        "left": None,
+                        "right": None,
+                        "center": None,
+                        "width": None,
+                        "single_side": "",
+                        "yellow_support_ratio": 0.0,
+                        "unknown_ratio": 0.0,
+                        "green_intrusion_ratio": 0.0,
+                        "valid_left_x": None,
+                        "valid_right_x": None,
+                        "left_outer_gap_px": None,
+                        "right_outer_gap_px": None,
+                    }
+                )
+                continue
+            valid_left_x, valid_right_x = int(valid_x[0]), int(valid_x[-1])
+            valid_left_values.append(valid_left_x)
+            valid_right_values.append(valid_right_x)
+            row_green = np.where(valid_mask[y], green[y], 0).astype(np.uint8)
+            row_intervals = YellowCorridorPlanner._intervals(row_green)
+            left_interval, left_failure, left_gap_diagnostic = cls._side_interval(
                 row_intervals,
-                green.shape[1],
                 "left",
                 center_axis,
+                valid_left_x,
+                valid_right_x,
                 previous_left,
                 continuity_limit,
                 minimum_green_span,
+                config.green_outer_seed_max_gap_px,
             )
-            right_interval = cls._side_interval(
+            (
+                right_interval,
+                right_failure,
+                right_gap_diagnostic,
+            ) = cls._side_interval(
                 row_intervals,
-                green.shape[1],
                 "right",
                 center_axis,
+                valid_left_x,
+                valid_right_x,
                 previous_right,
                 continuity_limit,
                 minimum_green_span,
+                config.green_outer_seed_max_gap_px,
             )
             left_inner = (
                 int(left_interval[1]) if left_interval is not None else None
@@ -1770,18 +1876,50 @@ class GreenBoundaryFastPlanner:
             right_inner = (
                 int(right_interval[0]) if right_interval is not None else None
             )
+            left_outer_gap = (
+                int(left_interval[3])
+                if left_interval is not None
+                else left_gap_diagnostic
+            )
+            right_outer_gap = (
+                int(right_interval[3])
+                if right_interval is not None
+                else right_gap_diagnostic
+            )
+            if left_outer_gap is not None:
+                left_outer_gaps.append(left_outer_gap)
+            if right_outer_gap is not None:
+                right_outer_gaps.append(right_outer_gap)
+            if left_interval is None:
+                status[
+                    "green_reject_left_run_too_short_count"
+                    if left_failure == "run_too_short"
+                    else "green_reject_left_outer_gap_count"
+                    if left_failure == "outer_gap"
+                    else "green_reject_left_outer_run_missing_count"
+                ] += 1
+            if right_interval is None:
+                status[
+                    "green_reject_right_run_too_short_count"
+                    if right_failure == "run_too_short"
+                    else "green_reject_right_outer_gap_count"
+                    if right_failure == "outer_gap"
+                    else "green_reject_right_outer_run_missing_count"
+                ] += 1
             if (
                 left_inner is not None
                 and previous_left is not None
                 and abs(left_inner - previous_left) > continuity_limit
             ):
                 left_inner = None
+                status["green_reject_center_jump_count"] += 1
             if (
                 right_inner is not None
                 and previous_right is not None
                 and abs(right_inner - previous_right) > continuity_limit
             ):
                 right_inner = None
+                status["green_reject_center_jump_count"] += 1
             if left_inner is None:
                 status["green_left_inner_edge_missing_count"] += 1
             if right_inner is None:
@@ -1804,14 +1942,21 @@ class GreenBoundaryFastPlanner:
                     unknown_ratio,
                     intrusion_ratio,
                 ) = cls._corridor_evidence(
-                    green[y], yellow[y], left_inner, right_inner
+                    green[y],
+                    yellow[y],
+                    valid_mask[y],
+                    left_inner,
+                    right_inner,
                 )
                 if not (minimum_width <= width_value <= maximum_width):
                     reason = "green_corridor_width_invalid"
+                    status["green_reject_width_count"] += 1
                 elif abs(candidate_center - previous_center) > continuity_limit:
                     reason = "green_corridor_center_jump"
+                    status["green_reject_center_jump_count"] += 1
                 elif intrusion_ratio > cls.MAX_GREEN_INTRUSION_RATIO:
                     reason = "green_corridor_intrusion"
+                    status["green_reject_green_intrusion_count"] += 1
                 else:
                     classification = "green_dual_observed"
                     reason = "accepted"
@@ -1876,6 +2021,10 @@ class GreenBoundaryFastPlanner:
                     "yellow_support_ratio": yellow_ratio,
                     "unknown_ratio": unknown_ratio,
                     "green_intrusion_ratio": intrusion_ratio,
+                    "valid_left_x": valid_left_x,
+                    "valid_right_x": valid_right_x,
+                    "left_outer_gap_px": left_outer_gap,
+                    "right_outer_gap_px": right_outer_gap,
                 }
             )
 
@@ -1895,6 +2044,18 @@ class GreenBoundaryFastPlanner:
                 ),
                 "green_corridor_green_intrusion_ratio": float(
                     np.mean(intrusion_ratios) if intrusion_ratios else 0.0
+                ),
+                "green_valid_span_left_x_mean": float(
+                    np.mean(valid_left_values) if valid_left_values else 0.0
+                ),
+                "green_valid_span_right_x_mean": float(
+                    np.mean(valid_right_values) if valid_right_values else 0.0
+                ),
+                "green_left_outer_gap_px_mean": float(
+                    np.mean(left_outer_gaps) if left_outer_gaps else 0.0
+                ),
+                "green_right_outer_gap_px_mean": float(
+                    np.mean(right_outer_gaps) if right_outer_gaps else 0.0
                 ),
             }
         )
@@ -3182,6 +3343,22 @@ class LaneAlgorithm:
             self.resolved_forward_min_m,
             self.resolved_forward_max_m,
         ) = CroppedIpm.from_full(ipm, geometry_config)
+        source_valid = np.full(
+            (ipm.image_height, ipm.image_width), 255, dtype=np.uint8
+        )
+        self.ipm_valid_mask = (
+            STAGE4.MaskIpmTransformer.transform(
+                source_valid, self.roi_ipm
+            )
+            > 0
+        )
+        expected_valid_shape = (
+            self.roi_ipm.output_height,
+            self.roi_ipm.output_width,
+        )
+        if self.ipm_valid_mask.shape != expected_valid_shape:
+            raise ValueError("cached ipm_valid_mask shape mismatch")
+        self.ipm_valid_mask_build_count = 1
         self.last_valid_points = np.empty((0, 2), dtype=np.float64)
         self.last_valid_time = 0.0
         self.last_center_x: Optional[float] = None
@@ -3303,6 +3480,7 @@ class LaneAlgorithm:
             self.roi_ipm,
             self.corridor_config,
             self.last_center_x,
+            self.ipm_valid_mask,
         )
         (
             green_dual_result,
@@ -3764,13 +3942,29 @@ class LaneAlgorithm:
                 )
         for sample in green_samples or ():
             classification = sample.get("classification", "missing")
+            y = int(sample["y"])
+            if sample.get("valid_left_x") is not None:
+                cv2.circle(
+                    overlay,
+                    (int(sample["valid_left_x"]), y),
+                    1,
+                    (255, 255, 255),
+                    -1,
+                )
+            if sample.get("valid_right_x") is not None:
+                cv2.circle(
+                    overlay,
+                    (int(sample["valid_right_x"]), y),
+                    1,
+                    (255, 255, 255),
+                    -1,
+                )
             if classification not in {
                 "green_dual_observed",
                 "green_single_offset",
                 "gap_filled",
             }:
                 continue
-            y = int(sample["y"])
             center = int(round(float(sample["center"])))
             if classification == "green_dual_observed":
                 cv2.circle(
@@ -4009,6 +4203,15 @@ const fields=["centerline_mode","centerline_valid","centerline_confidence",
 "green_corridor_width_px_std","green_corridor_yellow_support_ratio",
 "green_corridor_unknown_ratio","green_corridor_green_intrusion_ratio",
 "green_boundary_fast_path_used","green_boundary_fast_path_reason",
+"green_reject_no_valid_ipm_span_count",
+"green_reject_left_outer_run_missing_count",
+"green_reject_right_outer_run_missing_count",
+"green_reject_left_outer_gap_count","green_reject_right_outer_gap_count",
+"green_reject_left_run_too_short_count",
+"green_reject_right_run_too_short_count","green_reject_width_count",
+"green_reject_center_jump_count","green_reject_green_intrusion_count",
+"green_valid_span_left_x_mean","green_valid_span_right_x_mean",
+"green_left_outer_gap_px_mean","green_right_outer_gap_px_mean",
 "yellow_corridor_reason","fallback_boundary_pipeline_used",
 "observed_boundary_component_count","repaired_boundary_component_count",
 "merged_boundary_group_count","repaired_gap_count","repaired_gap_max_px",
@@ -4339,6 +4542,8 @@ class LanePerceptionPipelineNode(Node):
             "center_gap_fill_max_ratio": 0.25,
             "center_smooth_enable": True,
             "center_smooth_lambda": 2.0,
+            "green_outer_seed_max_gap_px": 8,
+            "green_min_outer_run_width_px": 8,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -4509,6 +4714,12 @@ class LanePerceptionPipelineNode(Node):
             ),
             center_smooth_lambda=float(
                 self.get_parameter("center_smooth_lambda").value
+            ),
+            green_outer_seed_max_gap_px=int(
+                self.get_parameter("green_outer_seed_max_gap_px").value
+            ),
+            green_min_outer_run_width_px=int(
+                self.get_parameter("green_min_outer_run_width_px").value
             ),
         )
         config.validate()
@@ -4939,12 +5150,18 @@ class LanePerceptionPipelineNode(Node):
                     "green left/right="
                     f"{total - green.get('green_left_inner_edge_missing_count', 0)}/"
                     f"{total - green.get('green_right_inner_edge_missing_count', 0)} "
-                    f"dual={green.get('green_dual_edge_valid_count', 0)}"
-                ),
-                (
-                    "single left/right="
+                    f"dual={green.get('green_dual_edge_valid_count', 0)} "
+                    "single="
                     f"{green.get('green_single_left_count', 0)}/"
                     f"{green.get('green_single_right_count', 0)}"
+                ),
+                (
+                    "valid span L/R="
+                    f"{green.get('green_valid_span_left_x_mean', 0.0):.1f}/"
+                    f"{green.get('green_valid_span_right_x_mean', 0.0):.1f} "
+                    "outer gap="
+                    f"{green.get('green_left_outer_gap_px_mean', 0.0):.1f}/"
+                    f"{green.get('green_right_outer_gap_px_mean', 0.0):.1f}"
                 ),
                 (
                     "width="
@@ -6612,6 +6829,242 @@ def run_self_tests() -> None:
         and green_only_pipeline.counters["jpeg_encode_count"] == 0
         and green_only_pipeline.timing_ms["overlay_build_ms"] == 0.0
         and green_only_pipeline.timing_ms["jpeg_encode_ms"] == 0.0,
+    )
+
+    # 86-98：IPM 黑色三角无效区、真实有效边界种子与缓存验证。
+    triangular_valid = np.zeros(local_shape, dtype=bool)
+    valid_seed_green = np.zeros(local_shape, dtype=np.uint8)
+    valid_seed_yellow = np.zeros(local_shape, dtype=np.uint8)
+    for local_y in range(local_shape[0]):
+        taper = int(round((140 - local_y) * 0.08))
+        valid_left, valid_right = 20 + taper, 579 - taper
+        triangular_valid[local_y, valid_left : valid_right + 1] = True
+        valid_seed_green[local_y, valid_left:250] = 255
+        valid_seed_green[local_y, 351 : valid_right + 1] = 255
+        valid_seed_yellow[local_y, 250:351] = 255
+
+    valid_seed_samples, valid_seed_status = GreenBoundaryFastPlanner.extract(
+        valid_seed_green,
+        valid_seed_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+        ipm_valid_mask=triangular_valid,
+    )
+    valid_seed_result, valid_seed_plan_status, valid_seed_debug = (
+        GreenBoundaryFastPlanner.plan(
+            valid_seed_samples,
+            valid_seed_status,
+            valid_seed_green,
+            valid_seed_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            geometry,
+            allow_single=False,
+        )
+    )
+    check(
+        "86 black triangle valid boundary seed",
+        valid_seed_result.valid
+        and valid_seed_plan_status["green_dual_edge_valid_count"] == 15
+        and valid_seed_plan_status[
+            "green_reject_no_valid_ipm_span_count"
+        ]
+        == 0,
+    )
+    check(
+        "87 left seed uses valid left not zero",
+        all(
+            sample["valid_left_x"] > 0
+            and sample["left_outer_gap_px"] == 0
+            for sample in valid_seed_debug
+            if sample["classification"] == "green_dual_observed"
+        ),
+    )
+    check(
+        "88 right seed uses valid right not image edge",
+        all(
+            sample["valid_right_x"] < local_shape[1] - 1
+            and sample["right_outer_gap_px"] == 0
+            for sample in valid_seed_debug
+            if sample["classification"] == "green_dual_observed"
+        ),
+    )
+    check(
+        "89 invalid ipm black excluded from unknown",
+        valid_seed_plan_status["green_corridor_unknown_ratio"] == 0.0,
+    )
+
+    valid_noise_green = valid_seed_green.copy()
+    valid_noise_green[:, 286:292] = 255
+    valid_noise_samples, valid_noise_status = (
+        GreenBoundaryFastPlanner.extract(
+            valid_noise_green,
+            valid_seed_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            ipm_valid_mask=triangular_valid,
+        )
+    )
+    check(
+        "90 valid roi inner green noise ignored",
+        valid_noise_status["green_dual_edge_valid_count"] == 15
+        and all(
+            sample["left"] == 249
+            for sample in valid_noise_samples
+            if sample["classification"] == "green_dual_observed"
+        ),
+    )
+
+    outer_gap_green = np.zeros_like(valid_seed_green)
+    for local_y in range(local_shape[0]):
+        valid_x = np.flatnonzero(triangular_valid[local_y])
+        left_x, right_x = int(valid_x[0]), int(valid_x[-1])
+        outer_gap_green[local_y, left_x + 8 : 250] = 255
+        outer_gap_green[local_y, 351 : right_x - 8 + 1] = 255
+    outer_gap_samples, outer_gap_status = GreenBoundaryFastPlanner.extract(
+        outer_gap_green,
+        valid_seed_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+        ipm_valid_mask=triangular_valid,
+    )
+    check(
+        "91 outer gap up to eight pixels accepted",
+        outer_gap_status["green_dual_edge_valid_count"] == 15
+        and abs(outer_gap_status["green_left_outer_gap_px_mean"] - 8.0)
+        < 1.0e-9
+        and abs(outer_gap_status["green_right_outer_gap_px_mean"] - 8.0)
+        < 1.0e-9,
+    )
+
+    excessive_gap_green = np.zeros_like(valid_seed_green)
+    for local_y in range(local_shape[0]):
+        valid_x = np.flatnonzero(triangular_valid[local_y])
+        left_x, right_x = int(valid_x[0]), int(valid_x[-1])
+        excessive_gap_green[local_y, left_x + 9 : 250] = 255
+        excessive_gap_green[local_y, 351 : right_x - 9 + 1] = 255
+    _excessive_samples, excessive_status = GreenBoundaryFastPlanner.extract(
+        excessive_gap_green,
+        valid_seed_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+        ipm_valid_mask=triangular_valid,
+    )
+    check(
+        "92 excessive outer gap rejected",
+        excessive_status["green_dual_edge_valid_count"] == 0
+        and excessive_status["green_reject_left_outer_gap_count"] == 15
+        and excessive_status["green_reject_right_outer_gap_count"] == 15,
+    )
+
+    short_run_green = np.zeros_like(valid_seed_green)
+    for local_y in range(local_shape[0]):
+        valid_x = np.flatnonzero(triangular_valid[local_y])
+        left_x, right_x = int(valid_x[0]), int(valid_x[-1])
+        short_run_green[local_y, left_x : left_x + 7] = 255
+        short_run_green[local_y, right_x - 6 : right_x + 1] = 255
+    _short_samples, short_status = GreenBoundaryFastPlanner.extract(
+        short_run_green,
+        valid_seed_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+        ipm_valid_mask=triangular_valid,
+    )
+    check(
+        "93 short outer green run rejected",
+        short_status["green_dual_edge_valid_count"] == 0
+        and short_status["green_reject_left_run_too_short_count"] == 15
+        and short_status["green_reject_right_run_too_short_count"] == 15,
+    )
+    check(
+        "94 valid seed dual center correct",
+        np.max(np.abs(valid_seed_result.final_points[:, 0] - 300.0))
+        <= 1.0,
+    )
+
+    valid_no_yellow = np.zeros_like(valid_seed_yellow)
+    no_yellow_valid_samples, no_yellow_valid_status = (
+        GreenBoundaryFastPlanner.extract(
+            valid_seed_green,
+            valid_no_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            ipm_valid_mask=triangular_valid,
+        )
+    )
+    no_yellow_valid_result, _no_yellow_valid_plan, _no_yellow_valid_debug = (
+        GreenBoundaryFastPlanner.plan(
+            no_yellow_valid_samples,
+            no_yellow_valid_status,
+            valid_seed_green,
+            valid_no_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            geometry,
+            allow_single=False,
+        )
+    )
+    check(
+        "95 no yellow with valid green full path",
+        no_yellow_valid_result.valid
+        and len(no_yellow_valid_result.final_points) == 15,
+    )
+
+    curved_valid_green = np.zeros_like(valid_seed_green)
+    curved_valid_yellow = np.zeros_like(valid_seed_yellow)
+    for local_y in range(local_shape[0]):
+        valid_x = np.flatnonzero(triangular_valid[local_y])
+        left_x, right_x = int(valid_x[0]), int(valid_x[-1])
+        curve_center = 300 + int(round((140 - local_y) * 0.04))
+        left_inner, right_inner = curve_center - 50, curve_center + 50
+        curved_valid_green[local_y, left_x : left_inner + 1] = 255
+        curved_valid_green[local_y, right_inner : right_x + 1] = 255
+        curved_valid_yellow[local_y, left_inner + 1 : right_inner] = 255
+    curved_valid_samples, curved_valid_status = (
+        GreenBoundaryFastPlanner.extract(
+            curved_valid_green,
+            curved_valid_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            ipm_valid_mask=triangular_valid,
+        )
+    )
+    curved_valid_result, _curved_plan_status, _curved_debug = (
+        GreenBoundaryFastPlanner.plan(
+            curved_valid_samples,
+            curved_valid_status,
+            curved_valid_green,
+            curved_valid_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            geometry,
+            allow_single=False,
+        )
+    )
+    check(
+        "96 curved valid boundaries tracked",
+        curved_valid_result.valid
+        and curved_valid_status["green_dual_edge_valid_count"] == 15
+        and curved_valid_result.final_points[-1, 0]
+        > curved_valid_result.final_points[0, 0],
+    )
+
+    cached_mask_identity = id(algorithm.ipm_valid_mask)
+    cached_mask_build_count = algorithm.ipm_valid_mask_build_count
+    algorithm.process(image)
+    algorithm.process(image)
+    check(
+        "97 ipm valid mask cached once",
+        id(algorithm.ipm_valid_mask) == cached_mask_identity
+        and algorithm.ipm_valid_mask_build_count == cached_mask_build_count
+        == 1,
+    )
+    cached_web_off_result = algorithm.process(image)
+    check(
+        "98 valid mask web off no overlay build",
+        cached_web_off_result.overlay is None
+        and cached_web_off_result.counters["overlay_build_count"] == 0
+        and cached_web_off_result.counters["jpeg_encode_count"] == 0,
     )
 
     print(f"SELF-TEST PASS: {len(passed)} checks")
