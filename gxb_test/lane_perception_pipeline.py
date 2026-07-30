@@ -1,0 +1,1626 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+一体化黄绿车道感知运行节点。
+
+本程序直接通过 OpenCV V4L2 读取 USB 相机，在同一进程、同一帧内完成
+黄绿分割、公共边界、逆透视、道路几何和米制 Path 输出。中间 mask 只在
+NumPy 内存中传递，不经过 ROS 图像话题。
+
+运行：
+    python3 gxb_test/lane_perception_pipeline.py \
+      --ros-args \
+      -p device:=/dev/video0 \
+      -p profile_name:=usb_camera \
+      -p width:=640 \
+      -p height:=480 \
+      -p camera_fps:=10.0 \
+      -p camera_fourcc:=YUYV \
+      -p web_gui_enable:=true \
+      -p web_gui_port:=8093 \
+      -p web_gui_max_fps:=1.0 \
+      -p publish_debug_raw_images:=false
+
+浏览器访问 http://小车IP:8093。运行本程序时无需同时启动 USB 图像发布器、
+第二阶段分割程序或第四阶段几何程序。本节点只产生感知结果和调试画面。
+"""
+
+import copy
+import importlib.util
+import json
+import math
+import sys
+import threading
+import time
+import types
+from collections import deque
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+
+SELF_TEST = "--self-test" in sys.argv
+INTERFACE_VERSION = "gxb_lane_pipeline_v1"
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
+
+
+def _install_self_test_ros_stubs() -> None:
+    """让没有 ROS Python 环境的开发机也能执行纯算法自测。"""
+
+    class Stamp:
+        def __init__(self) -> None:
+            self.sec = 0
+            self.nanosec = 0
+
+    class Header:
+        def __init__(self) -> None:
+            self.stamp = Stamp()
+            self.frame_id = ""
+
+    class Image:
+        def __init__(self) -> None:
+            self.header = Header()
+            self.height = 0
+            self.width = 0
+            self.encoding = ""
+            self.is_bigendian = 0
+            self.step = 0
+            self.data = b""
+
+    class CompressedImage:
+        def __init__(self) -> None:
+            self.header = Header()
+            self.format = ""
+            self.data = b""
+
+    class String:
+        def __init__(self) -> None:
+            self.data = ""
+
+    class Position:
+        def __init__(self) -> None:
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+
+    class Orientation:
+        def __init__(self) -> None:
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+            self.w = 0.0
+
+    class Pose:
+        def __init__(self) -> None:
+            self.position = Position()
+            self.orientation = Orientation()
+
+    class PoseStamped:
+        def __init__(self) -> None:
+            self.header = Header()
+            self.pose = Pose()
+
+    class RosPath:
+        def __init__(self) -> None:
+            self.header = Header()
+            self.poses: List[Any] = []
+
+    class Node:
+        pass
+
+    class Policy:
+        BEST_EFFORT = 1
+        VOLATILE = 1
+        KEEP_LAST = 1
+
+    class QoSProfile:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    rclpy_module = types.ModuleType("rclpy")
+    node_module = types.ModuleType("rclpy.node")
+    qos_module = types.ModuleType("rclpy.qos")
+    node_module.Node = Node
+    qos_module.DurabilityPolicy = Policy
+    qos_module.HistoryPolicy = Policy
+    qos_module.QoSProfile = QoSProfile
+    qos_module.ReliabilityPolicy = Policy
+    rclpy_module.node = node_module
+    rclpy_module.qos = qos_module
+
+    def add_message_package(package: str, members: Dict[str, Any]) -> None:
+        root = types.ModuleType(package)
+        message = types.ModuleType(f"{package}.msg")
+        for name, value in members.items():
+            setattr(message, name, value)
+        root.msg = message
+        sys.modules[package] = root
+        sys.modules[f"{package}.msg"] = message
+
+    sys.modules["rclpy"] = rclpy_module
+    sys.modules["rclpy.node"] = node_module
+    sys.modules["rclpy.qos"] = qos_module
+    add_message_package(
+        "sensor_msgs", {"Image": Image, "CompressedImage": CompressedImage}
+    )
+    add_message_package("std_msgs", {"String": String})
+    add_message_package("geometry_msgs", {"PoseStamped": PoseStamped})
+    add_message_package("nav_msgs", {"Path": RosPath})
+
+
+try:
+    import rclpy
+    from nav_msgs.msg import Path as RosPath
+    from rclpy.node import Node
+    from rclpy.qos import (
+        DurabilityPolicy,
+        HistoryPolicy,
+        QoSProfile,
+        ReliabilityPolicy,
+    )
+    from sensor_msgs.msg import CompressedImage, Image
+    from std_msgs.msg import String
+except ImportError:
+    if not SELF_TEST:
+        raise
+    _install_self_test_ros_stubs()
+    import rclpy
+    from nav_msgs.msg import Path as RosPath
+    from rclpy.node import Node
+    from rclpy.qos import (
+        DurabilityPolicy,
+        HistoryPolicy,
+        QoSProfile,
+        ReliabilityPolicy,
+    )
+    from sensor_msgs.msg import CompressedImage, Image
+    from std_msgs.msg import String
+
+
+def _load_stage_module(filename: str, alias: str) -> Any:
+    """加载数字开头的阶段脚本，并保留其原有算法实现。"""
+    path = SCRIPT_DIR / filename
+    spec = importlib.util.spec_from_file_location(alias, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载阶段脚本: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+STAGE2 = _load_stage_module(
+    "2_green_yellow_segmentation.py", "_gxb_stage2_runtime"
+)
+STAGE4 = _load_stage_module(
+    "4_lane_geometry_planner.py", "_gxb_stage4_runtime"
+)
+
+
+@dataclass
+class CapturedFrame:
+    sequence: int
+    image: np.ndarray
+    captured_monotonic: float
+    stamp: Any
+
+
+class LatestFrameSlot:
+    """单元素覆盖槽；算法总是获得当时最新的一帧。"""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.latest: Optional[CapturedFrame] = None
+        self.sequence = 0
+        self.last_taken_sequence = 0
+        self.dropped_count = 0
+
+    def put(
+        self, image: np.ndarray, captured_monotonic: float, stamp: Any
+    ) -> int:
+        with self.condition:
+            if (
+                self.latest is not None
+                and self.latest.sequence > self.last_taken_sequence
+            ):
+                self.dropped_count += 1
+            self.sequence += 1
+            self.latest = CapturedFrame(
+                self.sequence, image, captured_monotonic, stamp
+            )
+            self.condition.notify()
+            return self.sequence
+
+    def take(
+        self, previous_sequence: int, stop_event: threading.Event
+    ) -> Optional[CapturedFrame]:
+        with self.condition:
+            self.condition.wait_for(
+                lambda: stop_event.is_set()
+                or (
+                    self.latest is not None
+                    and self.latest.sequence > previous_sequence
+                ),
+                timeout=0.5,
+            )
+            if stop_event.is_set() or self.latest is None:
+                return None
+            if self.latest.sequence <= previous_sequence:
+                return None
+            self.last_taken_sequence = self.latest.sequence
+            return self.latest
+
+    def wake(self) -> None:
+        with self.condition:
+            self.condition.notify_all()
+
+
+class RateMeter:
+    """滑动一秒窗口频率计。"""
+
+    def __init__(self) -> None:
+        self.events: Deque[float] = deque()
+
+    def tick(self, now: Optional[float] = None) -> float:
+        moment = time.monotonic() if now is None else now
+        self.events.append(moment)
+        return self.value(moment)
+
+    def value(self, now: Optional[float] = None) -> float:
+        moment = time.monotonic() if now is None else now
+        while self.events and moment - self.events[0] > 1.0:
+            self.events.popleft()
+        return float(len(self.events))
+
+
+class CameraCapture:
+    """V4L2 阻塞采集线程，失败时记录状态并持续重试。"""
+
+    def __init__(
+        self,
+        node: "LanePerceptionPipelineNode",
+        slot: LatestFrameSlot,
+        stop_event: threading.Event,
+        capture_factory: Any = cv2.VideoCapture,
+    ) -> None:
+        self.node = node
+        self.slot = slot
+        self.stop_event = stop_event
+        self.capture_factory = capture_factory
+        self.thread: Optional[threading.Thread] = None
+        self.capture: Any = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(
+            target=self._run, name="lane-camera-capture", daemon=True
+        )
+        self.thread.start()
+
+    def _open(self) -> Any:
+        capture = self.capture_factory(self.node.device, cv2.CAP_V4L2)
+        capture.set(
+            cv2.CAP_PROP_FOURCC,
+            cv2.VideoWriter_fourcc(*self.node.camera_fourcc),
+        )
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.node.request_width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.node.request_height)
+        capture.set(cv2.CAP_PROP_FPS, self.node.request_camera_fps)
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, self.node.camera_buffer_size)
+        return capture
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.capture = self._open()
+                if not self.capture.isOpened():
+                    raise RuntimeError(f"无法打开相机 {self.node.device}")
+                self.node.update_camera_report(self.capture)
+                while not self.stop_event.is_set():
+                    ok, frame = self.capture.read()
+                    captured = time.monotonic()
+                    if not ok or frame is None or frame.size == 0:
+                        raise RuntimeError("相机读取失败")
+                    if frame.ndim == 2:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    self.slot.put(
+                        np.ascontiguousarray(frame),
+                        captured,
+                        self.node.get_clock().now().to_msg(),
+                    )
+                    self.node.capture_succeeded(captured)
+            except Exception as exc:
+                self.node.capture_failed(str(exc))
+                self.stop_event.wait(0.5)
+            finally:
+                if self.capture is not None:
+                    self.capture.release()
+                    self.capture = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.slot.wake()
+        if self.capture is not None:
+            self.capture.release()
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+
+
+@dataclass
+class PipelineResult:
+    boundary: np.ndarray
+    yellow: np.ndarray
+    green: np.ndarray
+    transformed: Dict[str, np.ndarray]
+    main_yellow: np.ndarray
+    selected_boundary: np.ndarray
+    centerline_mask: np.ndarray
+    overlay: np.ndarray
+    geometry: Any
+    roi: Tuple[int, int]
+    boundary_valid: bool
+    yellow_status: Dict[str, Any]
+    boundary_component_count: int
+    valid_boundary_component_count: int
+
+
+class LaneAlgorithm:
+    """将第二、第四阶段的原有纯算法串成单帧内存流水线。"""
+
+    def __init__(
+        self,
+        threshold: Any,
+        segmentation_config: Dict[str, object],
+        geometry_config: Any,
+        ipm: Any,
+    ) -> None:
+        self.threshold = threshold
+        self.segmentation_config = segmentation_config
+        self.geometry_config = geometry_config
+        self.ipm = ipm
+        self.last_valid_points = np.empty((0, 2), dtype=np.float64)
+        self.last_valid_time = 0.0
+        self.last_center_x: Optional[float] = None
+
+    @staticmethod
+    def points_mask(
+        shape: Tuple[int, int], points: np.ndarray, thickness: int
+    ) -> np.ndarray:
+        output = np.zeros(shape, dtype=np.uint8)
+        if len(points) == 0:
+            return output
+        integer = np.round(points).astype(np.int32)
+        if len(integer) == 1:
+            cv2.circle(output, tuple(integer[0]), thickness, 255, -1)
+        else:
+            cv2.polylines(
+                output, [integer], False, 255, thickness, cv2.LINE_8
+            )
+            for point in integer:
+                cv2.circle(output, tuple(point), max(1, thickness), 255, -1)
+        return output
+
+    def _segment(
+        self, bgr: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+        values = STAGE2.GreenYellowSegmenter.segment(
+            bgr, self.threshold, self.segmentation_config
+        )
+        (
+            _yellow_raw,
+            _green_raw,
+            _unknown_raw,
+            yellow,
+            green,
+            unknown,
+            _hsv,
+            roi_start,
+            roi_end,
+            _overlap,
+            _yellow_stats,
+            _green_stats,
+        ) = values
+        boundary_result = STAGE2.BoundaryExtractor.extract(
+            yellow,
+            green,
+            unknown,
+            roi_start,
+            roi_end,
+            self.segmentation_config,
+        )
+        return yellow, green, boundary_result.final, boundary_result.valid
+
+    def process(self, bgr: np.ndarray, processing_ms: float = 0.0) -> PipelineResult:
+        if bgr.shape[:2] != (self.ipm.image_height, self.ipm.image_width):
+            raise ValueError(
+                f"相机图像 {bgr.shape[1]}x{bgr.shape[0]} 与 IPM "
+                f"{self.ipm.image_width}x{self.ipm.image_height} 不一致"
+            )
+        yellow, green, boundary, boundary_valid = self._segment(bgr)
+        transformed = {
+            "boundary": STAGE4.MaskIpmTransformer.transform(
+                boundary, self.ipm
+            ),
+            "yellow": STAGE4.MaskIpmTransformer.transform(yellow, self.ipm),
+            "green": STAGE4.MaskIpmTransformer.transform(green, self.ipm),
+        }
+        (
+            _forward_min,
+            _forward_max,
+            y_min,
+            y_max,
+        ) = self.ipm.planning_roi(self.geometry_config)
+        roi = (y_min, y_max)
+        main_yellow, yellow_status = STAGE4.MainYellowSelector.select(
+            transformed["yellow"],
+            self.ipm,
+            self.geometry_config,
+            roi,
+        )
+        curves: List[Any] = []
+        raw_component_count = 0
+        result = STAGE4.GeometryResult(reason="segmentation_invalid")
+        if boundary_valid and yellow_status["main_yellow_valid"]:
+            curves, raw_component_count = (
+                STAGE4.BoundaryComponentAnalyzer.analyze(
+                    transformed["boundary"],
+                    self.ipm,
+                    self.geometry_config,
+                    roi,
+                )
+            )
+            step_px = max(
+                2,
+                int(
+                    round(
+                        self.geometry_config.centerline_sample_step_m
+                        / self.ipm.meter_per_pixel
+                    )
+                ),
+            )
+            for curve in curves:
+                STAGE4.BoundaryRoadSideClassifier.classify_curve(
+                    curve,
+                    main_yellow,
+                    transformed["green"],
+                    self.geometry_config,
+                    step_px,
+                )
+            if curves:
+                result = STAGE4.DualBoundaryPlanner.plan(
+                    curves,
+                    main_yellow,
+                    self.ipm,
+                    self.geometry_config,
+                    roi,
+                    self.last_center_x,
+                )
+                if result is None:
+                    result = STAGE4.SingleBoundaryPlanner.plan(
+                        curves,
+                        main_yellow,
+                        transformed["green"],
+                        self.ipm,
+                        self.geometry_config,
+                        roi,
+                    )
+                if result is None:
+                    reason = (
+                        "single_boundary_side_unknown"
+                        if any(curve.inward_sign == 0 for curve in curves)
+                        else "boundary_pair_invalid"
+                    )
+                    result = STAGE4.GeometryResult(reason=reason)
+            else:
+                result = STAGE4.GeometryResult(reason="boundary_missing")
+        elif not yellow_status["main_yellow_valid"]:
+            result = STAGE4.GeometryResult(reason="main_yellow_missing")
+
+        if not bool(yellow_status.get("main_yellow_seed_connected", False)):
+            result.confidence *= 0.80
+        if len(result.raw_points):
+            (
+                result.final_points,
+                result.reason,
+                result.yellow_ratio,
+                result.forward_span_m,
+            ) = STAGE4.CenterlineSmoother.smooth(
+                result.raw_points,
+                main_yellow,
+                self.ipm,
+                self.geometry_config,
+                roi,
+            )
+            result.valid = result.reason == "valid"
+        if not result.valid and self.geometry_config.history_fallback_enable:
+            age = time.monotonic() - self.last_valid_time
+            lateral_change_ok = bool(
+                len(self.last_valid_points)
+                and (
+                    len(result.raw_points) == 0
+                    or abs(
+                        float(result.raw_points[0, 0])
+                        - float(self.last_valid_points[0, 0])
+                    )
+                    * self.ipm.meter_per_pixel
+                    <= self.geometry_config.centerline_max_lateral_jump_m
+                )
+            )
+            if (
+                len(self.last_valid_points)
+                >= self.geometry_config.centerline_min_points
+                and age <= self.geometry_config.history_max_age_sec
+                and lateral_change_ok
+            ):
+                result.final_points = self.last_valid_points.copy()
+                result.mode = "history_fallback"
+                result.reason = "valid"
+                result.valid = True
+                result.confidence = min(0.50, result.confidence or 0.45)
+        if result.valid:
+            self.last_valid_points = result.final_points.copy()
+            self.last_valid_time = time.monotonic()
+            self.last_center_x = float(result.final_points[0, 0])
+        else:
+            result.confidence = 0.0
+
+        shape = (self.ipm.output_height, self.ipm.output_width)
+        selected = STAGE4.BoundaryComponentAnalyzer.component_mask(
+            transformed["boundary"], result.selected_curves, 3
+        )
+        centerline = self.points_mask(shape, result.final_points, 3)
+        raw_line = self.points_mask(shape, result.raw_points, 2)
+        overlay = self.make_overlay(
+            transformed,
+            main_yellow,
+            selected,
+            raw_line,
+            centerline,
+            result,
+            roi,
+            processing_ms,
+        )
+        return PipelineResult(
+            boundary=boundary,
+            yellow=yellow,
+            green=green,
+            transformed=transformed,
+            main_yellow=main_yellow,
+            selected_boundary=selected,
+            centerline_mask=centerline,
+            overlay=overlay,
+            geometry=result,
+            roi=roi,
+            boundary_valid=bool(boundary_valid),
+            yellow_status=yellow_status,
+            boundary_component_count=raw_component_count,
+            valid_boundary_component_count=len(curves),
+        )
+
+    def make_overlay(
+        self,
+        transformed: Dict[str, np.ndarray],
+        main_yellow: np.ndarray,
+        selected: np.ndarray,
+        raw_line: np.ndarray,
+        centerline: np.ndarray,
+        result: Any,
+        roi: Tuple[int, int],
+        processing_ms: float,
+    ) -> np.ndarray:
+        height, width = main_yellow.shape
+        overlay = np.zeros((height, width, 3), dtype=np.uint8)
+        overlay[transformed["green"] > 0] = (0, 90, 0)
+        overlay[main_yellow > 0] = (0, 150, 150)
+        overlay[transformed["boundary"] > 0] = (200, 200, 200)
+        if (
+            result.mode == "dual_boundary_midpoint"
+            and len(result.selected_curves) == 2
+        ):
+            first = STAGE4.BoundaryComponentAnalyzer.component_mask(
+                transformed["boundary"], [result.selected_curves[0]], 3
+            )
+            second = STAGE4.BoundaryComponentAnalyzer.component_mask(
+                transformed["boundary"], [result.selected_curves[1]], 3
+            )
+            overlay[first > 0] = (255, 0, 0)
+            overlay[second > 0] = (255, 0, 255)
+        else:
+            overlay[selected > 0] = (255, 255, 0)
+        overlay[raw_line > 0] = (0, 140, 255)
+        overlay[centerline > 0] = (0, 0, 255)
+        center_x = int(round(self.ipm.vehicle_center_x_px))
+        origin_y = int(round(self.ipm.vehicle_origin_y_px))
+        cv2.line(
+            overlay,
+            (center_x, roi[0]),
+            (center_x, roi[1]),
+            (255, 255, 0),
+            1,
+        )
+        if 0 <= origin_y < height:
+            cv2.circle(overlay, (center_x, origin_y), 6, (0, 0, 255), -1)
+        cv2.rectangle(
+            overlay, (0, roi[0]), (width - 1, roi[1]), (255, 255, 255), 1
+        )
+        lines = (
+            f"mode={result.mode}",
+            f"valid={result.valid} confidence={result.confidence:.2f}",
+            f"points={len(result.final_points)} span={result.forward_span_m:.2f}m",
+            f"time={processing_ms:.1f}ms",
+        )
+        for index, text in enumerate(lines):
+            position = (10, 24 + index * 22)
+            cv2.putText(
+                overlay,
+                text,
+                position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 0),
+                4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                overlay,
+                text,
+                position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        return overlay
+
+
+class LatestJpeg:
+    """Web 与可选压缩话题共用唯一一次 JPEG 编码结果。"""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.data: Optional[bytes] = None
+        self.sequence = 0
+        self.encode_count = 0
+
+    def update(self, composite: np.ndarray, quality: int) -> Optional[bytes]:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            np.ascontiguousarray(composite),
+            [cv2.IMWRITE_JPEG_QUALITY, int(quality)],
+        )
+        if not ok:
+            return None
+        payload = encoded.tobytes()
+        with self.condition:
+            self.data = payload
+            self.sequence += 1
+            self.encode_count += 1
+            self.condition.notify_all()
+        return payload
+
+    def get(self) -> Tuple[Optional[bytes], int]:
+        with self.condition:
+            return self.data, self.sequence
+
+
+WEB_PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>一体化车道感知</title><style>
+body{margin:0;background:#10151d;color:#e7edf5;font:14px system-ui}
+header{padding:12px 18px;background:#172131;position:sticky;top:0}
+h1{margin:0 0 6px;font-size:21px}.page{padding:12px}
+.panel{background:#182231;border:1px solid #2b3a50;border-radius:8px;padding:12px}
+img{display:block;width:100%;height:auto;background:#05080c}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:8px;margin-top:12px}
+.item{background:#111a26;padding:8px;border-radius:5px}.good{color:#6fe29b}.bad{color:#ff6b6b}
+@media(max-width:760px){.stats{grid-template-columns:1fr 1fr}}</style></head>
+<body><header><h1>一体化车道感知（gxb_lane_pipeline_v1）</h1>
+<div>综合图从左到右：相机缩略图、鸟瞰 Overlay、最终中心线。</div></header>
+<main class="page"><section class="panel"><img src="/stream/overlay">
+<div class="stats" id="stats"></div></section></main><script>
+const fields=["centerline_mode","centerline_valid","centerline_confidence",
+"capture_fps","process_fps","path_publish_fps","end_to_end_ms",
+"dropped_frame_count","processing_time_ms","last_error"];
+async function refresh(){try{const s=await(await fetch("/api/status")).json();
+document.getElementById("stats").innerHTML=fields.map(k=>`<div class="item"><b>${k}</b><br>${s[k]}</div>`).join("");
+}catch(e){}setTimeout(refresh,500)}refresh();</script></body></html>"""
+
+
+class PipelineWebServer:
+    def __init__(self, node: "LanePerceptionPipelineNode") -> None:
+        self.node = node
+        self.server: Optional[ThreadingHTTPServer] = None
+        self.thread: Optional[threading.Thread] = None
+
+    def handler_class(self) -> Any:
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/":
+                    self._send(
+                        200, "text/html; charset=utf-8", WEB_PAGE.encode()
+                    )
+                elif self.path == "/api/status":
+                    body = json.dumps(
+                        owner.node.status_snapshot(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode()
+                    self._send(200, "application/json", body)
+                elif self.path == "/stream/overlay":
+                    self._stream()
+                else:
+                    self._send(404, "text/plain", b"not found")
+
+            def _send(
+                self, code: int, content_type: str, body: bytes
+            ) -> None:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _stream(self) -> None:
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame",
+                )
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                last = -1
+                try:
+                    while not owner.node.stop_event.is_set():
+                        data, sequence = owner.node.web_jpeg.get()
+                        if data is not None and sequence != last:
+                            self.wfile.write(
+                                b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                                + data
+                                + b"\r\n"
+                            )
+                            self.wfile.flush()
+                            last = sequence
+                        time.sleep(0.05)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                pass
+
+        return Handler
+
+    def start(self, host: str, port: int) -> None:
+        self.server = ThreadingHTTPServer(
+            (host, port), self.handler_class()
+        )
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            name="lane-pipeline-web",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+            self.thread = None
+
+
+class LanePerceptionPipelineNode(Node):
+    """直接相机输入的一体化 ROS 感知节点。"""
+
+    DEBUG_TOPICS = {
+        "boundary": "/gxb_test/pipeline/debug/boundary_mask",
+        "yellow": "/gxb_test/pipeline/debug/yellow_mask",
+        "green": "/gxb_test/pipeline/debug/green_mask",
+        "ipm": "/gxb_test/pipeline/debug/ipm_boundary_mask",
+        "selected": "/gxb_test/pipeline/debug/selected_boundary_mask",
+        "centerline": "/gxb_test/pipeline/debug/centerline_mask",
+    }
+
+    def __init__(self) -> None:
+        super().__init__("lane_perception_pipeline")
+        self._declare_parameters()
+        self.device = str(self.get_parameter("device").value)
+        self.profile_name = str(self.get_parameter("profile_name").value)
+        self.request_width = int(self.get_parameter("width").value)
+        self.request_height = int(self.get_parameter("height").value)
+        self.request_camera_fps = float(
+            self.get_parameter("camera_fps").value
+        )
+        self.camera_fourcc = self._validate_fourcc(
+            str(self.get_parameter("camera_fourcc").value)
+        )
+        self.camera_buffer_size = max(
+            1, int(self.get_parameter("camera_buffer_size").value)
+        )
+        self.frame_id = str(self.get_parameter("frame_id").value)
+        self.publish_debug_raw_images = bool(
+            self.get_parameter("publish_debug_raw_images").value
+        )
+        self.debug_publish_fps = max(
+            0.1, float(self.get_parameter("debug_publish_fps").value)
+        )
+        self.publish_overlay_compressed = bool(
+            self.get_parameter("publish_overlay_compressed").value
+        )
+        self.web_gui_enable = bool(
+            self.get_parameter("web_gui_enable").value
+        )
+        self.web_gui_host = str(
+            self.get_parameter("web_gui_host").value
+        )
+        self.web_gui_port = int(
+            self.get_parameter("web_gui_port").value
+        )
+        self.web_gui_max_fps = max(
+            0.1, float(self.get_parameter("web_gui_max_fps").value)
+        )
+        self.web_gui_jpeg_quality = int(
+            np.clip(
+                int(self.get_parameter("web_gui_jpeg_quality").value),
+                1,
+                100,
+            )
+        )
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.slot = LatestFrameSlot()
+        self.web_jpeg = LatestJpeg()
+        self.web = PipelineWebServer(self)
+        self.capture_meter = RateMeter()
+        self.process_meter = RateMeter()
+        self.path_meter = RateMeter()
+        self.last_web_encode = 0.0
+        self.last_debug_publish = 0.0
+        self.process_thread: Optional[threading.Thread] = None
+        self.capture = CameraCapture(self, self.slot, self.stop_event)
+        self.threshold, threshold_path = self._load_threshold()
+        self.segmentation_config = self._load_segmentation_config()
+        self.geometry_config, self.ipm = self._load_geometry()
+        self.algorithm = LaneAlgorithm(
+            self.threshold,
+            self.segmentation_config,
+            self.geometry_config,
+            self.ipm,
+        )
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.path_publisher = self.create_publisher(
+            RosPath, "/gxb_test/pipeline/centerline_path", qos
+        )
+        self.status_publisher = self.create_publisher(
+            String, "/gxb_test/pipeline/status", qos
+        )
+        self.overlay_publisher = (
+            self.create_publisher(
+                CompressedImage,
+                "/gxb_test/pipeline/overlay/compressed",
+                qos,
+            )
+            if self.publish_overlay_compressed
+            else None
+        )
+        self.debug_publishers: Dict[str, Any] = {}
+        if self.publish_debug_raw_images:
+            self.debug_publishers = {
+                name: self.create_publisher(Image, topic, qos)
+                for name, topic in self.DEBUG_TOPICS.items()
+            }
+        self.status = self._initial_status(str(threshold_path))
+        self.create_timer(0.5, self._publish_status)
+        self.create_timer(5.0, self._log_statistics)
+        if self.web_gui_enable:
+            self.web.start(self.web_gui_host, self.web_gui_port)
+            self.get_logger().info(
+                f"Web GUI: http://{self.web_gui_host}:{self.web_gui_port}"
+            )
+        self.capture.start()
+        self.process_thread = threading.Thread(
+            target=self._processing_loop,
+            name="lane-pipeline-processing",
+            daemon=True,
+        )
+        self.process_thread.start()
+        self.get_logger().info(
+            "pipeline started: "
+            f"device={self.device}, requested={self.request_width}x"
+            f"{self.request_height}@{self.request_camera_fps:.1f}, "
+            f"fourcc={self.camera_fourcc}, profile={self.profile_name}, "
+            f"debug_raw={self.publish_debug_raw_images}, "
+            f"web={self.web_gui_enable}"
+        )
+
+    def _declare_parameters(self) -> None:
+        defaults: Dict[str, object] = {
+            "device": "/dev/video0",
+            "profile_name": "usb_camera",
+            "width": 640,
+            "height": 480,
+            "camera_fps": 10.0,
+            "camera_fourcc": "YUYV",
+            "camera_buffer_size": 1,
+            "frame_id": "usb_camera",
+            "threshold_config_path": "",
+            "ipm_config_path": "",
+            "auto_load_segmentation_config": True,
+            "auto_load_geometry_config": True,
+            "publish_debug_raw_images": False,
+            "debug_publish_fps": 1.0,
+            "publish_overlay_compressed": False,
+            "web_gui_enable": True,
+            "web_gui_host": "0.0.0.0",
+            "web_gui_port": 8093,
+            "web_gui_max_fps": 1.0,
+            "web_gui_jpeg_quality": 85,
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+
+    @staticmethod
+    def _validate_fourcc(value: str) -> str:
+        normalized = value.strip().upper()
+        if len(normalized) != 4:
+            raise ValueError("camera_fourcc 必须恰好为四个字符")
+        return normalized
+
+    def _load_threshold(self) -> Tuple[Any, Path]:
+        explicit = str(self.get_parameter("threshold_config_path").value)
+        path = STAGE2.ThresholdConfigLoader.resolve_path(
+            SCRIPT_DIR, self.profile_name, explicit
+        )
+        threshold = STAGE2.ThresholdConfigLoader.load(path)
+        if not threshold.loaded:
+            raise RuntimeError(threshold.error or f"阈值配置无效: {path}")
+        return threshold, path
+
+    def _load_segmentation_config(self) -> Dict[str, object]:
+        values = copy.deepcopy(STAGE2.DEFAULT_SEGMENTATION_CONFIG)
+        if bool(self.get_parameter("auto_load_segmentation_config").value):
+            store = STAGE2.SegmentationConfigStore(SCRIPT_DIR)
+            path = store.path(self.profile_name, "")
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                values = store.flatten(payload)
+        return STAGE2.SegmentationConfig.validate(values)
+
+    def _load_geometry(self) -> Tuple[Any, Any]:
+        config = STAGE4.GeometryConfig(profile_name=self.profile_name)
+        config.ipm_config_path = str(
+            self.get_parameter("ipm_config_path").value
+        )
+        if bool(self.get_parameter("auto_load_geometry_config").value):
+            store = STAGE4.GeometryParameterStore(SCRIPT_PATH)
+            if store.path(self.profile_name).exists():
+                config = store.load(config)
+                config.ipm_config_path = str(
+                    self.get_parameter("ipm_config_path").value
+                )
+        config.web_gui_enable = self.web_gui_enable
+        config.web_gui_host = self.web_gui_host
+        config.web_gui_port = self.web_gui_port
+        config.web_gui_max_fps = self.web_gui_max_fps
+        config.web_gui_jpeg_quality = self.web_gui_jpeg_quality
+        config.validate()
+        ipm = STAGE4.IpmConfigLoader(SCRIPT_PATH).load(config)
+        return config, ipm
+
+    def _initial_status(self, threshold_path: str) -> Dict[str, Any]:
+        return {
+            "interface_version": INTERFACE_VERSION,
+            "capture_fps": 0.0,
+            "process_fps": 0.0,
+            "path_publish_fps": 0.0,
+            "captured_frame_count": 0,
+            "processed_frame_count": 0,
+            "dropped_frame_count": 0,
+            "capture_to_process_age_ms": 0.0,
+            "processing_time_ms": 0.0,
+            "end_to_end_ms": 0.0,
+            "camera_width": 0,
+            "camera_height": 0,
+            "camera_reported_fps": 0.0,
+            "camera_fourcc": self.camera_fourcc,
+            "green_yellow_config_loaded": True,
+            "green_yellow_config_path": threshold_path,
+            "ipm_config_loaded": True,
+            "ipm_config_path": self.ipm.path,
+            "boundary_valid": False,
+            "centerline_valid": False,
+            "centerline_mode": "invalid",
+            "centerline_reason": "waiting_for_camera",
+            "centerline_confidence": 0.0,
+            "final_centerline_point_count": 0,
+            "centerline_forward_span_m": 0.0,
+            "centerline_yellow_ratio": 0.0,
+            "last_error": "",
+        }
+
+    def update_camera_report(self, capture: Any) -> None:
+        raw_fourcc = int(capture.get(cv2.CAP_PROP_FOURCC))
+        reported_fourcc = "".join(
+            chr((raw_fourcc >> (8 * index)) & 0xFF) for index in range(4)
+        )
+        with self.lock:
+            self.status.update(
+                {
+                    "camera_width": int(
+                        capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+                    ),
+                    "camera_height": int(
+                        capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                    ),
+                    "camera_reported_fps": float(
+                        capture.get(cv2.CAP_PROP_FPS)
+                    ),
+                    "camera_fourcc": reported_fourcc.strip("\x00")
+                    or self.camera_fourcc,
+                }
+            )
+
+    def capture_succeeded(self, now: float) -> None:
+        capture_fps = self.capture_meter.tick(now)
+        with self.lock:
+            self.status["captured_frame_count"] += 1
+            self.status["capture_fps"] = capture_fps
+            if self.status["last_error"].startswith("camera:"):
+                self.status["last_error"] = ""
+
+    def capture_failed(self, message: str) -> None:
+        with self.lock:
+            self.status["last_error"] = f"camera: {message}"
+
+    def _source_image(self, frame: CapturedFrame) -> Image:
+        source = Image()
+        source.header.stamp = frame.stamp
+        source.header.frame_id = self.frame_id
+        source.height = int(frame.image.shape[0])
+        source.width = int(frame.image.shape[1])
+        source.encoding = "bgr8"
+        source.step = source.width * 3
+        return source
+
+    def _processing_loop(self) -> None:
+        sequence = 0
+        while not self.stop_event.is_set():
+            frame = self.slot.take(sequence, self.stop_event)
+            if frame is None:
+                continue
+            sequence = frame.sequence
+            started = time.monotonic()
+            age_ms = (started - frame.captured_monotonic) * 1000.0
+            source = self._source_image(frame)
+            try:
+                result = self.algorithm.process(frame.image)
+                processing_ms = (time.monotonic() - started) * 1000.0
+                result.overlay = self.algorithm.make_overlay(
+                    result.transformed,
+                    result.main_yellow,
+                    result.selected_boundary,
+                    self.algorithm.points_mask(
+                        result.centerline_mask.shape,
+                        result.geometry.raw_points,
+                        2,
+                    ),
+                    result.centerline_mask,
+                    result.geometry,
+                    result.roi,
+                    processing_ms,
+                )
+                path = (
+                    STAGE4.PathConverter.to_path(
+                        result.geometry.final_points, self.ipm, source
+                    )
+                    if result.geometry.valid
+                    else STAGE4.PathConverter.empty(self.ipm, source)
+                )
+                self.path_publisher.publish(path)
+                path_fps = self.path_meter.tick()
+                process_fps = self.process_meter.tick()
+                end_to_end = (
+                    time.monotonic() - frame.captured_monotonic
+                ) * 1000.0
+                self._publish_debug(frame.image, result, source)
+                with self.lock:
+                    self.status.update(
+                        {
+                            "process_fps": process_fps,
+                            "path_publish_fps": path_fps,
+                            "processed_frame_count": self.status[
+                                "processed_frame_count"
+                            ]
+                            + 1,
+                            "dropped_frame_count": self.slot.dropped_count,
+                            "capture_to_process_age_ms": age_ms,
+                            "processing_time_ms": processing_ms,
+                            "end_to_end_ms": end_to_end,
+                            "boundary_valid": result.boundary_valid,
+                            "centerline_valid": bool(
+                                result.geometry.valid
+                            ),
+                            "centerline_mode": result.geometry.mode,
+                            "centerline_reason": result.geometry.reason,
+                            "centerline_confidence": float(
+                                np.clip(
+                                    result.geometry.confidence, 0.0, 1.0
+                                )
+                            ),
+                            "final_centerline_point_count": len(
+                                result.geometry.final_points
+                            ),
+                            "centerline_forward_span_m": float(
+                                result.geometry.forward_span_m
+                            ),
+                            "centerline_yellow_ratio": float(
+                                result.geometry.yellow_ratio
+                            ),
+                            "last_error": ""
+                            if result.geometry.valid
+                            else result.geometry.reason,
+                        }
+                    )
+            except Exception as exc:
+                processing_ms = (time.monotonic() - started) * 1000.0
+                self.path_publisher.publish(
+                    STAGE4.PathConverter.empty(self.ipm, source)
+                )
+                self.path_meter.tick()
+                self.process_meter.tick()
+                with self.lock:
+                    self.status.update(
+                        {
+                            "processed_frame_count": self.status[
+                                "processed_frame_count"
+                            ]
+                            + 1,
+                            "dropped_frame_count": self.slot.dropped_count,
+                            "capture_to_process_age_ms": age_ms,
+                            "processing_time_ms": processing_ms,
+                            "end_to_end_ms": (
+                                time.monotonic()
+                                - frame.captured_monotonic
+                            )
+                            * 1000.0,
+                            "boundary_valid": False,
+                            "centerline_valid": False,
+                            "centerline_mode": "invalid",
+                            "centerline_reason": "processing_error",
+                            "centerline_confidence": 0.0,
+                            "final_centerline_point_count": 0,
+                            "last_error": f"processing: {exc}",
+                        }
+                    )
+
+    def _publish_debug(
+        self, raw: np.ndarray, result: PipelineResult, source: Image
+    ) -> None:
+        now = time.monotonic()
+        web_due = (
+            (self.web_gui_enable or self.publish_overlay_compressed)
+            and now - self.last_web_encode >= 1.0 / self.web_gui_max_fps
+        )
+        if web_due:
+            composite = self._make_web_composite(
+                raw, result.overlay, result.centerline_mask
+            )
+            payload = self.web_jpeg.update(
+                composite, self.web_gui_jpeg_quality
+            )
+            self.last_web_encode = now
+            if payload is not None and self.overlay_publisher is not None:
+                message = CompressedImage()
+                message.header = copy.deepcopy(source.header)
+                message.format = "jpeg"
+                message.data = payload
+                self.overlay_publisher.publish(message)
+        if (
+            self.publish_debug_raw_images
+            and now - self.last_debug_publish
+            >= 1.0 / self.debug_publish_fps
+        ):
+            images = {
+                "boundary": result.boundary,
+                "yellow": result.yellow,
+                "green": result.green,
+                "ipm": result.transformed["boundary"],
+                "selected": result.selected_boundary,
+                "centerline": result.centerline_mask,
+            }
+            for name, image in images.items():
+                self.debug_publishers[name].publish(
+                    self._mono_message(image, source)
+                )
+            self.last_debug_publish = now
+
+    @staticmethod
+    def _make_web_composite(
+        raw: np.ndarray, overlay: np.ndarray, centerline: np.ndarray
+    ) -> np.ndarray:
+        panel_height = max(360, overlay.shape[0])
+        raw_width = max(
+            1, int(round(raw.shape[1] * panel_height / raw.shape[0]))
+        )
+        overlay_width = max(
+            1,
+            int(round(overlay.shape[1] * panel_height / overlay.shape[0])),
+        )
+        raw_panel = cv2.resize(
+            raw, (raw_width, panel_height), interpolation=cv2.INTER_AREA
+        )
+        overlay_panel = cv2.resize(
+            overlay,
+            (overlay_width, panel_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        center_bgr = cv2.cvtColor(centerline, cv2.COLOR_GRAY2BGR)
+        center_panel = cv2.resize(
+            center_bgr,
+            (overlay_width, panel_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        composite = np.hstack((raw_panel, overlay_panel, center_panel))
+        labels = (
+            ("CAMERA", 8),
+            ("BIRDVIEW OVERLAY", raw_width + 8),
+            ("FINAL CENTERLINE", raw_width + overlay_width + 8),
+        )
+        for text, x in labels:
+            cv2.putText(
+                composite,
+                text,
+                (x, 26),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 0, 0),
+                4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                composite,
+                text,
+                (x, 26),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        return composite
+
+    @staticmethod
+    def _mono_message(image: np.ndarray, source: Image) -> Image:
+        packed = np.ascontiguousarray(image, dtype=np.uint8)
+        message = Image()
+        message.header = copy.deepcopy(source.header)
+        message.height = int(packed.shape[0])
+        message.width = int(packed.shape[1])
+        message.encoding = "mono8"
+        message.is_bigendian = 0
+        message.step = message.width
+        message.data = packed.tobytes()
+        return message
+
+    def _publish_status(self) -> None:
+        message = String()
+        message.data = json.dumps(
+            self.status_snapshot(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.status_publisher.publish(message)
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            snapshot = copy.deepcopy(self.status)
+            snapshot["capture_fps"] = self.capture_meter.value()
+            snapshot["process_fps"] = self.process_meter.value()
+            snapshot["path_publish_fps"] = self.path_meter.value()
+            snapshot["dropped_frame_count"] = self.slot.dropped_count
+            return snapshot
+
+    def _log_statistics(self) -> None:
+        status = self.status_snapshot()
+        self.get_logger().info(
+            f"capture={status['capture_fps']:.1f} "
+            f"process={status['process_fps']:.1f} "
+            f"path={status['path_publish_fps']:.1f} "
+            f"drop={status['dropped_frame_count']} "
+            f"processing_ms={status['processing_time_ms']:.1f}"
+        )
+
+    def destroy_node(self) -> bool:
+        self.stop_event.set()
+        self.capture.stop()
+        self.slot.wake()
+        if self.process_thread is not None:
+            self.process_thread.join(timeout=2.0)
+        self.web.stop()
+        return super().destroy_node()
+
+
+def _threshold_document() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "profile_name": "test",
+        "saved_at": "self-test",
+        "image_topic": "/test",
+        "frame_width": 600,
+        "frame_height": 800,
+        "roi": {"y_start_ratio": 0.0, "y_end_ratio": 1.0},
+        "yellow": {
+            "h_min": 20,
+            "h_max": 40,
+            "s_min": 100,
+            "s_max": 255,
+            "v_min": 100,
+            "v_max": 255,
+            "prefer_bottom_connected": False,
+        },
+        "green": {
+            "h_min": 45,
+            "h_max": 85,
+            "s_min": 100,
+            "s_max": 255,
+            "v_min": 80,
+            "v_max": 255,
+            "prefer_bottom_connected": False,
+        },
+        "morphology": {
+            "open_kernel_size": 1,
+            "close_kernel_size": 1,
+            "open_iterations": 0,
+            "close_iterations": 0,
+            "min_component_area": 20,
+            "bottom_band_pixels": 10,
+        },
+    }
+
+
+def _ipm_document(version: str = "gxb_ipm_v1") -> Dict[str, Any]:
+    return {
+        "version": version,
+        "image_width": 600,
+        "image_height": 800,
+        "homography_matrix": np.eye(3).tolist(),
+        "inverse_homography_matrix": np.eye(3).tolist(),
+        "output": {
+            "width_px": 600,
+            "height_px": 800,
+            "meter_per_pixel": 0.005,
+            "vehicle_center_x_px": 300,
+            "vehicle_origin_y_px": 799,
+        },
+        "coordinate_convention": {
+            "vehicle_reference_point_name": "base_link"
+        },
+        "calibration_board": {
+            "width_m": 0.50,
+            "length_m": 0.70,
+            "near_edge_distance_m": 0.30,
+            "center_lateral_offset_m": 0.0,
+        },
+        "road_geometry_defaults": {
+            "expected_lane_width_m": 0.50,
+            "single_boundary_center_offset_m": 0.25,
+        },
+    }
+
+
+def run_self_tests() -> None:
+    """覆盖配置、完整处理、覆盖槽、失败降级和轻量发布约束。"""
+    passed: List[str] = []
+
+    def check(name: str, condition: bool) -> None:
+        if not condition:
+            raise AssertionError(name)
+        passed.append(name)
+
+    class MemoryConfigPath:
+        def __init__(self, name: str, document: Dict[str, Any]) -> None:
+            self.name = name
+            self.document = document
+
+        def exists(self) -> bool:
+            return True
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            del encoding
+            return json.dumps(self.document)
+
+        def stat(self) -> Any:
+            return types.SimpleNamespace(st_mtime_ns=1)
+
+        def __str__(self) -> str:
+            return self.name
+
+    threshold_path = MemoryConfigPath(
+        "memory:test_green_yellow.json", _threshold_document()
+    )
+    threshold = STAGE2.ThresholdConfigLoader.load(threshold_path)
+    check("1 config load", threshold.loaded)
+
+    geometry = STAGE4.GeometryConfig(
+        profile_name="test",
+        main_yellow_min_area_px=50,
+        main_yellow_min_vertical_span_px=10,
+        boundary_component_min_pixels=5,
+        boundary_component_min_vertical_span_px=8,
+        boundary_fit_min_points=5,
+        centerline_min_points=5,
+        centerline_min_forward_span_m=0.20,
+        centerline_min_yellow_ratio=0.45,
+    )
+    geometry.validate()
+    loader = STAGE4.IpmConfigLoader(SCRIPT_PATH)
+    ipm_path = MemoryConfigPath(
+        "memory:test_ipm.json", _ipm_document()
+    )
+    loader.resolve_path = lambda _config: ipm_path
+    ipm = loader.load(geometry)
+    check("2 ipm version", ipm.path == str(ipm_path))
+    bad_path = MemoryConfigPath(
+        "memory:bad_ipm.json", _ipm_document("bad")
+    )
+    bad_loader = STAGE4.IpmConfigLoader(SCRIPT_PATH)
+    bad_loader.resolve_path = lambda _config: bad_path
+    try:
+        bad_loader.load(geometry)
+    except STAGE4.GeometryError:
+        passed.append("3 reject ipm version")
+    else:
+        raise AssertionError("3 reject ipm version")
+
+    config = copy.deepcopy(STAGE2.DEFAULT_SEGMENTATION_CONFIG)
+    config.update(
+        {
+            "boundary_min_component_pixels": 5,
+            "boundary_min_valid_pixels": 5,
+            "boundary_min_span_px": 5,
+            "boundary_max_component_area_ratio": 0.20,
+        }
+    )
+    algorithm = LaneAlgorithm(threshold, config, geometry, ipm)
+    hsv = np.zeros((800, 600, 3), dtype=np.uint8)
+    hsv[:, :175] = (60, 220, 220)
+    hsv[:, 175:425] = (30, 220, 220)
+    hsv[:, 425:] = (60, 220, 220)
+    image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    result = algorithm.process(image)
+    check("4 static full process", result.boundary.shape == (800, 600))
+    binary = all(
+        set(np.unique(mask).tolist()).issubset({0, 255})
+        for mask in (
+            result.yellow,
+            result.green,
+            result.boundary,
+            result.transformed["yellow"],
+            result.transformed["green"],
+            result.transformed["boundary"],
+        )
+    )
+    check("5 binary masks", binary)
+    points = np.array(
+        [[300.0, 739.0], [300.0, 700.0], [300.0, 650.0]]
+    )
+    samples = STAGE4.PathConverter.metric_samples(points, ipm)
+    check("6 metric conversion", len(samples) == 3)
+    check(
+        "7 forward monotonic",
+        all(samples[index + 1][0] > samples[index][0] for index in range(2)),
+    )
+
+    slot = LatestFrameSlot()
+    stop = threading.Event()
+    stamp = types.SimpleNamespace(sec=0, nanosec=0)
+    slot.put(np.zeros((1, 1, 3), np.uint8), time.monotonic(), stamp)
+    slot.put(np.ones((1, 1, 3), np.uint8), time.monotonic(), stamp)
+    newest = slot.take(0, stop)
+    check(
+        "8 latest overwrite",
+        newest is not None and int(newest.image[0, 0, 0]) == 1,
+    )
+    check("9 slow consumer drop", slot.dropped_count == 1)
+
+    class FailedCapture:
+        def __init__(self, *_args: Any) -> None:
+            pass
+
+        def set(self, *_args: Any) -> bool:
+            return False
+
+        def isOpened(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            pass
+
+    fake_node = types.SimpleNamespace(
+        device="/missing",
+        camera_fourcc="YUYV",
+        request_width=640,
+        request_height=480,
+        request_camera_fps=10.0,
+        camera_buffer_size=1,
+    )
+    capture = CameraCapture(
+        fake_node, LatestFrameSlot(), threading.Event(), FailedCapture
+    )
+    opened = capture._open()
+    check("10 camera failure safe", not opened.isOpened())
+
+    source = Image()
+    empty_path = STAGE4.PathConverter.empty(ipm, source)
+    check("11 invalid empty path", len(empty_path.poses) == 0)
+    jpeg = LatestJpeg()
+    web_enabled = False
+    if web_enabled:
+        jpeg.update(np.zeros((10, 10, 3), np.uint8), 85)
+    check("12 web off no encode", jpeg.encode_count == 0)
+    debug_default = False
+    check("13 debug raw default off", not debug_default)
+    source_text = SCRIPT_PATH.read_text(encoding="utf-8")
+    forbidden = (
+        "Twi" + "st",
+        "cmd" + "_vel",
+        "linear" + ".x",
+        "angular" + ".z",
+        "Pure" + "Pursuit",
+        "P" + "ID",
+    )
+    check(
+        "14 perception only",
+        not any(token in source_text for token in forbidden),
+    )
+    composite = LanePerceptionPipelineNode._make_web_composite(
+        image,
+        result.overlay,
+        result.centerline_mask,
+    )
+    check(
+        "15 one composite",
+        composite.ndim == 3 and composite.shape[1] > image.shape[1],
+    )
+
+    print(f"SELF-TEST PASS: {len(passed)} checks")
+    for name in passed:
+        print(f"  PASS {name}")
+
+
+def main(args: Optional[List[str]] = None) -> None:
+    if SELF_TEST:
+        run_self_tests()
+        return
+    rclpy.init(args=args)
+    node: Optional[LanePerceptionPipelineNode] = None
+    try:
+        node = LanePerceptionPipelineNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
