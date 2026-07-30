@@ -379,6 +379,8 @@ class PipelineResult:
     roi_y_offset: int
     yellow_corridor_status: Dict[str, Any]
     yellow_corridor_samples: List[Dict[str, Any]]
+    green_boundary_status: Dict[str, Any]
+    green_boundary_samples: List[Dict[str, Any]]
     fallback_boundary_pipeline_used: bool
     timing_ms: Dict[str, float]
     counters: Dict[str, int]
@@ -389,6 +391,7 @@ TIMING_NAMES = (
     "boundary_extract_ms",
     "ipm_warp_ms",
     "main_yellow_select_ms",
+    "green_boundary_fast_path_ms",
     "yellow_corridor_ms",
     "component_analysis_ms",
     "fragment_descriptor_ms",
@@ -596,6 +599,9 @@ class YellowCorridorPlanner:
     CENTER_WEIGHTS = {
         "strict_observed": 1.0,
         "weak_single_edge": 0.60,
+        "green_dual_observed": 1.0,
+        "yellow_dual_observed": 1.0,
+        "green_single_offset": 0.60,
         "gap_filled": 0.25,
     }
     REASONS = (
@@ -721,6 +727,12 @@ class YellowCorridorPlanner:
                 "right": right,
                 "center": center,
                 "classification": classification,
+                "source_type": (
+                    "yellow_dual_observed"
+                    if classification
+                    in {"strict_observed", "weak_single_edge", "weak_candidate"}
+                    else classification
+                ),
                 "width": width,
                 "left_valid": bool(left_valid),
                 "right_valid": bool(right_valid),
@@ -1125,6 +1137,7 @@ class YellowCorridorPlanner:
             for sample, center in zip(samples[start:end], proposed):
                 sample["source_reason"] = sample["reason"]
                 sample["classification"] = "gap_filled"
+                sample["source_type"] = "gap_filled"
                 sample["center"] = center
             filled_count += count
             gap_count += 1
@@ -1617,6 +1630,492 @@ class YellowCorridorPlanner:
         )
         result.yellow_corridor_samples = samples
         return result, status
+
+
+class GreenBoundaryFastPlanner:
+    """仅在稀疏采样行上跟踪左右主绿色区域的通道内边缘。"""
+
+    MAX_GREEN_INTRUSION_RATIO = 0.15
+    MAX_SINGLE_CONSECUTIVE_SAMPLES = 2
+    EMPTY_STATUS: Dict[str, Any] = {
+        "green_dual_edge_valid_count": 0,
+        "green_single_left_count": 0,
+        "green_single_right_count": 0,
+        "green_left_inner_edge_missing_count": 0,
+        "green_right_inner_edge_missing_count": 0,
+        "green_corridor_width_px_mean": 0.0,
+        "green_corridor_width_px_std": 0.0,
+        "green_corridor_yellow_support_ratio": 0.0,
+        "green_corridor_unknown_ratio": 0.0,
+        "green_corridor_green_intrusion_ratio": 0.0,
+        "green_boundary_fast_path_used": False,
+        "green_boundary_fast_path_reason": "not_attempted",
+    }
+
+    @staticmethod
+    def _side_interval(
+        intervals: Sequence[Tuple[int, int]],
+        row_width: int,
+        side: str,
+        center_x: int,
+        previous_inner_x: Optional[float],
+        continuity_limit_px: float,
+        minimum_span_px: int,
+    ) -> Optional[Tuple[int, int, bool]]:
+        candidates: List[Tuple[int, float, int, int, bool]] = []
+        for left, right in intervals:
+            if side == "left":
+                if right >= center_x:
+                    continue
+                connected = left == 0
+                inner_x = float(right)
+            else:
+                if left <= center_x:
+                    continue
+                connected = right == row_width - 1
+                inner_x = float(left)
+            span = right - left + 1
+            continuous = bool(
+                previous_inner_x is not None
+                and abs(inner_x - previous_inner_x) <= continuity_limit_px
+            )
+            if span < minimum_span_px or not (connected or continuous):
+                continue
+            distance = (
+                abs(inner_x - previous_inner_x)
+                if previous_inner_x is not None
+                else 0.0
+            )
+            candidates.append(
+                (0 if connected else 1, distance, left, right, connected)
+            )
+        if not candidates:
+            return None
+        _priority, _distance, left, right, connected = min(
+            candidates, key=lambda item: (item[0], item[1], -item[3] + item[2])
+        )
+        return int(left), int(right), bool(connected)
+
+    @staticmethod
+    def _corridor_evidence(
+        green_row: np.ndarray,
+        yellow_row: np.ndarray,
+        left_inner: int,
+        right_inner: int,
+    ) -> Tuple[float, float, float]:
+        start, end = left_inner + 1, right_inner
+        if end <= start:
+            return 0.0, 1.0, 1.0
+        green_inside = green_row[start:end] > 0
+        yellow_inside = yellow_row[start:end] > 0
+        yellow_ratio = float(np.mean(yellow_inside))
+        intrusion_ratio = float(np.mean(green_inside))
+        unknown_ratio = float(np.mean(~green_inside & ~yellow_inside))
+        return yellow_ratio, unknown_ratio, intrusion_ratio
+
+    @classmethod
+    def extract(
+        cls,
+        green: np.ndarray,
+        yellow: np.ndarray,
+        ipm: Any,
+        config: YellowCorridorConfig,
+        seed_center_x: Optional[float] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        status = copy.deepcopy(cls.EMPTY_STATUS)
+        samples: List[Dict[str, Any]] = []
+        step_px = max(2, int(round(config.sample_step_m / ipm.meter_per_pixel)))
+        expected_width = float(ipm.expected_lane_width_px)
+        minimum_width = expected_width * config.width_min_ratio
+        maximum_width = expected_width * config.width_max_ratio
+        continuity_limit = config.center_jump_max_m / ipm.meter_per_pixel
+        minimum_green_span = max(4, int(round(expected_width * 0.15)))
+        center_axis = int(round(ipm.vehicle_center_x_px))
+        previous_left: Optional[float] = None
+        previous_right: Optional[float] = None
+        previous_center = float(
+            ipm.vehicle_center_x_px
+            if seed_center_x is None
+            else seed_center_x
+        )
+        consecutive_single = 0
+        widths: List[float] = []
+        yellow_ratios: List[float] = []
+        unknown_ratios: List[float] = []
+        intrusion_ratios: List[float] = []
+
+        for y in range(green.shape[0] - 1, -1, -step_px):
+            row_intervals = YellowCorridorPlanner._intervals(green[y])
+            left_interval = cls._side_interval(
+                row_intervals,
+                green.shape[1],
+                "left",
+                center_axis,
+                previous_left,
+                continuity_limit,
+                minimum_green_span,
+            )
+            right_interval = cls._side_interval(
+                row_intervals,
+                green.shape[1],
+                "right",
+                center_axis,
+                previous_right,
+                continuity_limit,
+                minimum_green_span,
+            )
+            left_inner = (
+                int(left_interval[1]) if left_interval is not None else None
+            )
+            right_inner = (
+                int(right_interval[0]) if right_interval is not None else None
+            )
+            if (
+                left_inner is not None
+                and previous_left is not None
+                and abs(left_inner - previous_left) > continuity_limit
+            ):
+                left_inner = None
+            if (
+                right_inner is not None
+                and previous_right is not None
+                and abs(right_inner - previous_right) > continuity_limit
+            ):
+                right_inner = None
+            if left_inner is None:
+                status["green_left_inner_edge_missing_count"] += 1
+            if right_inner is None:
+                status["green_right_inner_edge_missing_count"] += 1
+
+            classification = "missing"
+            reason = "green_edges_missing"
+            center: Optional[float] = None
+            width_value: Optional[float] = None
+            yellow_ratio = 0.0
+            unknown_ratio = 0.0
+            intrusion_ratio = 0.0
+            single_side = ""
+
+            if left_inner is not None and right_inner is not None:
+                width_value = float(right_inner - left_inner)
+                candidate_center = (left_inner + right_inner) / 2.0
+                (
+                    yellow_ratio,
+                    unknown_ratio,
+                    intrusion_ratio,
+                ) = cls._corridor_evidence(
+                    green[y], yellow[y], left_inner, right_inner
+                )
+                if not (minimum_width <= width_value <= maximum_width):
+                    reason = "green_corridor_width_invalid"
+                elif abs(candidate_center - previous_center) > continuity_limit:
+                    reason = "green_corridor_center_jump"
+                elif intrusion_ratio > cls.MAX_GREEN_INTRUSION_RATIO:
+                    reason = "green_corridor_intrusion"
+                else:
+                    classification = "green_dual_observed"
+                    reason = "accepted"
+                    center = candidate_center
+                    consecutive_single = 0
+                    widths.append(width_value)
+                    yellow_ratios.append(yellow_ratio)
+                    unknown_ratios.append(unknown_ratio)
+                    intrusion_ratios.append(intrusion_ratio)
+                    status["green_dual_edge_valid_count"] += 1
+            elif left_inner is not None or right_inner is not None:
+                single_side = "left" if left_inner is not None else "right"
+                candidate_center = (
+                    float(left_inner) + expected_width / 2.0
+                    if left_inner is not None
+                    else float(right_inner) - expected_width / 2.0
+                )
+                center_index = int(round(candidate_center))
+                center_is_green = not (
+                    0 <= center_index < green.shape[1]
+                ) or bool(green[y, center_index] > 0)
+                if (
+                    consecutive_single
+                    < cls.MAX_SINGLE_CONSECUTIVE_SAMPLES
+                    and abs(candidate_center - previous_center)
+                    <= continuity_limit
+                    and not center_is_green
+                ):
+                    classification = "green_single_offset"
+                    reason = "accepted"
+                    center = candidate_center
+                    consecutive_single += 1
+                    status[
+                        "green_single_left_count"
+                        if single_side == "left"
+                        else "green_single_right_count"
+                    ] += 1
+                else:
+                    reason = "green_single_offset_invalid"
+                    consecutive_single += 1
+            else:
+                consecutive_single += 1
+
+            if left_inner is not None:
+                previous_left = float(left_inner)
+            if right_inner is not None:
+                previous_right = float(right_inner)
+            if center is not None:
+                previous_center = center
+            samples.append(
+                {
+                    "y": int(y),
+                    "forward_m": YellowCorridorPlanner._forward_m(y, ipm),
+                    "reason": reason,
+                    "classification": classification,
+                    "source_type": classification,
+                    "left": left_inner,
+                    "right": right_inner,
+                    "center": center,
+                    "width": width_value,
+                    "single_side": single_side,
+                    "yellow_support_ratio": yellow_ratio,
+                    "unknown_ratio": unknown_ratio,
+                    "green_intrusion_ratio": intrusion_ratio,
+                }
+            )
+
+        status.update(
+            {
+                "green_corridor_width_px_mean": float(
+                    np.mean(widths) if widths else 0.0
+                ),
+                "green_corridor_width_px_std": float(
+                    np.std(widths) if widths else 0.0
+                ),
+                "green_corridor_yellow_support_ratio": float(
+                    np.mean(yellow_ratios) if yellow_ratios else 0.0
+                ),
+                "green_corridor_unknown_ratio": float(
+                    np.mean(unknown_ratios) if unknown_ratios else 0.0
+                ),
+                "green_corridor_green_intrusion_ratio": float(
+                    np.mean(intrusion_ratios) if intrusion_ratios else 0.0
+                ),
+            }
+        )
+        return samples, status
+
+    @classmethod
+    def _fill_internal_gaps(
+        cls,
+        samples: List[Dict[str, Any]],
+        green: np.ndarray,
+        config: YellowCorridorConfig,
+        ipm: Any,
+    ) -> None:
+        if not config.center_gap_fill_enable:
+            return
+        valid_classes = {"green_dual_observed", "green_single_offset"}
+        index = 0
+        while index < len(samples):
+            if samples[index]["classification"] != "missing":
+                index += 1
+                continue
+            start = index
+            while (
+                index < len(samples)
+                and samples[index]["classification"] == "missing"
+            ):
+                index += 1
+            end = index
+            count = end - start
+            if (
+                start == 0
+                or end >= len(samples)
+                or samples[start - 1]["classification"] not in valid_classes
+                or samples[end]["classification"] not in valid_classes
+                or count > config.center_gap_fill_max_samples
+                or count * config.sample_step_m
+                > config.center_gap_fill_max_m + 1.0e-9
+            ):
+                continue
+            before, after = samples[start - 1], samples[end]
+            if (
+                abs(float(after["center"]) - float(before["center"]))
+                / (count + 1)
+                > config.center_jump_max_m / ipm.meter_per_pixel
+            ):
+                continue
+            proposed: List[float] = []
+            valid = True
+            for offset, sample in enumerate(samples[start:end], 1):
+                ratio = offset / float(count + 1)
+                center = float(before["center"]) + ratio * (
+                    float(after["center"]) - float(before["center"])
+                )
+                center_index = int(round(center))
+                if (
+                    not 0 <= center_index < green.shape[1]
+                    or green[int(sample["y"]), center_index] > 0
+                ):
+                    valid = False
+                    break
+                proposed.append(center)
+            if not valid:
+                continue
+            for sample, center in zip(samples[start:end], proposed):
+                sample["classification"] = "gap_filled"
+                sample["source_type"] = "gap_filled"
+                sample["center"] = center
+                sample["reason"] = "accepted"
+
+    @staticmethod
+    def _leading_segment(
+        samples: List[Dict[str, Any]],
+        allowed: set,
+    ) -> List[Dict[str, Any]]:
+        segment: List[Dict[str, Any]] = []
+        started = False
+        for sample in samples:
+            if sample["classification"] in allowed:
+                segment.append(sample)
+                started = True
+            elif started:
+                break
+        return segment
+
+    @classmethod
+    def plan(
+        cls,
+        extracted_samples: Sequence[Dict[str, Any]],
+        base_status: Dict[str, Any],
+        green: np.ndarray,
+        yellow: np.ndarray,
+        ipm: Any,
+        config: YellowCorridorConfig,
+        geometry_config: Any,
+        allow_single: bool,
+    ) -> Tuple[Any, Dict[str, Any], List[Dict[str, Any]]]:
+        status = dict(base_status)
+        samples = [dict(sample) for sample in extracted_samples]
+        if not config.enable:
+            result = STAGE4.GeometryResult(reason="green_fast_path_disabled")
+            result.green_boundary_samples = samples
+            status["green_boundary_fast_path_reason"] = (
+                "green_fast_path_disabled"
+            )
+            return result, status, samples
+        if not allow_single:
+            for sample in samples:
+                if sample["classification"] == "green_single_offset":
+                    sample["classification"] = "missing"
+                    sample["reason"] = "green_single_not_enabled"
+        cls._fill_internal_gaps(samples, green, config, ipm)
+        allowed = {"green_dual_observed", "gap_filled"}
+        if allow_single:
+            allowed.add("green_single_offset")
+        segment = cls._leading_segment(samples, allowed)
+        raw = np.asarray(
+            [
+                (float(sample["center"]), float(sample["y"]))
+                for sample in segment
+            ],
+            dtype=np.float64,
+        ).reshape(-1, 2)
+        weights = np.asarray(
+            [
+                YellowCorridorPlanner.CENTER_WEIGHTS[
+                    sample["classification"]
+                ]
+                for sample in segment
+            ],
+            dtype=np.float64,
+        )
+        final_points = raw.copy()
+        if config.center_smooth_enable and len(raw) >= 3:
+            try:
+                final_points = YellowCorridorPlanner._weighted_smooth(
+                    raw, weights, config.center_smooth_lambda
+                )
+            except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+                final_points = raw.copy()
+        fake_support = np.full_like(yellow, 255)
+        reason, _support, span = YellowCorridorPlanner._validate_centerline(
+            final_points,
+            fake_support,
+            ipm,
+            config,
+            geometry_config,
+        )
+        yellow_ratio = 0.0
+        if len(final_points):
+            pixels = np.round(final_points).astype(int)
+            yellow_ratio = float(
+                np.mean(yellow[pixels[:, 1], pixels[:, 0]] > 0)
+            )
+        dual_count = sum(
+            sample["classification"] == "green_dual_observed"
+            for sample in segment
+        )
+        single_count = sum(
+            sample["classification"] == "green_single_offset"
+            for sample in segment
+        )
+        filled_count = sum(
+            sample["classification"] == "gap_filled" for sample in segment
+        )
+        if not allow_single and dual_count < config.min_valid_samples:
+            reason = "green_dual_too_few_samples"
+        if allow_single and single_count == 0:
+            reason = "green_single_missing"
+        if (
+            filled_count / max(1, len(segment))
+            > config.center_gap_fill_max_ratio
+        ):
+            reason = "green_gap_fill_ratio_high"
+        width_std = float(status["green_corridor_width_px_std"])
+        width_stability = float(
+            np.clip(
+                1.0
+                - width_std / max(float(ipm.expected_lane_width_px) * 0.20, 1.0),
+                0.0,
+                1.0,
+            )
+        )
+        intrusion = float(status["green_corridor_green_intrusion_ratio"])
+        confidence = float(
+            np.clip(
+                0.65
+                + 0.15 * width_stability
+                + 0.15 * yellow_ratio
+                + 0.05 * (1.0 - intrusion)
+                - 0.18 * single_count / max(1, len(segment))
+                - 0.20 * filled_count / max(1, len(segment)),
+                0.0,
+                0.995,
+            )
+        )
+        mode = (
+            "single_green_width_offset"
+            if allow_single and single_count
+            else "green_dual_inner_edge"
+        )
+        if mode == "single_green_width_offset":
+            confidence = min(confidence, 0.72)
+        valid = reason == "valid"
+        status["green_boundary_fast_path_used"] = valid
+        status["green_boundary_fast_path_reason"] = reason
+        result = STAGE4.GeometryResult(
+            mode=mode,
+            valid=valid,
+            reason=reason,
+            confidence=confidence if valid else 0.0,
+            raw_points=raw,
+            final_points=final_points if valid else np.empty((0, 2)),
+            measured_width_mean_px=float(
+                status["green_corridor_width_px_mean"]
+            ),
+            measured_width_std_px=width_std,
+            yellow_ratio=yellow_ratio,
+            forward_span_m=span,
+        )
+        result.green_boundary_samples = samples
+        return result, status, samples
 
 
 @dataclass
@@ -2798,7 +3297,44 @@ class LaneAlgorithm:
         ) * 1000.0
 
         started = time.perf_counter()
-        if yellow_status["main_yellow_valid"]:
+        green_extracted, green_base_status = GreenBoundaryFastPlanner.extract(
+            transformed["green"],
+            transformed["yellow"],
+            self.roi_ipm,
+            self.corridor_config,
+            self.last_center_x,
+        )
+        (
+            green_dual_result,
+            green_status,
+            green_debug_samples,
+        ) = GreenBoundaryFastPlanner.plan(
+            green_extracted,
+            green_base_status,
+            transformed["green"],
+            transformed["yellow"],
+            self.roi_ipm,
+            self.corridor_config,
+            self.geometry_config,
+            allow_single=False,
+        )
+        timing["green_boundary_fast_path_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+
+        started = time.perf_counter()
+        if green_dual_result.valid:
+            corridor_result = STAGE4.GeometryResult(
+                reason="skipped_green_dual_valid"
+            )
+            corridor_result.yellow_corridor_samples = []
+            corridor_status = copy.deepcopy(
+                YellowCorridorPlanner.EMPTY_STATUS
+            )
+            corridor_status["yellow_corridor_reason"] = (
+                "skipped_green_dual_valid"
+            )
+        elif yellow_status["main_yellow_valid"]:
             corridor_result, corridor_status = YellowCorridorPlanner.plan(
                 main_yellow,
                 observed_ipm_boundary,
@@ -2822,14 +3358,42 @@ class LaneAlgorithm:
             time.perf_counter() - started
         ) * 1000.0
 
-        fast_valid = False
-        if corridor_status["yellow_corridor_valid"]:
+        fast_result = green_dual_result
+        fast_valid = bool(green_dual_result.valid)
+        if not fast_valid and corridor_status["yellow_corridor_valid"]:
+            fast_result = corridor_result
             fast_valid = bool(corridor_result.valid)
-            if not fast_valid:
+            if fast_valid and green_base_status["green_dual_edge_valid_count"]:
+                fast_result.mode = "green_yellow_hybrid"
+            elif not fast_valid:
                 corridor_status["yellow_corridor_valid"] = False
                 corridor_status["yellow_corridor_reason"] = (
                     corridor_result.reason
                 )
+        if not fast_valid:
+            single_started = time.perf_counter()
+            (
+                green_single_result,
+                single_status,
+                single_debug_samples,
+            ) = GreenBoundaryFastPlanner.plan(
+                green_extracted,
+                green_base_status,
+                transformed["green"],
+                transformed["yellow"],
+                self.roi_ipm,
+                self.corridor_config,
+                self.geometry_config,
+                allow_single=True,
+            )
+            timing["green_boundary_fast_path_ms"] += (
+                time.perf_counter() - single_started
+            ) * 1000.0
+            if green_single_result.valid:
+                fast_result = green_single_result
+                green_status = single_status
+                green_debug_samples = single_debug_samples
+                fast_valid = True
 
         empty = np.zeros(
             (self.roi_ipm.output_height, self.roi_ipm.output_width),
@@ -2849,7 +3413,7 @@ class LaneAlgorithm:
         raw_component_count = 0
         merged_group_count = 0
         fallback_used = not fast_valid
-        result = corridor_result if fast_valid else STAGE4.GeometryResult(
+        result = fast_result if fast_valid else STAGE4.GeometryResult(
             reason="segmentation_invalid"
         )
 
@@ -3036,6 +3600,9 @@ class LaneAlgorithm:
         if result.mode in {
             "yellow_corridor_dual_edge",
             "yellow_corridor_center_gap_filled",
+            "green_dual_inner_edge",
+            "green_yellow_hybrid",
+            "single_green_width_offset",
         }:
             road_side_status = {
                 key: "N/A"
@@ -3082,6 +3649,8 @@ class LaneAlgorithm:
             yellow_corridor_samples=list(
                 getattr(corridor_result, "yellow_corridor_samples", [])
             ),
+            green_boundary_status=green_status,
+            green_boundary_samples=green_debug_samples,
             fallback_boundary_pipeline_used=fallback_used,
             timing_ms=timing,
             counters=counters,
@@ -3102,6 +3671,8 @@ class LaneAlgorithm:
         diagnostic_curves: Optional[Sequence[Any]] = None,
         corridor_samples: Optional[Sequence[Dict[str, Any]]] = None,
         corridor_status: Optional[Dict[str, Any]] = None,
+        green_samples: Optional[Sequence[Dict[str, Any]]] = None,
+        green_status: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         height, width = main_yellow.shape
         overlay = np.zeros((height, width, 3), dtype=np.uint8)
@@ -3153,7 +3724,12 @@ class LaneAlgorithm:
             "reject_boundary_ratio": (255, 255, 0),
             "reject_center_not_yellow": (180, 0, 180),
         }
-        for sample in corridor_samples or ():
+        green_mode = result.mode in {
+            "green_dual_inner_edge",
+            "green_yellow_hybrid",
+            "single_green_width_offset",
+        }
+        for sample in (() if green_mode else (corridor_samples or ())):
             y = int(sample["y"])
             classification = sample.get("classification", "missing")
             center = int(
@@ -3186,6 +3762,37 @@ class LaneAlgorithm:
                     1,
                     cv2.LINE_AA,
                 )
+        for sample in green_samples or ():
+            classification = sample.get("classification", "missing")
+            if classification not in {
+                "green_dual_observed",
+                "green_single_offset",
+                "gap_filled",
+            }:
+                continue
+            y = int(sample["y"])
+            center = int(round(float(sample["center"])))
+            if classification == "green_dual_observed":
+                cv2.circle(
+                    overlay, (int(sample["left"]), y), 4, (255, 120, 0), -1
+                )
+                cv2.circle(
+                    overlay, (int(sample["right"]), y), 4, (255, 0, 255), -1
+                )
+                cv2.circle(overlay, (center, y), 3, (0, 255, 255), -1)
+            elif classification == "green_single_offset":
+                edge_x = (
+                    sample["left"]
+                    if sample.get("left") is not None
+                    else sample.get("right")
+                )
+                if edge_x is not None:
+                    cv2.circle(
+                        overlay, (int(edge_x), y), 4, (255, 160, 0), -1
+                    )
+                cv2.circle(overlay, (center, y), 5, (0, 140, 255), 2)
+            else:
+                cv2.circle(overlay, (center, y), 5, (255, 255, 0), 2)
         near_forward = (
             self.roi_ipm.vehicle_origin_y_px - float(roi[1])
         ) * self.roi_ipm.meter_per_pixel
@@ -3247,7 +3854,34 @@ class LaneAlgorithm:
             "yellow_corridor_center_gap_filled",
         }
         sample_summary = corridor_status or {}
-        lines = (
+        green_summary = green_status or {}
+        if green_mode:
+            lines = (
+                f"mode={result.mode}",
+                f"valid={result.valid} confidence={result.confidence:.2f}",
+                (
+                    "green L/R="
+                    f"{len(green_samples or ()) - green_summary.get('green_left_inner_edge_missing_count', 0)}/"
+                    f"{len(green_samples or ()) - green_summary.get('green_right_inner_edge_missing_count', 0)} "
+                    "single="
+                    f"{green_summary.get('green_single_left_count', 0)}/"
+                    f"{green_summary.get('green_single_right_count', 0)}"
+                ),
+                (
+                    "width="
+                    f"{green_summary.get('green_corridor_width_px_mean', 0.0):.1f}"
+                    f"+/-{green_summary.get('green_corridor_width_px_std', 0.0):.1f}px"
+                ),
+                (
+                    "Y/U/G="
+                    f"{green_summary.get('green_corridor_yellow_support_ratio', 0.0):.2f}/"
+                    f"{green_summary.get('green_corridor_unknown_ratio', 0.0):.2f}/"
+                    f"{green_summary.get('green_corridor_green_intrusion_ratio', 0.0):.2f}"
+                ),
+                f"time={processing_ms:.1f}ms",
+            )
+        else:
+            lines = (
             f"mode={result.mode}",
             f"valid={result.valid} confidence={result.confidence:.2f}",
             f"points={len(result.final_points)} span={result.forward_span_m:.2f}m",
@@ -3271,7 +3905,7 @@ class LaneAlgorithm:
                 )
             ),
             f"time={processing_ms:.1f}ms",
-        )
+            )
         for index, text in enumerate(lines):
             position = (10, 24 + index * 22)
             cv2.putText(
@@ -3369,6 +4003,12 @@ const fields=["centerline_mode","centerline_valid","centerline_confidence",
 "center_gap_max_samples","center_gap_fill_ratio",
 "center_smoothing_used","center_smoothing_lambda",
 "center_pre_smooth_lateral_std_px","center_post_smooth_lateral_std_px",
+"green_dual_edge_valid_count","green_single_left_count",
+"green_single_right_count","green_left_inner_edge_missing_count",
+"green_right_inner_edge_missing_count","green_corridor_width_px_mean",
+"green_corridor_width_px_std","green_corridor_yellow_support_ratio",
+"green_corridor_unknown_ratio","green_corridor_green_intrusion_ratio",
+"green_boundary_fast_path_used","green_boundary_fast_path_reason",
 "yellow_corridor_reason","fallback_boundary_pipeline_used",
 "observed_boundary_component_count","repaired_boundary_component_count",
 "merged_boundary_group_count","repaired_gap_count","repaired_gap_max_px",
@@ -3912,6 +4552,7 @@ class LanePerceptionPipelineNode(Node):
                 self.algorithm.roi_ipm.output_height
             ),
             **copy.deepcopy(YellowCorridorPlanner.EMPTY_STATUS),
+            **copy.deepcopy(GreenBoundaryFastPlanner.EMPTY_STATUS),
             "fallback_boundary_pipeline_used": False,
             "boundary_repair_max_gap_px": (
                 self.enhancement_config.max_gap_px(
@@ -4052,6 +4693,7 @@ class LanePerceptionPipelineNode(Node):
                                 result.geometry.yellow_ratio
                             ),
                             **result.yellow_corridor_status,
+                            **result.green_boundary_status,
                             "fallback_boundary_pipeline_used": (
                                 result.fallback_boundary_pipeline_used
                             ),
@@ -4115,6 +4757,9 @@ class LanePerceptionPipelineNode(Node):
                             "merged_boundary_group_count": 0,
                             "repaired_gap_count": 0,
                             "repaired_gap_max_px": 0,
+                            **copy.deepcopy(
+                                GreenBoundaryFastPlanner.EMPTY_STATUS
+                            ),
                             **copy.deepcopy(
                                 GlobalRoadSideClassifier.EMPTY_STATUS
                             ),
@@ -4224,6 +4869,8 @@ class LanePerceptionPipelineNode(Node):
                 result.candidate_curves,
                 result.yellow_corridor_samples,
                 result.yellow_corridor_status,
+                result.green_boundary_samples,
+                result.green_boundary_status,
             )
             composite = self._make_web_composite(
                 snapshot.raw,
@@ -4276,6 +4923,50 @@ class LanePerceptionPipelineNode(Node):
     def _corridor_status_lines(
         cls, result: PipelineResult
     ) -> List[str]:
+        if result.geometry.mode in {
+            "green_dual_inner_edge",
+            "green_yellow_hybrid",
+            "single_green_width_offset",
+        }:
+            green = result.green_boundary_status
+            total = len(result.green_boundary_samples)
+            return [
+                (
+                    f"mode={result.geometry.mode} "
+                    f"confidence={result.geometry.confidence:.2f}"
+                ),
+                (
+                    "green left/right="
+                    f"{total - green.get('green_left_inner_edge_missing_count', 0)}/"
+                    f"{total - green.get('green_right_inner_edge_missing_count', 0)} "
+                    f"dual={green.get('green_dual_edge_valid_count', 0)}"
+                ),
+                (
+                    "single left/right="
+                    f"{green.get('green_single_left_count', 0)}/"
+                    f"{green.get('green_single_right_count', 0)}"
+                ),
+                (
+                    "width="
+                    f"{green.get('green_corridor_width_px_mean', 0.0):.1f}"
+                    f"+/-{green.get('green_corridor_width_px_std', 0.0):.1f}px"
+                ),
+                (
+                    "yellow/unknown/intrusion="
+                    f"{green.get('green_corridor_yellow_support_ratio', 0.0):.2f}/"
+                    f"{green.get('green_corridor_unknown_ratio', 0.0):.2f}/"
+                    f"{green.get('green_corridor_green_intrusion_ratio', 0.0):.2f}"
+                ),
+                (
+                    f"points={len(result.geometry.final_points)} "
+                    f"span={result.geometry.forward_span_m:.2f}m"
+                ),
+                (
+                    "green fast path="
+                    f"{green.get('green_boundary_fast_path_used', False)} "
+                    f"reason={green.get('green_boundary_fast_path_reason', 'N/A')}"
+                ),
+            ]
         status = result.yellow_corridor_status
         return [
             (
@@ -4480,6 +5171,8 @@ class LanePerceptionPipelineNode(Node):
             f"{p95['boundary_extract_ms']:.1f} "
             f"ipm={average['ipm_warp_ms']:.1f}/"
             f"{p95['ipm_warp_ms']:.1f} "
+            f"greenfast={average['green_boundary_fast_path_ms']:.1f}/"
+            f"{p95['green_boundary_fast_path_ms']:.1f} "
             f"corridor={average['yellow_corridor_ms']:.1f}/"
             f"{p95['yellow_corridor_ms']:.1f} "
             f"repair={average['boundary_repair_ms']:.1f}/"
@@ -4767,6 +5460,8 @@ def run_self_tests() -> None:
         result.candidate_curves,
         result.yellow_corridor_samples,
         result.yellow_corridor_status,
+        result.green_boundary_samples,
+        result.green_boundary_status,
     )
     composite = LanePerceptionPipelineNode._make_web_composite(
         image,
@@ -5204,7 +5899,11 @@ def run_self_tests() -> None:
         "34 valid corridor skips repair",
         fast_pipeline_result.geometry.valid
         and fast_pipeline_result.geometry.mode
-        == "yellow_corridor_dual_edge"
+        in {
+            "green_dual_inner_edge",
+            "green_yellow_hybrid",
+            "yellow_corridor_dual_edge",
+        }
         and not fast_pipeline_result.fallback_boundary_pipeline_used
         and len(fast_pipeline_result.geometry.final_points) >= 8
         and fast_pipeline_result.geometry.forward_span_m >= 0.30
@@ -5435,7 +6134,7 @@ def run_self_tests() -> None:
     )
     check(
         "50 fast mode road side is N/A",
-        fast_pipeline_result.geometry.mode == "yellow_corridor_dual_edge"
+        fast_pipeline_result.geometry.valid
         and all(
             value == "N/A"
             for value in fast_pipeline_result.road_side_status.values()
@@ -5660,8 +6359,6 @@ def run_self_tests() -> None:
     check(
         "69 weak fast path skips complex fallback",
         weak_fast_result.geometry.valid
-        and weak_fast_result.geometry.mode
-        == "yellow_corridor_center_gap_filled"
         and not weak_fast_result.fallback_boundary_pipeline_used,
     )
     check(
@@ -5690,6 +6387,231 @@ def run_self_tests() -> None:
         and weak_fast_result.counters["jpeg_encode_count"] == 0
         and weak_fast_result.timing_ms["overlay_build_ms"] == 0.0
         and weak_fast_result.timing_ms["jpeg_encode_ms"] == 0.0,
+    )
+
+    # 73-85：绿色主区域内边缘优先，黄色只作为辅助证据。
+    (
+        green_samples,
+        green_base_status,
+    ) = GreenBoundaryFastPlanner.extract(
+        corridor_green,
+        corridor_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    green_dual_result, green_dual_status, green_dual_samples = (
+        GreenBoundaryFastPlanner.plan(
+            green_samples,
+            green_base_status,
+            corridor_green,
+            corridor_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            geometry,
+            allow_single=False,
+        )
+    )
+    check(
+        "73 complete green yellow dual center",
+        green_dual_result.valid
+        and green_dual_result.mode == "green_dual_inner_edge"
+        and green_dual_status["green_dual_edge_valid_count"] == 15
+        and np.max(np.abs(green_dual_result.final_points[:, 0] - 300.0))
+        <= 1.0,
+    )
+
+    sparse_yellow = corridor_yellow.copy()
+    sparse_yellow[20:121] = 0
+    sparse_samples, sparse_base = GreenBoundaryFastPlanner.extract(
+        corridor_green,
+        sparse_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    sparse_result, sparse_status, _sparse_debug = (
+        GreenBoundaryFastPlanner.plan(
+            sparse_samples,
+            sparse_base,
+            corridor_green,
+            sparse_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            geometry,
+            allow_single=False,
+        )
+    )
+    check(
+        "74 sparse yellow still full green centerline",
+        sparse_result.valid
+        and len(sparse_result.final_points) == 15
+        and sparse_status["green_corridor_unknown_ratio"] > 0.50,
+    )
+
+    no_yellow = np.zeros_like(corridor_yellow)
+    no_yellow_samples, no_yellow_base = GreenBoundaryFastPlanner.extract(
+        corridor_green,
+        no_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    no_yellow_result, no_yellow_status, _no_yellow_debug = (
+        GreenBoundaryFastPlanner.plan(
+            no_yellow_samples,
+            no_yellow_base,
+            corridor_green,
+            no_yellow,
+            algorithm.roi_ipm,
+            corridor_config,
+            geometry,
+            allow_single=False,
+        )
+    )
+    check(
+        "75 no yellow keeps green path with lower confidence",
+        no_yellow_result.valid
+        and no_yellow_status["green_corridor_yellow_support_ratio"] == 0.0
+        and no_yellow_result.confidence < green_dual_result.confidence,
+    )
+
+    noisy_green = corridor_green.copy()
+    noisy_green[:, 286:292] = 255
+    noisy_samples, noisy_status = GreenBoundaryFastPlanner.extract(
+        noisy_green,
+        corridor_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    check(
+        "76 isolated inner green noise ignored",
+        noisy_status["green_dual_edge_valid_count"] == 15
+        and all(
+            sample["left"] == 249
+            for sample in noisy_samples
+            if sample["classification"] == "green_dual_observed"
+        ),
+    )
+    check(
+        "77 left green border connection",
+        all(
+            sample["left"] == 249
+            for sample in green_dual_samples
+            if sample["classification"] == "green_dual_observed"
+        ),
+    )
+    check(
+        "78 right green border connection",
+        all(
+            sample["right"] == 351
+            for sample in green_dual_samples
+            if sample["classification"] == "green_dual_observed"
+        ),
+    )
+
+    wide_green = np.zeros_like(corridor_green)
+    wide_green[:, :250] = 255
+    wide_green[:, 450:] = 255
+    wide_samples, wide_base = GreenBoundaryFastPlanner.extract(
+        wide_green,
+        no_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    wide_result, _wide_status, _wide_debug = GreenBoundaryFastPlanner.plan(
+        wide_samples,
+        wide_base,
+        wide_green,
+        no_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+        geometry,
+        allow_single=False,
+    )
+    check("79 abnormal green width rejected", not wide_result.valid)
+
+    green_metric_samples = STAGE4.PathConverter.metric_samples(
+        algorithm.roi_ipm.to_full_points(green_dual_result.final_points),
+        ipm,
+    )
+    check(
+        "80 green dual forward monotonic",
+        len(green_metric_samples) > 1
+        and all(
+            green_metric_samples[index + 1][0]
+            > green_metric_samples[index][0]
+            for index in range(len(green_metric_samples) - 1)
+        ),
+    )
+
+    mixed_single_green = corridor_green.copy()
+    mixed_single_green[110, 351:] = 0
+    mixed_single_green[100, :250] = 0
+    mixed_samples, mixed_base = GreenBoundaryFastPlanner.extract(
+        mixed_single_green,
+        corridor_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+    )
+    mixed_result, _mixed_status, mixed_debug = GreenBoundaryFastPlanner.plan(
+        mixed_samples,
+        mixed_base,
+        mixed_single_green,
+        corridor_yellow,
+        algorithm.roi_ipm,
+        corridor_config,
+        geometry,
+        allow_single=True,
+    )
+    left_estimates = [
+        sample
+        for sample in mixed_debug
+        if sample["classification"] == "green_single_offset"
+        and sample["single_side"] == "left"
+    ]
+    right_estimates = [
+        sample
+        for sample in mixed_debug
+        if sample["classification"] == "green_single_offset"
+        and sample["single_side"] == "right"
+    ]
+    check(
+        "81 single green offset direction",
+        mixed_result.valid
+        and left_estimates
+        and right_estimates
+        and abs(float(left_estimates[0]["center"]) - 299.0) <= 1.0
+        and abs(float(right_estimates[0]["center"]) - 301.0) <= 1.0,
+    )
+    check(
+        "82 single green confidence below dual",
+        mixed_result.confidence < green_dual_result.confidence,
+    )
+
+    green_only_hsv = np.zeros((800, 600, 3), dtype=np.uint8)
+    green_only_hsv[:, :250] = (60, 220, 220)
+    green_only_hsv[:, 250:351] = (0, 0, 35)
+    green_only_hsv[:, 351:] = (60, 220, 220)
+    green_only_image = cv2.cvtColor(green_only_hsv, cv2.COLOR_HSV2BGR)
+    green_only_pipeline = fast_algorithm.process(green_only_image)
+    check(
+        "83 green dual skips complex fallback",
+        green_only_pipeline.geometry.valid
+        and green_only_pipeline.geometry.mode == "green_dual_inner_edge"
+        and green_only_pipeline.green_boundary_status[
+            "green_boundary_fast_path_used"
+        ]
+        and not green_only_pipeline.fallback_boundary_pipeline_used,
+    )
+    check(
+        "84 green yellow failure retains fallback",
+        fallback_result.fallback_boundary_pipeline_used,
+    )
+    check(
+        "85 green web off no overlay jpeg",
+        green_only_pipeline.overlay is None
+        and green_only_pipeline.counters["overlay_build_count"] == 0
+        and green_only_pipeline.counters["jpeg_encode_count"] == 0
+        and green_only_pipeline.timing_ms["overlay_build_ms"] == 0.0
+        and green_only_pipeline.timing_ms["jpeg_encode_ms"] == 0.0,
     )
 
     print(f"SELF-TEST PASS: {len(passed)} checks")
