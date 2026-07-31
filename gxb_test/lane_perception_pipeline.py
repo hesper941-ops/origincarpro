@@ -1717,6 +1717,27 @@ class SingleGreenCurvePlanner:
     """Build a centerline only over an observed single-green boundary chain."""
 
     SEGMENT_RATIOS = (0.20, 0.36, 0.52, 0.68, 0.84, 1.0)
+    DP_MAX_CANDIDATES_PER_STATION = 9
+    DP_MAX_INTERNAL_GAP_STATIONS = 2
+    DP_DEDUPLICATE_PX = 2.0
+    DP_MIN_YELLOW_RATIO = 0.15
+    DP_MAX_LATERAL_STEP_M = 0.24
+    DP_WEIGHTS = {
+        "yellow": 1.40,
+        "green": 4.00,
+        "width": 1.20,
+        "normal_prior": 0.80,
+        "anchor_dual": -1.50,
+        "anchor_hybrid": -0.45,
+        "normal": 0.00,
+        "yellow_center": 0.15,
+        "yellow_peak": 0.25,
+        "transition_lateral": 0.55,
+        "transition_heading": 0.40,
+        "transition_curvature": 0.75,
+        "transition_gap": 0.80,
+        "transition_reversal": 2.50,
+    }
     STATUS_DEFAULTS: Dict[str, Any] = {
         "single_green_curve_offset_used": False,
         "single_green_curve_side": "",
@@ -1761,6 +1782,34 @@ class SingleGreenCurvePlanner:
         "hybrid_single_curve_point_count": 0,
         "hybrid_final_point_count": 0,
         "hybrid_final_span_m": 0.0,
+        "single_green_curve_pre_fusion_count": 0,
+        "single_green_curve_post_fusion_count": 0,
+        "single_green_curve_fusion_reject_reason": "not_attempted",
+        "single_green_curve_station_duplicate_count": 0,
+        "single_green_curve_station_covered_count": 0,
+        "single_green_dp_attempted": False,
+        "single_green_dp_used": False,
+        "single_green_dp_failure_reason": "not_attempted",
+        "single_green_dp_station_count": 0,
+        "single_green_dp_candidate_count": 0,
+        "single_green_dp_candidate_count_max": 0,
+        "single_green_dp_anchor_count": 0,
+        "single_green_dp_normal_prior_count": 0,
+        "single_green_dp_yellow_center_count": 0,
+        "single_green_dp_yellow_peak_count": 0,
+        "single_green_dp_output_count": 0,
+        "single_green_dp_output_span_m": 0.0,
+        "single_green_dp_gap_count": 0,
+        "single_green_dp_mean_candidate_cost": 0.0,
+        "single_green_dp_mean_transition_cost": 0.0,
+        "single_green_dp_total_cost": 0.0,
+        "single_green_dp_evidence_start_x_m": 0.0,
+        "single_green_dp_evidence_end_x_m": 0.0,
+        "single_green_dp_output_start_x_m": 0.0,
+        "single_green_dp_output_end_x_m": 0.0,
+        "single_green_dp_left_right_shared_pipeline": True,
+        "single_green_dp_mode_selection_reason": "not_selected",
+        "single_green_dp_ms": 0.0,
         "single_green_curve_offset_ms": 0.0,
     }
 
@@ -2095,6 +2144,628 @@ class SingleGreenCurvePlanner:
         return width, source, history_age_ms, clamped
 
     @classmethod
+    def _dp_candidate_cost(
+        cls,
+        source_type: str,
+        yellow_ratio: float,
+        green_ratio: float,
+        width_error_ratio: float,
+        normal_distance_ratio: float,
+    ) -> float:
+        weights = cls.DP_WEIGHTS
+        return float(
+            weights["yellow"] * (1.0 - yellow_ratio)
+            + weights["green"] * green_ratio
+            + weights["width"] * min(width_error_ratio, 2.0)
+            + weights["normal_prior"] * min(normal_distance_ratio, 2.0)
+            + weights[source_type]
+        )
+
+    @classmethod
+    def _dp_add_candidate(
+        cls,
+        candidates: List[Dict[str, Any]],
+        pixel_x: float,
+        pixel_y: int,
+        forward_m: float,
+        boundary_left_m: float,
+        normal_prior_x: float,
+        source_type: str,
+        yellow: np.ndarray,
+        green: np.ndarray,
+        valid_mask: np.ndarray,
+        ipm: Any,
+        config: YellowCorridorConfig,
+        half_width_m: float,
+        boundary_pixel_x: float,
+    ) -> None:
+        x = int(round(pixel_x))
+        y = int(pixel_y)
+        if (
+            not 0 <= y < yellow.shape[0]
+            or not 0 <= x < yellow.shape[1]
+            or not valid_mask[y, x]
+        ):
+            return
+        is_dual_anchor = source_type == "anchor_dual"
+        yellow_ratio, green_ratio = cls._window_ratios(
+            yellow,
+            green,
+            valid_mask,
+            float(x),
+            float(y),
+            config.single_green_center_yellow_window_px,
+        )
+        if green_ratio > config.single_green_center_max_green_ratio:
+            return
+        if not is_dual_anchor and (
+            yellow[y, x] == 0 or yellow_ratio < cls.DP_MIN_YELLOW_RATIO
+        ):
+            return
+        if not is_dual_anchor and cls._segment_green_ratio(
+            (boundary_pixel_x, float(y)),
+            (float(x), float(y)),
+            green,
+            valid_mask,
+        ) > 0.35:
+            return
+        meter_per_pixel = float(ipm.meter_per_pixel)
+        candidate_left_m = (
+            float(ipm.vehicle_center_x_px) - float(x)
+        ) * meter_per_pixel
+        width_error = abs(
+            abs(candidate_left_m - boundary_left_m) - half_width_m
+        )
+        if not is_dual_anchor and width_error > max(0.18, half_width_m * 0.72):
+            return
+        width_error_ratio = width_error / max(half_width_m, 1.0e-6)
+        normal_distance_ratio = (
+            abs(float(x) - normal_prior_x)
+            * meter_per_pixel
+            / max(half_width_m, 1.0e-6)
+        )
+        cost = cls._dp_candidate_cost(
+            source_type,
+            yellow_ratio,
+            green_ratio,
+            width_error_ratio,
+            normal_distance_ratio,
+        )
+        candidate = {
+            "pixel_x": float(x),
+            "pixel_y": float(y),
+            "forward_m": float(forward_m),
+            "left_m": float(candidate_left_m),
+            "source_type": source_type,
+            "yellow_ratio": float(yellow_ratio),
+            "green_ratio": float(green_ratio),
+            "candidate_cost": float(cost),
+        }
+        for index, existing in enumerate(candidates):
+            if abs(existing["pixel_x"] - candidate["pixel_x"]) <= (
+                cls.DP_DEDUPLICATE_PX
+            ):
+                if candidate["candidate_cost"] < existing["candidate_cost"]:
+                    candidates[index] = candidate
+                return
+        candidates.append(candidate)
+
+    @classmethod
+    def _dp_transition_cost(
+        cls,
+        previous_previous: Optional[Dict[str, Any]],
+        previous: Dict[str, Any],
+        current: Dict[str, Any],
+        gap_count: int,
+    ) -> Optional[float]:
+        delta_forward = current["forward_m"] - previous["forward_m"]
+        if delta_forward <= 1.0e-6:
+            return None
+        delta_left = current["left_m"] - previous["left_m"]
+        allowed_step = cls.DP_MAX_LATERAL_STEP_M * max(1, gap_count + 1)
+        if abs(delta_left) > allowed_step:
+            return None
+        heading = math.atan2(delta_left, delta_forward)
+        weights = cls.DP_WEIGHTS
+        cost = (
+            weights["transition_lateral"]
+            * (abs(delta_left) / max(0.10 * (gap_count + 1), 1.0e-6)) ** 2
+            + weights["transition_heading"]
+            * (abs(heading) / math.radians(35.0)) ** 2
+            + weights["transition_gap"] * gap_count
+        )
+        if previous_previous is not None:
+            previous_forward = (
+                previous["forward_m"] - previous_previous["forward_m"]
+            )
+            if previous_forward <= 1.0e-6:
+                return None
+            previous_delta_left = (
+                previous["left_m"] - previous_previous["left_m"]
+            )
+            previous_heading = math.atan2(
+                previous_delta_left, previous_forward
+            )
+            heading_change = abs(math.atan2(
+                math.sin(heading - previous_heading),
+                math.cos(heading - previous_heading),
+            ))
+            if heading_change > math.radians(85.0):
+                return None
+            cost += weights["transition_curvature"] * (
+                heading_change / math.radians(30.0)
+            ) ** 2
+            if (
+                delta_left * previous_delta_left < 0.0
+                and abs(delta_left) > 0.015
+                and abs(previous_delta_left) > 0.015
+            ):
+                cost += weights["transition_reversal"]
+        return float(cost)
+
+    @staticmethod
+    def _dp_station_gap_count(
+        previous_forward_m: float,
+        current_forward_m: float,
+        sample_step_m: float,
+    ) -> int:
+        return max(
+            0,
+            int(round(
+                (current_forward_m - previous_forward_m)
+                / max(sample_step_m, 1.0e-6)
+            ))
+            - 1,
+        )
+
+    @classmethod
+    def _run_corridor_dp(
+        cls,
+        samples: Sequence[Dict[str, Any]],
+        chain: Sequence[Dict[str, Any]],
+        smoothed: np.ndarray,
+        tangents: np.ndarray,
+        side: str,
+        lane_width: float,
+        yellow: np.ndarray,
+        green: np.ndarray,
+        valid_mask: np.ndarray,
+        ipm: Any,
+        config: YellowCorridorConfig,
+        geometry_config: Any,
+        status: Dict[str, Any],
+        collect_debug: bool,
+    ) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+        started = time.perf_counter()
+        status["single_green_dp_attempted"] = True
+        half_width = lane_width * 0.5
+        meter_per_pixel = float(ipm.meter_per_pixel)
+        inverse_meter_per_pixel = 1.0 / meter_per_pixel
+        vehicle_center_x = float(ipm.vehicle_center_x_px)
+        expected_sign = -1.0 if side == "left" else 1.0
+        stations: List[Dict[str, Any]] = []
+        debug_by_sample: Dict[int, Dict[str, Any]] = {}
+        source_counter = {
+            "anchor_dual": 0,
+            "anchor_hybrid": 0,
+            "normal": 0,
+            "yellow_center": 0,
+            "yellow_peak": 0,
+        }
+        for chain_index, chain_item in enumerate(chain):
+            sample_index = int(chain_item["sample_index"])
+            source = samples[sample_index]
+            forward_m = float(chain_item["forward_m"])
+            boundary_left_m = float(smoothed[chain_index, 1])
+            tangent_left = float(tangents[chain_index, 1])
+            normal_left = math.copysign(
+                max(0.25, math.sqrt(max(0.0, 1.0 - tangent_left ** 2))),
+                expected_sign,
+            )
+            normal_prior_left = boundary_left_m + normal_left * half_width
+            normal_prior_x = (
+                vehicle_center_x - normal_prior_left * inverse_meter_per_pixel
+            )
+            y = int(round(float(source["y"])))
+            boundary_pixel_x = (
+                vehicle_center_x - boundary_left_m * inverse_meter_per_pixel
+            )
+            candidates: List[Dict[str, Any]] = []
+            if source.get("left") is not None and source.get("right") is not None:
+                cls._dp_add_candidate(
+                    candidates,
+                    0.5 * (float(source["left"]) + float(source["right"])),
+                    y,
+                    forward_m,
+                    boundary_left_m,
+                    normal_prior_x,
+                    "anchor_dual",
+                    yellow,
+                    green,
+                    valid_mask,
+                    ipm,
+                    config,
+                    half_width,
+                    boundary_pixel_x,
+                )
+            if candidates:
+                candidates = [
+                    min(candidates, key=lambda item: item["candidate_cost"])
+                ]
+            else:
+                if source.get("center") is not None:
+                    cls._dp_add_candidate(
+                        candidates,
+                        float(source["center"]),
+                        y,
+                        forward_m,
+                        boundary_left_m,
+                        normal_prior_x,
+                        "anchor_hybrid",
+                        yellow,
+                        green,
+                        valid_mask,
+                        ipm,
+                        config,
+                        half_width,
+                        boundary_pixel_x,
+                    )
+                cls._dp_add_candidate(
+                    candidates,
+                    normal_prior_x,
+                    y,
+                    forward_m,
+                    boundary_left_m,
+                    normal_prior_x,
+                    "normal",
+                    yellow,
+                    green,
+                    valid_mask,
+                    ipm,
+                    config,
+                    half_width,
+                    boundary_pixel_x,
+                )
+                intervals = sorted(
+                    YellowCorridorPlanner._intervals(yellow[y]),
+                    key=lambda interval: abs(
+                        0.5 * (interval[0] + interval[1]) - normal_prior_x
+                    ),
+                )[:2]
+                for interval_left, interval_right in intervals:
+                    interval_width = interval_right - interval_left + 1
+                    interval_center = 0.5 * (interval_left + interval_right)
+                    cls._dp_add_candidate(
+                        candidates,
+                        interval_center,
+                        y,
+                        forward_m,
+                        boundary_left_m,
+                        normal_prior_x,
+                        "yellow_center",
+                        yellow,
+                        green,
+                        valid_mask,
+                        ipm,
+                        config,
+                        half_width,
+                        boundary_pixel_x,
+                    )
+                    if interval_width >= 10:
+                        for ratio in (0.35, 0.65):
+                            cls._dp_add_candidate(
+                                candidates,
+                                interval_left + ratio * (interval_width - 1),
+                                y,
+                                forward_m,
+                                boundary_left_m,
+                                normal_prior_x,
+                                "yellow_peak",
+                                yellow,
+                                green,
+                                valid_mask,
+                                ipm,
+                                config,
+                                half_width,
+                                boundary_pixel_x,
+                            )
+            candidates.sort(key=lambda item: item["candidate_cost"])
+            candidates = candidates[: cls.DP_MAX_CANDIDATES_PER_STATION]
+            for candidate in candidates:
+                source_counter[candidate["source_type"]] += 1
+            status["single_green_dp_candidate_count"] += len(candidates)
+            status["single_green_dp_candidate_count_max"] = max(
+                status["single_green_dp_candidate_count_max"], len(candidates)
+            )
+            if collect_debug:
+                debug_by_sample[sample_index] = {
+                    "sample_index": sample_index,
+                    "side": side,
+                    "boundary_pixel": (boundary_pixel_x, float(y)),
+                    "smoothed_pixel": (boundary_pixel_x, float(y)),
+                    "center_pixel": (normal_prior_x, float(y)),
+                    "normal_prior_pixel": (normal_prior_x, float(y)),
+                    "normal_sign": int(expected_sign),
+                    "normal_selection_reason": "shared_corridor_dp",
+                    "accepted": False,
+                    "reject_key": "",
+                    "dp_candidates": [
+                        (
+                            item["pixel_x"],
+                            item["pixel_y"],
+                            item["source_type"],
+                        )
+                        for item in candidates
+                    ],
+                    "dp_selected": False,
+                }
+            if candidates:
+                stations.append(
+                    {
+                        "chain_index": chain_index,
+                        "sample_index": sample_index,
+                        "forward_m": forward_m,
+                        "candidates": candidates,
+                    }
+                )
+        status["single_green_dp_station_count"] = len(stations)
+        status["single_green_dp_anchor_count"] = (
+            source_counter["anchor_dual"] + source_counter["anchor_hybrid"]
+        )
+        status["single_green_dp_normal_prior_count"] = source_counter["normal"]
+        status["single_green_dp_yellow_center_count"] = source_counter[
+            "yellow_center"
+        ]
+        status["single_green_dp_yellow_peak_count"] = source_counter[
+            "yellow_peak"
+        ]
+        if not (
+            source_counter["normal"]
+            or source_counter["yellow_center"]
+            or source_counter["yellow_peak"]
+        ):
+            status["single_green_dp_failure_reason"] = "yellow_evidence_missing"
+            status["single_green_dp_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            return {}, list(debug_by_sample.values())
+        groups: List[List[Dict[str, Any]]] = []
+        group: List[Dict[str, Any]] = []
+        for station in stations:
+            if (
+                group
+                and cls._dp_station_gap_count(
+                    group[-1]["forward_m"],
+                    station["forward_m"],
+                    config.sample_step_m,
+                )
+                > cls.DP_MAX_INTERNAL_GAP_STATIONS
+            ):
+                groups.append(group)
+                group = []
+            group.append(station)
+        if group:
+            groups.append(group)
+        selected_stations = max(
+            groups,
+            key=lambda values: (
+                values[-1]["forward_m"] - values[0]["forward_m"],
+                len(values),
+            ),
+            default=[],
+        )
+        if len(selected_stations) < config.min_valid_samples:
+            status["single_green_dp_failure_reason"] = "too_few_candidate_stations"
+            status["single_green_dp_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            return {}, list(debug_by_sample.values())
+        states: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for candidate_index, candidate in enumerate(
+            selected_stations[0]["candidates"]
+        ):
+            states[(-1, candidate_index)] = {
+                "cost": float(candidate["candidate_cost"]),
+                "path": [candidate_index],
+                "transition_total": 0.0,
+            }
+        for station_index in range(1, len(selected_stations)):
+            current_station = selected_stations[station_index]
+            previous_station = selected_stations[station_index - 1]
+            gap_count = cls._dp_station_gap_count(
+                previous_station["forward_m"],
+                current_station["forward_m"],
+                config.sample_step_m,
+            )
+            next_states: Dict[Tuple[int, int], Dict[str, Any]] = {}
+            for (previous_previous_index, previous_index), record in states.items():
+                previous = previous_station["candidates"][previous_index]
+                previous_previous = None
+                if station_index >= 2 and previous_previous_index >= 0:
+                    previous_previous = selected_stations[station_index - 2][
+                        "candidates"
+                    ][previous_previous_index]
+                for current_index, current in enumerate(
+                    current_station["candidates"]
+                ):
+                    transition = cls._dp_transition_cost(
+                        previous_previous,
+                        previous,
+                        current,
+                        gap_count,
+                    )
+                    if transition is None:
+                        continue
+                    total_cost = (
+                        record["cost"]
+                        + current["candidate_cost"]
+                        + transition
+                    )
+                    key = (previous_index, current_index)
+                    if key not in next_states or total_cost < next_states[key]["cost"]:
+                        next_states[key] = {
+                            "cost": float(total_cost),
+                            "path": record["path"] + [current_index],
+                            "transition_total": (
+                                record["transition_total"] + transition
+                            ),
+                        }
+            if not next_states:
+                status["single_green_dp_failure_reason"] = "transition_disconnected"
+                status["single_green_dp_ms"] = (
+                    time.perf_counter() - started
+                ) * 1000.0
+                return {}, list(debug_by_sample.values())
+            states = next_states
+        best = min(states.values(), key=lambda item: item["cost"])
+        selected_candidates = [
+            station["candidates"][candidate_index]
+            for station, candidate_index in zip(selected_stations, best["path"])
+        ]
+        raw_points = np.asarray(
+            [
+                (candidate["pixel_x"], candidate["pixel_y"])
+                for candidate in selected_candidates
+            ],
+            dtype=np.float64,
+        )
+        weights = np.asarray(
+            [
+                1.0
+                if candidate["source_type"] in {"anchor_dual", "anchor_hybrid"}
+                else 0.60
+                for candidate in selected_candidates
+            ],
+            dtype=np.float64,
+        )
+        final_points = raw_points.copy()
+        if config.center_smooth_enable and len(raw_points) >= 3:
+            try:
+                final_points = YellowCorridorPlanner._weighted_smooth(
+                    raw_points, weights, config.center_smooth_lambda
+                )
+                final_points[:, 1] = raw_points[:, 1]
+                for index, candidate in enumerate(selected_candidates):
+                    if candidate["source_type"] in {
+                        "anchor_dual",
+                        "anchor_hybrid",
+                    }:
+                        final_points[index, 0] = raw_points[index, 0]
+            except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+                final_points = raw_points.copy()
+        reason, _yellow_support, span = YellowCorridorPlanner._validate_centerline(
+            final_points,
+            yellow,
+            ipm,
+            config,
+            geometry_config,
+        )
+        if reason != "valid":
+            reason, _yellow_support, span = (
+                YellowCorridorPlanner._validate_centerline(
+                    raw_points,
+                    yellow,
+                    ipm,
+                    config,
+                    geometry_config,
+                )
+            )
+            final_points = raw_points
+        if reason != "valid":
+            status["single_green_dp_failure_reason"] = reason
+            status["single_green_dp_evidence_start_x_m"] = float(
+                selected_stations[0]["forward_m"]
+            )
+            status["single_green_dp_evidence_end_x_m"] = float(
+                selected_stations[-1]["forward_m"]
+            )
+            status["single_green_dp_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            return {}, list(debug_by_sample.values())
+        selected: Dict[int, Dict[str, Any]] = {}
+        candidate_cost_total = 0.0
+        gap_total = 0
+        for index, (station, candidate, point) in enumerate(
+            zip(selected_stations, selected_candidates, final_points)
+        ):
+            sample_index = int(station["sample_index"])
+            candidate_cost_total += float(candidate["candidate_cost"])
+            if index:
+                gap_total += cls._dp_station_gap_count(
+                    selected_stations[index - 1]["forward_m"],
+                    station["forward_m"],
+                    config.sample_step_m,
+                )
+            selected[sample_index] = {
+                "center_pixel": (float(point[0]), float(point[1])),
+                "center_metric": (
+                    float(station["forward_m"]),
+                    (
+                        vehicle_center_x - float(point[0])
+                    ) * meter_per_pixel,
+                ),
+                "boundary_metric": (
+                    float(station["forward_m"]),
+                    float(smoothed[station["chain_index"], 1]),
+                ),
+                "tangent": tuple(tangents[station["chain_index"]]),
+                "side": side,
+                "yellow_ratio": float(candidate["yellow_ratio"]),
+                "green_ratio": float(candidate["green_ratio"]),
+                "segment_green_ratio": 0.0,
+                "offset_distance_m": abs(
+                    candidate["left_m"]
+                    - float(smoothed[station["chain_index"], 1])
+                ),
+                "normal_sign": int(expected_sign),
+                "reject_reason": "",
+                "dp_source_type": candidate["source_type"],
+                "dp_candidate_cost": float(candidate["candidate_cost"]),
+            }
+            if collect_debug and sample_index in debug_by_sample:
+                debug_by_sample[sample_index]["accepted"] = True
+                debug_by_sample[sample_index]["center_pixel"] = (
+                    float(point[0]), float(point[1])
+                )
+                debug_by_sample[sample_index]["dp_selected"] = True
+                debug_by_sample[sample_index]["dp_selected_type"] = candidate[
+                    "source_type"
+                ]
+        evidence_start = float(selected_stations[0]["forward_m"])
+        evidence_end = float(selected_stations[-1]["forward_m"])
+        output_forwards = [item["center_metric"][0] for item in selected.values()]
+        status.update(
+            {
+                "single_green_dp_used": True,
+                "single_green_dp_failure_reason": "valid",
+                "single_green_dp_output_count": len(selected),
+                "single_green_dp_output_span_m": float(span),
+                "single_green_dp_gap_count": gap_total,
+                "single_green_dp_mean_candidate_cost": (
+                    candidate_cost_total / max(1, len(selected))
+                ),
+                "single_green_dp_mean_transition_cost": (
+                    best["transition_total"] / max(1, len(selected) - 1)
+                ),
+                "single_green_dp_total_cost": float(best["cost"]),
+                "single_green_dp_evidence_start_x_m": evidence_start,
+                "single_green_dp_evidence_end_x_m": evidence_end,
+                "single_green_dp_output_start_x_m": min(output_forwards),
+                "single_green_dp_output_end_x_m": max(output_forwards),
+                "single_green_dp_mode_selection_reason": (
+                    "dual_or_hybrid_anchors_with_dp"
+                    if status["single_green_dp_anchor_count"]
+                    else "single_green_corridor_dp"
+                ),
+            }
+        )
+        status["single_green_dp_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+        return selected, list(debug_by_sample.values())
+
+    @classmethod
     def build(
         cls,
         samples: Sequence[Dict[str, Any]],
@@ -2106,6 +2777,7 @@ class SingleGreenCurvePlanner:
         width_state: Optional[SingleGreenLaneWidthState] = None,
         now: Optional[float] = None,
         collect_debug: bool = False,
+        geometry_config: Any = None,
     ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
         started = time.perf_counter()
         instant = time.monotonic() if now is None else float(now)
@@ -2432,6 +3104,27 @@ class SingleGreenCurvePlanner:
                 "single_green_center_heading_deg_std": center_heading_std,
             }
         )
+        dp_candidates, dp_debug = cls._run_corridor_dp(
+            samples,
+            chain,
+            smoothed,
+            tangents,
+            side,
+            lane_width,
+            yellow,
+            green,
+            ipm_valid_mask,
+            ipm,
+            config,
+            geometry_config,
+            status,
+            collect_debug,
+        )
+        if dp_candidates:
+            accepted = dp_candidates
+            debug = dp_debug
+            status["single_green_curve_offset_used"] = True
+            status["single_green_curve_failure_reason"] = "valid"
         status["single_green_curve_offset_ms"] = (
             time.perf_counter() - started
         ) * 1000.0
@@ -2993,6 +3686,7 @@ class GreenBoundaryFastPlanner:
                 width_state,
                 now_monotonic,
                 collect_debug,
+                geometry_config,
             )
             status.update(single_curve_status)
             for item in single_curve_debug:
@@ -3001,6 +3695,14 @@ class GreenBoundaryFastPlanner:
         cls._fill_internal_gaps(samples, green, config, ipm)
         allowed = {"green_dual_observed", "gap_filled"}
         if allow_single:
+            status["single_green_curve_pre_fusion_count"] = len(
+                single_curve_candidates
+            )
+            status["single_green_curve_station_covered_count"] = sum(
+                sample_index in single_curve_candidates
+                and sample["classification"] in allowed
+                for sample_index, sample in enumerate(samples)
+            )
             fused: List[Tuple[int, Dict[str, Any]]] = []
             for sample_index, sample in enumerate(samples):
                 classification = sample["classification"]
@@ -3066,6 +3768,9 @@ class GreenBoundaryFastPlanner:
             chosen_classes = [
                 sample["classification"] for sample in segment
             ]
+            status["single_green_curve_station_duplicate_count"] = (
+                len(fused) - len({entry[0] for entry in fused})
+            )
             status["hybrid_dual_point_count"] = sum(
                 item == "green_dual_observed"
                 for item in chosen_classes
@@ -3186,6 +3891,14 @@ class GreenBoundaryFastPlanner:
             if allow_single and single_count
             else "green_dual_inner_edge"
         )
+        if (
+            status.get("single_green_dp_used", False)
+            and dual_count / max(1, len(segment)) >= 0.25
+        ):
+            mode = "green_yellow_hybrid"
+            status["single_green_dp_mode_selection_reason"] = (
+                "dual_anchor_ratio"
+            )
         if mode == "single_green_width_offset":
             accepted_ratio = float(
                 status.get("single_green_curve_accepted_count", 0)
@@ -3206,6 +3919,38 @@ class GreenBoundaryFastPlanner:
                 + 0.08 * chain_factor
                 + 0.08 * yellow_ratio
                 + 0.02 * width_stability,
+            )
+        if status.get("single_green_dp_used", False):
+            output_count = int(status["single_green_dp_output_count"])
+            output_span = float(status["single_green_dp_output_span_m"])
+            anchor_ratio = float(
+                status["single_green_dp_anchor_count"] / max(1, output_count)
+            )
+            cost_quality = 1.0 / (
+                1.0 + max(0.0, status["single_green_dp_mean_candidate_cost"])
+            )
+            transition_quality = 1.0 / (
+                1.0 + max(0.0, status["single_green_dp_mean_transition_cost"])
+            )
+            evidence_quality = min(
+                1.0,
+                output_count / max(config.single_green_curve_min_points, 1),
+                output_span / max(config.single_green_curve_min_span_m, 1.0e-6),
+            )
+            expected_width_penalty = 0.05 * (
+                status.get("single_green_lane_width_source") == "expected"
+            )
+            confidence = min(
+                0.78,
+                0.36
+                + 0.13 * evidence_quality
+                + 0.08 * yellow_ratio
+                + 0.05 * (1.0 - intrusion)
+                + 0.06 * cost_quality
+                + 0.05 * transition_quality
+                + 0.05 * anchor_ratio
+                - 0.025 * status["single_green_dp_gap_count"]
+                - expected_width_penalty,
             )
         valid = reason == "valid"
         status["green_boundary_fast_path_used"] = valid
@@ -3229,6 +3974,12 @@ class GreenBoundaryFastPlanner:
             result.final_points
         )
         status["hybrid_final_span_m"] = float(result.forward_span_m)
+        status["single_green_curve_post_fusion_count"] = len(
+            result.final_points
+        )
+        status["single_green_curve_fusion_reject_reason"] = (
+            "valid" if valid else reason
+        )
         if (
             valid
             and mode == "green_dual_inner_edge"
@@ -3264,12 +4015,31 @@ class GreenBoundaryFastPlanner:
         ipm: Any,
         config: YellowCorridorConfig,
         geometry_config: Any,
-    ) -> Tuple[Any, int]:
+    ) -> Tuple[Any, int, Dict[str, Any]]:
         """Fill uncovered forward stations without moving existing points."""
+        fusion_status = {
+            "single_green_curve_pre_fusion_count": len(single.final_points),
+            "single_green_curve_post_fusion_count": 0,
+            "single_green_curve_fusion_reject_reason": "not_attempted",
+            "single_green_curve_station_duplicate_count": 0,
+            "single_green_curve_station_covered_count": 0,
+        }
         if not existing.valid:
-            return single, len(single.final_points)
+            fusion_status["single_green_curve_post_fusion_count"] = len(
+                single.final_points
+            )
+            fusion_status["single_green_curve_fusion_reject_reason"] = (
+                "existing_invalid_single_preserved"
+            )
+            return single, len(single.final_points), fusion_status
         if not single.valid:
-            return existing, 0
+            fusion_status["single_green_curve_post_fusion_count"] = len(
+                existing.final_points
+            )
+            fusion_status["single_green_curve_fusion_reject_reason"] = (
+                "single_invalid_existing_preserved"
+            )
+            return existing, 0, fusion_status
         station_tolerance_m = max(0.01, config.sample_step_m * 0.45)
         entries: List[Tuple[float, int, np.ndarray]] = []
         for priority, points in (
@@ -3290,6 +4060,10 @@ class GreenBoundaryFastPlanner:
                 and abs(entry[0] - selected[-1][0])
                 <= station_tolerance_m
             ):
+                fusion_status["single_green_curve_station_duplicate_count"] += 1
+                fusion_status["single_green_curve_station_covered_count"] += int(
+                    entry[1] == 1 and selected[-1][1] == 2
+                )
                 if entry[1] > selected[-1][1]:
                     single_contributed -= int(selected[-1][1] == 1)
                     selected[-1] = entry
@@ -3308,7 +4082,17 @@ class GreenBoundaryFastPlanner:
             points, fake_support, ipm, config, geometry_config
         )
         if reason != "valid":
-            return existing, 0
+            preferred = (
+                single
+                if float(single.forward_span_m) > float(existing.forward_span_m)
+                else existing
+            )
+            contributed = len(single.final_points) if preferred is single else 0
+            fusion_status["single_green_curve_post_fusion_count"] = len(
+                preferred.final_points
+            )
+            fusion_status["single_green_curve_fusion_reject_reason"] = reason
+            return preferred, contributed, fusion_status
         result = STAGE4.GeometryResult(
             mode="green_yellow_hybrid",
             valid=True,
@@ -3333,7 +4117,11 @@ class GreenBoundaryFastPlanner:
             ),
             forward_span_m=float(span),
         )
-        return result, single_contributed
+        fusion_status["single_green_curve_post_fusion_count"] = len(
+            result.final_points
+        )
+        fusion_status["single_green_curve_fusion_reject_reason"] = "valid"
+        return result, single_contributed, fusion_status
 
 
 @dataclass
@@ -4645,7 +5433,7 @@ class LaneAlgorithm:
                     corridor_result.reason
                 )
             elif green_single_result.valid:
-                fast_result, contributed = (
+                fast_result, contributed, fusion_status = (
                     GreenBoundaryFastPlanner.fuse_existing_with_single_curve(
                         corridor_result,
                         green_single_result,
@@ -4670,6 +5458,7 @@ class LaneAlgorithm:
                 green_status["hybrid_final_span_m"] = float(
                     fast_result.forward_span_m
                 )
+                green_status.update(fusion_status)
             elif green_base_status["green_dual_edge_valid_count"]:
                 fast_result.mode = "green_yellow_hybrid"
         if not fast_valid and green_single_result.valid:
@@ -5069,8 +5858,37 @@ class LaneAlgorithm:
                 cv2.circle(
                     overlay, smoothed_point, 4, (220, 220, 220), 1
                 )
+                normal_prior = curve_debug.get("normal_prior_pixel")
+                if normal_prior is not None:
+                    cv2.circle(
+                        overlay,
+                        tuple(int(round(value)) for value in normal_prior),
+                        4,
+                        (0, 165, 255),
+                        1,
+                    )
+                for candidate_x, candidate_y, candidate_type in (
+                    curve_debug.get("dp_candidates") or ()
+                ):
+                    candidate_color = (
+                        (255, 255, 0)
+                        if candidate_type in {"anchor_dual", "anchor_hybrid"}
+                        else (0, 220, 220)
+                    )
+                    cv2.circle(
+                        overlay,
+                        (int(round(candidate_x)), int(round(candidate_y))),
+                        2,
+                        candidate_color,
+                        -1,
+                    )
                 if curve_debug.get("accepted"):
-                    cv2.circle(overlay, center_point, 3, (0, 165, 255), -1)
+                    selected_color = (
+                        (255, 0, 255)
+                        if curve_debug.get("dp_selected")
+                        else (0, 165, 255)
+                    )
+                    cv2.circle(overlay, center_point, 3, selected_color, -1)
                     if int(curve_debug.get("sample_index", 0)) % 3 == 0:
                         cv2.arrowedLine(
                             overlay,
@@ -5228,6 +6046,19 @@ class LaneAlgorithm:
                     f"{green_summary.get('hybrid_single_curve_point_count', 0)} "
                     f"final={len(result.final_points)}/"
                     f"{result.forward_span_m:.2f}m"
+                ),
+                (
+                    "DP station/candidate/output="
+                    f"{green_summary.get('single_green_dp_station_count', 0)}/"
+                    f"{green_summary.get('single_green_dp_candidate_count', 0)}/"
+                    f"{green_summary.get('single_green_dp_output_count', 0)}"
+                ),
+                (
+                    "DP span/cost/gap/time="
+                    f"{green_summary.get('single_green_dp_output_span_m', 0.0):.2f}m/"
+                    f"{green_summary.get('single_green_dp_total_cost', 0.0):.2f}/"
+                    f"{green_summary.get('single_green_dp_gap_count', 0)}/"
+                    f"{green_summary.get('single_green_dp_ms', 0.0):.2f}ms"
                 ),
                 f"time={processing_ms:.1f}ms",
             )
@@ -8568,7 +9399,15 @@ def run_self_tests() -> None:
         curve_ipm,
         curve_config,
     )
-    check("121 green intrusion rejected", len(intrusion_candidates) < len(left_candidates) and intrusion_status["single_green_curve_reject_green_intrusion_count"] > 0)
+    check(
+        "121 green intrusion candidate bypassed",
+        intrusion_status["single_green_curve_reject_green_intrusion_count"] > 0
+        and intrusion_status["single_green_dp_used"]
+        and all(
+            not 295 <= value["center_pixel"][0] <= 307
+            for value in intrusion_candidates.values()
+        ),
+    )
     invalid_candidates, invalid_status, _ = SingleGreenCurvePlanner.build(
         left_samples,
         left_green,
@@ -8629,7 +9468,7 @@ def run_self_tests() -> None:
             * curve_ipm.meter_per_pixel
         ),
     )
-    fused_result, fused_single_count = (
+    fused_result, fused_single_count, fused_status = (
         GreenBoundaryFastPlanner.fuse_existing_with_single_curve(
             existing_result,
             single_plan,
@@ -8646,6 +9485,12 @@ def run_self_tests() -> None:
     check("130 fused path has no duplicate stations", np.min(np.diff(fused_forward)) > curve_config.sample_step_m * 0.40)
     check("131 fused path order is forward monotonic", np.all(np.diff(fused_forward) > 0.0))
     check("132 fused mode remains compatible", fused_result.mode == "green_yellow_hybrid")
+    check(
+        "132a fusion status has explicit outcome",
+        fused_status["single_green_curve_fusion_reject_reason"] == "valid"
+        and fused_status["single_green_curve_post_fusion_count"]
+        == len(fused_result.final_points),
+    )
 
     mixed_green = np.zeros(curve_shape, dtype=np.uint8)
     mixed_yellow = np.zeros(curve_shape, dtype=np.uint8)
@@ -8788,6 +9633,286 @@ def run_self_tests() -> None:
         ),
     )
 
+    check(
+        "140 left production corridor DP is used",
+        left_curve_status["single_green_dp_attempted"]
+        and left_curve_status["single_green_dp_used"],
+    )
+    check(
+        "141 right production corridor DP is used",
+        right_curve_status["single_green_dp_attempted"]
+        and right_curve_status["single_green_dp_used"],
+    )
+    check(
+        "142 DP candidate cap is enforced",
+        left_curve_status["single_green_dp_candidate_count_max"]
+        <= SingleGreenCurvePlanner.DP_MAX_CANDIDATES_PER_STATION
+        and right_curve_status["single_green_dp_candidate_count_max"]
+        <= SingleGreenCurvePlanner.DP_MAX_CANDIDATES_PER_STATION,
+    )
+    check(
+        "143 DP output covers fourteen-point left curve",
+        left_curve_status["single_green_dp_output_count"] >= 14
+        and left_curve_status["single_green_dp_output_span_m"] >= 0.60,
+    )
+    check(
+        "144 DP output covers fourteen-point right curve",
+        right_curve_status["single_green_dp_output_count"] >= 14
+        and right_curve_status["single_green_dp_output_span_m"] >= 0.60,
+    )
+    check(
+        "145 mirrored DP point counts differ by at most one",
+        abs(
+            left_curve_status["single_green_dp_output_count"]
+            - right_curve_status["single_green_dp_output_count"]
+        )
+        <= 1,
+    )
+    check(
+        "146 mirrored DP spans differ by at most five centimeters",
+        abs(
+            left_curve_status["single_green_dp_output_span_m"]
+            - right_curve_status["single_green_dp_output_span_m"]
+        )
+        <= 0.05,
+    )
+    left_lateral = (
+        curve_ipm.vehicle_center_x_px - mixed_curve_result.final_points[:, 0]
+    ) * curve_ipm.meter_per_pixel
+    right_lateral = (
+        curve_ipm.vehicle_center_x_px
+        - right_mixed_result.final_points[:, 0]
+    ) * curve_ipm.meter_per_pixel
+    check(
+        "147 mirrored curve curvature signs oppose",
+        float(np.mean(np.diff(left_lateral, n=2)))
+        * float(np.mean(np.diff(right_lateral, n=2)))
+        < 0.0,
+    )
+    check(
+        "148 both sides report one shared DP pipeline",
+        left_curve_status["single_green_dp_left_right_shared_pipeline"]
+        and right_curve_status["single_green_dp_left_right_shared_pipeline"],
+    )
+    check(
+        "149 DP output starts within current evidence",
+        left_curve_status["single_green_dp_output_start_x_m"]
+        >= left_curve_status["single_green_dp_evidence_start_x_m"] - 1.0e-9,
+    )
+    check(
+        "150 DP output ends within current evidence",
+        left_curve_status["single_green_dp_output_end_x_m"]
+        <= left_curve_status["single_green_dp_evidence_end_x_m"] + 1.0e-9,
+    )
+    check(
+        "151 DP stations are forward ordered without duplicates",
+        len(accepted_forward) == len(set(round(value, 6) for value in accepted_forward))
+        and np.all(np.diff(accepted_forward) > 0.0),
+    )
+    check(
+        "152 yellow corridor candidates participate",
+        left_curve_status["single_green_dp_yellow_center_count"]
+        + left_curve_status["single_green_dp_yellow_peak_count"]
+        > 0,
+    )
+    check(
+        "153 yellow peak candidates participate",
+        left_curve_status["single_green_dp_yellow_peak_count"] > 0,
+    )
+    check(
+        "154 normal offset remains a soft prior candidate",
+        left_curve_status["single_green_dp_normal_prior_count"] > 0,
+    )
+    check(
+        "155 missing yellow cannot maintain a previous-frame path",
+        not no_yellow_candidates
+        and not no_yellow_curve_status["single_green_dp_used"],
+    )
+    check(
+        "156 short evidence output remains inside thirty centimeters",
+        _short_status["single_green_dp_output_span_m"] <= 0.301
+        and _short_status["single_green_dp_output_end_x_m"]
+        <= _short_status["single_green_dp_evidence_end_x_m"] + 1.0e-9,
+    )
+    check(
+        "157 straight dual fast path bypasses corridor DP",
+        not green_dual_status["single_green_dp_attempted"]
+        and green_dual_result.mode == "green_dual_inner_edge",
+    )
+    check(
+        "158 enhanced left mode is controller-compatible",
+        mixed_curve_result.mode
+        in {"single_green_width_offset", "green_yellow_hybrid"},
+    )
+    check(
+        "159 enhanced right mode is controller-compatible",
+        right_mixed_result.mode
+        in {"single_green_width_offset", "green_yellow_hybrid"},
+    )
+    check(
+        "160 successful enhanced paths are never old fallback",
+        mixed_curve_result.mode != "single_boundary_normal_offset"
+        and right_mixed_result.mode != "single_boundary_normal_offset",
+    )
+    check(
+        "161 fusion accounting has an explicit destination",
+        single_plan_status["single_green_curve_pre_fusion_count"] > 0
+        and single_plan_status["single_green_curve_post_fusion_count"]
+        == len(single_plan.final_points)
+        and single_plan_status["single_green_curve_fusion_reject_reason"]
+        == "valid",
+    )
+    check(
+        "162 mode path and status point count agree",
+        single_plan_status["hybrid_final_point_count"]
+        == len(single_plan.final_points)
+        and single_plan_status["single_green_dp_output_count"]
+        == len(single_plan.final_points),
+    )
+    check(
+        "163 real-car right regression reaches target",
+        right_mixed_result.valid
+        and len(right_mixed_result.final_points) >= 10
+        and right_mixed_result.forward_span_m >= 0.45,
+    )
+    check(
+        "164 real-car left regression reaches target",
+        mixed_curve_result.valid
+        and len(mixed_curve_result.final_points) >= 10
+        and mixed_curve_result.forward_span_m >= 0.45,
+    )
+    check(
+        "165 DP costs are finite and nonnegative",
+        all(
+            math.isfinite(float(left_curve_status[key]))
+            and float(left_curve_status[key]) >= 0.0
+            for key in (
+                "single_green_dp_mean_candidate_cost",
+                "single_green_dp_mean_transition_cost",
+                "single_green_dp_total_cost",
+                "single_green_dp_ms",
+            )
+        ),
+    )
+    one_gap_candidates, one_gap_status, _ = SingleGreenCurvePlanner.build(
+        synthetic_curve_samples("left", (7,)),
+        left_green,
+        left_yellow,
+        curve_valid,
+        curve_ipm,
+        curve_config,
+    )
+    check(
+        "166 corridor DP permits one internal evidence gap",
+        len(one_gap_candidates) >= 12
+        and one_gap_status["single_green_dp_used"]
+        and one_gap_status["single_green_dp_gap_count"] == 1,
+    )
+    two_gap_candidates, two_gap_status, _ = SingleGreenCurvePlanner.build(
+        synthetic_curve_samples("left", (6, 7)),
+        left_green,
+        left_yellow,
+        curve_valid,
+        curve_ipm,
+        curve_config,
+    )
+    check(
+        "167 corridor DP permits two internal evidence gaps",
+        len(two_gap_candidates) >= 12
+        and two_gap_status["single_green_dp_used"]
+        and two_gap_status["single_green_dp_gap_count"] == 2,
+    )
+    large_gap_candidates, large_gap_status, _ = (
+        SingleGreenCurvePlanner.build(
+            synthetic_curve_samples("left", (6, 7, 8)),
+            left_green,
+            left_yellow,
+            curve_valid,
+            curve_ipm,
+            curve_config,
+        )
+    )
+    check(
+        "168 corridor DP does not cross a large evidence gap",
+        not large_gap_candidates
+        and not large_gap_status["single_green_dp_used"],
+    )
+    transition_previous_previous = {"forward_m": 0.10, "left_m": 0.00}
+    transition_previous = {"forward_m": 0.15, "left_m": 0.01}
+    gradual_transition = SingleGreenCurvePlanner._dp_transition_cost(
+        transition_previous_previous,
+        transition_previous,
+        {"forward_m": 0.20, "left_m": 0.025},
+        0,
+    )
+    outlier_transition = SingleGreenCurvePlanner._dp_transition_cost(
+        transition_previous_previous,
+        transition_previous,
+        {"forward_m": 0.20, "left_m": 0.20},
+        0,
+    )
+    check(
+        "169 gradual curvature costs less than isolated lateral outlier",
+        gradual_transition is not None
+        and outlier_transition is not None
+        and gradual_transition < outlier_transition,
+    )
+    reversal_transition = SingleGreenCurvePlanner._dp_transition_cost(
+        transition_previous_previous,
+        transition_previous,
+        {"forward_m": 0.20, "left_m": -0.02},
+        0,
+    )
+    check(
+        "170 sudden direction reversal receives a high transition cost",
+        reversal_transition is not None
+        and gradual_transition is not None
+        and reversal_transition > gradual_transition,
+    )
+    check(
+        "171 accepted single-green points have explicit final disposition",
+        right_mixed_status["single_green_curve_accepted_count"] > 0
+        and right_mixed_status["single_green_curve_pre_fusion_count"] > 0
+        and right_mixed_status["single_green_curve_post_fusion_count"]
+        == len(right_mixed_result.final_points)
+        and right_mixed_status["single_green_curve_fusion_reject_reason"]
+        == "valid",
+    )
+    legacy_six_points = single_plan.final_points[:6].copy()
+    legacy_six_points[:, 1] = np.linspace(
+        legacy_six_points[0, 1],
+        legacy_six_points[0, 1] - 0.19 / curve_ipm.meter_per_pixel,
+        6,
+    )
+    legacy_six_result = STAGE4.GeometryResult(
+        mode="single_green_width_offset",
+        valid=True,
+        reason="legacy_accepted_six",
+        confidence=0.35,
+        raw_points=legacy_six_points.copy(),
+        final_points=legacy_six_points,
+        forward_span_m=0.19,
+    )
+    accepted_six_fused, accepted_six_contributed, accepted_six_status = (
+        GreenBoundaryFastPlanner.fuse_existing_with_single_curve(
+            legacy_six_result,
+            single_plan,
+            curve_ipm,
+            curve_config,
+            geometry,
+        )
+    )
+    check(
+        "172 accepted six regression cannot silently become final zero",
+        accepted_six_contributed > 0
+        and accepted_six_fused.valid
+        and len(accepted_six_fused.final_points) >= 10
+        and accepted_six_status["single_green_curve_post_fusion_count"]
+        == len(accepted_six_fused.final_points)
+        and accepted_six_status["single_green_curve_fusion_reject_reason"]
+        == "valid",
+    )
+
     print(f"SELF-TEST PASS: {len(passed)} checks")
     for name in passed:
         print(f"  PASS {name}")
@@ -8862,6 +9987,9 @@ def run_single_green_benchmark(
         if (
             len(accepted) < 10
             or status["single_green_curve_accepted_count"] < 10
+            or not status["single_green_dp_attempted"]
+            or not status["single_green_dp_used"]
+            or status["single_green_dp_output_count"] != len(accepted)
             or debug
         ):
             raise RuntimeError("single-green benchmark correctness failed")
