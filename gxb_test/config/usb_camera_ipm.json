@@ -1,0 +1,119 @@
+{
+  "version": "gxb_ipm_v1",
+  "profile_name": "usb_camera",
+  "saved_at": "2026-07-29T16:47:28.758261+00:00",
+  "calibration_source_image": "D:\\ zhuomian\\大二下比赛代码文件\\智能车\\ipm_frame_latest.png",
+  "image_topic": "/image_out",
+  "image_width": 640,
+  "image_height": 480,
+  "coordinate_convention": {
+    "birdview_pixel_x": "right_positive",
+    "birdview_pixel_y": "down_positive",
+    "vehicle_forward": "up_in_birdview",
+    "vehicle_left": "left_in_birdview",
+    "vehicle_origin": "configured_reference_point",
+    "vehicle_reference_point_name": "base_link",
+    "forward_m_formula": "(vehicle_origin_y_px - birdview_y_px) * meter_per_pixel",
+    "left_m_formula": "(vehicle_center_x_px - birdview_x_px) * meter_per_pixel"
+  },
+  "calibration_board": {
+    "width_m": 0.5,
+    "length_m": 0.7,
+    "has_internal_grid": false,
+    "grid_size_m": 0.1,
+    "grid_columns": 0,
+    "grid_rows": 0,
+    "near_edge_distance_m": 0.3,
+    "center_lateral_offset_m": 0.0,
+    "note": "现场为已知尺寸矩形区域，内部没有实体网格；grid_size_m 仅用于鸟瞰虚拟网格显示。"
+  },
+  "source_points": {
+    "top_left": [
+      215.0,
+      199.0
+    ],
+    "top_right": [
+      383.0,
+      196.0
+    ],
+    "bottom_left": [
+      58.0,
+      278.0
+    ],
+    "bottom_right": [
+      569.0,
+      268.0
+    ]
+  },
+  "destination_points": {
+    "top_left": [
+      250.0,
+      599.0
+    ],
+    "top_right": [
+      350.0,
+      599.0
+    ],
+    "bottom_left": [
+      250.0,
+      739.0
+    ],
+    "bottom_right": [
+      350.0,
+      739.0
+    ]
+  },
+  "output": {
+    "width_px": 600,
+    "height_px": 800,
+    "meter_per_pixel": 0.005,
+    "vehicle_center_x_px": 300.0,
+    "vehicle_origin_y_px": 799.0
+  },
+  "road_geometry_defaults": {
+    "expected_lane_width_m": 0.5,
+    "single_boundary_center_offset_m": 0.25
+  },
+  "homography_matrix": [
+    [
+      -0.16371021278648548,
+      -1.7847586913273674,
+      334.2479315811743
+    ],
+    [
+      -0.08409140747540142,
+      -4.878925519369896,
+      854.5301129558302
+    ],
+    [
+      -0.00010283068320094803,
+      -0.006042001899899803,
+      1.0
+    ]
+  ],
+  "inverse_homography_matrix": [
+    [
+      0.4380611000088285,
+      -0.36193480112773163,
+      162.8631699062017
+    ],
+    [
+      -0.005828297177344688,
+      -0.19939852761946042,
+      172.34014260605161
+    ],
+    [
+      9.831539578969395e-06,
+      -0.001241984285588167,
+      1.0
+    ]
+  ],
+  "validation": {
+    "valid": true,
+    "source_quad_area_px": 25726.5,
+    "homography_determinant": -0.037638913542229036,
+    "expected_board_width_px": 100.0,
+    "expected_board_length_px": 140.0,
+    "independent_accuracy_note": "四个源角点被强制映射到目标矩形，目标外框尺寸本身不是独立精度证明；请使用未参与四点计算的已知距离或固定赛道宽度额外验证。"
+  }
+}

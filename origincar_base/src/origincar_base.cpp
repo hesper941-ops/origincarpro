@@ -223,94 +223,125 @@ unsigned char origincar_base::Check_Sum(unsigned char Count_Number,unsigned char
 
 bool origincar_base::Get_Sensor_Data()
 {
-    short transition_16 = 0, j = 0, Header_Pos = 0, Tail_Pos = 0;
-    uint8_t Receive_Data_Pr[RECEIVE_DATA_SIZE] = {0}; 
-    Stm32_Serial.read(Receive_Data_Pr,sizeof (Receive_Data_Pr)); 
-    for (j = 0; j < 25; j++) {
-      if (Receive_Data_Pr[j] == FRAME_HEADER)
-      Header_Pos=j;
-      else if (Receive_Data_Pr[j] == FRAME_TAIL)
-      Tail_Pos = j;
+    short transition_16 = 0;
+    uint8_t raw[RECEIVE_DATA_SIZE] = {0};
+
+    const size_t bytes_read = Stm32_Serial.read(raw, sizeof(raw));
+    if (bytes_read != RECEIVE_DATA_SIZE) {
+      return false;
     }
 
-    if (Tail_Pos == (Header_Pos + 24)) {
-      memcpy(Receive_Data.rx, Receive_Data_Pr, sizeof(Receive_Data_Pr));
-    }  else if (Header_Pos == (1 + Tail_Pos)) {
-      for (j = 0;j < 25; j++)
-      Receive_Data.rx[j] = Receive_Data_Pr[(j+Header_Pos) % 25];
-    }  else {
-    return false;
+    bool valid_frame = false;
+    for (int start = 0; start < RECEIVE_DATA_SIZE; ++start) {
+      if (raw[start] != FRAME_HEADER) {
+        continue;
+      }
+
+      for (int i = 0; i < RECEIVE_DATA_SIZE; ++i) {
+        Receive_Data.rx[i] = raw[(start + i) % RECEIVE_DATA_SIZE];
+      }
+
+      if (Receive_Data.rx[23] != FRAME_TAIL) {
+        continue;
+      }
+
+      if (Receive_Data.rx[22] != Check_Sum(22, READ_DATA_CHECK)) {
+        continue;
+      }
+
+      valid_frame = true;
+      break;
+    }
+
+    if (!valid_frame) {
+      return false;
     }
 
     Receive_Data.Frame_Header = Receive_Data.rx[0];
-    Receive_Data.Frame_Tail = Receive_Data.rx[24];
-    if (Receive_Data.Frame_Header == FRAME_HEADER) {
-      if (Receive_Data.Frame_Tail == FRAME_TAIL) {
-        if (Receive_Data.rx[23] == Check_Sum(23,READ_DATA_CHECK)||(Header_Pos == (1 + Tail_Pos))) {
-          Receive_Data.Flag_Stop=Receive_Data.rx[1];
-          Robot_Vel.X = Odom_Trans(Receive_Data.rx[2],Receive_Data.rx[3]);
-        
-          Robot_Vel.Y = Odom_Trans(Receive_Data.rx[4],Receive_Data.rx[5]);
-                                                                          
-          Robot_Vel.Z = Odom_Trans(Receive_Data.rx[6],Receive_Data.rx[7]); 
+    Receive_Data.Frame_Tail = Receive_Data.rx[23];
+    Receive_Data.Flag_Stop = Receive_Data.rx[1];
 
-          Mpu6050_Data.accele_x_data = IMU_Trans(Receive_Data.rx[8],Receive_Data.rx[9]);
-          Mpu6050_Data.accele_y_data = IMU_Trans(Receive_Data.rx[10],Receive_Data.rx[11]);
-          Mpu6050_Data.accele_z_data = IMU_Trans(Receive_Data.rx[12],Receive_Data.rx[13]);
-          Mpu6050_Data.gyros_x_data = IMU_Trans(Receive_Data.rx[14],Receive_Data.rx[15]);
-          Mpu6050_Data.gyros_y_data = IMU_Trans(Receive_Data.rx[16],Receive_Data.rx[17]);
-          Mpu6050_Data.gyros_z_data = IMU_Trans(Receive_Data.rx[18],Receive_Data.rx[19]);
+    Robot_Vel.X = Odom_Trans(Receive_Data.rx[2], Receive_Data.rx[3]);
+    Robot_Vel.Y = Odom_Trans(Receive_Data.rx[4], Receive_Data.rx[5]);
+    Robot_Vel.Z = Odom_Trans(Receive_Data.rx[6], Receive_Data.rx[7]);
 
-          Mpu6050.linear_acceleration.x = Mpu6050_Data.accele_x_data / ACCEl_RATIO;
-          Mpu6050.linear_acceleration.y = Mpu6050_Data.accele_y_data / ACCEl_RATIO;
-          Mpu6050.linear_acceleration.z = Mpu6050_Data.accele_z_data / ACCEl_RATIO;
+    Mpu6050_Data.accele_x_data =
+        IMU_Trans(Receive_Data.rx[8], Receive_Data.rx[9]);
+    Mpu6050_Data.accele_y_data =
+        IMU_Trans(Receive_Data.rx[10], Receive_Data.rx[11]);
+    Mpu6050_Data.accele_z_data =
+        IMU_Trans(Receive_Data.rx[12], Receive_Data.rx[13]);
+    Mpu6050_Data.gyros_x_data =
+        IMU_Trans(Receive_Data.rx[14], Receive_Data.rx[15]);
+    Mpu6050_Data.gyros_y_data =
+        IMU_Trans(Receive_Data.rx[16], Receive_Data.rx[17]);
+    Mpu6050_Data.gyros_z_data =
+        IMU_Trans(Receive_Data.rx[18], Receive_Data.rx[19]);
 
-          Mpu6050.angular_velocity.x =  Mpu6050_Data.gyros_x_data * GYROSCOPE_RATIO;
-          Mpu6050.angular_velocity.y =  Mpu6050_Data.gyros_y_data * GYROSCOPE_RATIO;
-          Mpu6050.angular_velocity.z =  Mpu6050_Data.gyros_z_data * GYROSCOPE_RATIO;
+    Mpu6050.linear_acceleration.x =
+        Mpu6050_Data.accele_x_data / ACCEl_RATIO;
+    Mpu6050.linear_acceleration.y =
+        Mpu6050_Data.accele_y_data / ACCEl_RATIO;
+    Mpu6050.linear_acceleration.z =
+        Mpu6050_Data.accele_z_data / ACCEl_RATIO;
 
-          transition_16 = 0;
-          transition_16 |=  Receive_Data.rx[20]<<8;
-          transition_16 |=  Receive_Data.rx[21];
-          Power_voltage = transition_16/1000+(transition_16 % 1000)*0.001;
-          
-          user_key = Receive_Data.rx[22];
+    Mpu6050.angular_velocity.x =
+        Mpu6050_Data.gyros_x_data * GYROSCOPE_RATIO;
+    Mpu6050.angular_velocity.y =
+        Mpu6050_Data.gyros_y_data * GYROSCOPE_RATIO;
+    Mpu6050.angular_velocity.z =
+        Mpu6050_Data.gyros_z_data * GYROSCOPE_RATIO;
 
-          return true;
-        }
-      }
-    }
+    transition_16 = 0;
+    transition_16 |= Receive_Data.rx[20] << 8;
+    transition_16 |= Receive_Data.rx[21];
+    Power_voltage =
+        transition_16 / 1000 + (transition_16 % 1000) * 0.001;
 
-    return false;
+    user_key = 0;
+    return true;
 }
 
 void origincar_base::Control()
 {
-    rclcpp::Time current_time, last_time;
-    current_time = rclcpp::Node::now();
-    last_time = rclcpp::Node::now();
-    while(rclcpp::ok()) {
-      current_time = rclcpp::Node::now();
-      Sampling_Time = (current_time - last_time).seconds();
-      if (true == Get_Sensor_Data()) {
-        Robot_Pos.X+=1.03*(Robot_Vel.X * cos(Robot_Pos.Z) - Robot_Vel.Y * sin(Robot_Pos.Z)) * Sampling_Time;
-        Robot_Pos.Y+=1.125*(Robot_Vel.X * sin(Robot_Pos.Z) + Robot_Vel.Y * cos(Robot_Pos.Z)) * Sampling_Time;
-        Robot_Pos.Z+=Robot_Vel.Z * Sampling_Time;
+    rclcpp::Time current_time = rclcpp::Node::now();
+    rclcpp::Time last_sensor_time = current_time;
 
-        Quaternion_Solution(Mpu6050.angular_velocity.x, Mpu6050.angular_velocity.y, Mpu6050.angular_velocity.z,\
-                  Mpu6050.linear_acceleration.x, Mpu6050.linear_acceleration.y, Mpu6050.linear_acceleration.z);
+    while (rclcpp::ok()) {
+      rclcpp::spin_some(this->get_node_base_interface());
+
+      if (Get_Sensor_Data()) {
+        current_time = rclcpp::Node::now();
+        Sampling_Time = (current_time - last_sensor_time).seconds();
+
+        Robot_Pos.X +=
+            1.03 *
+            (Robot_Vel.X * cos(Robot_Pos.Z) -
+             Robot_Vel.Y * sin(Robot_Pos.Z)) *
+            Sampling_Time;
+        Robot_Pos.Y +=
+            1.125 *
+            (Robot_Vel.X * sin(Robot_Pos.Z) +
+             Robot_Vel.Y * cos(Robot_Pos.Z)) *
+            Sampling_Time;
+        Robot_Pos.Z += Robot_Vel.Z * Sampling_Time;
+
+        Quaternion_Solution(
+            Mpu6050.angular_velocity.x,
+            Mpu6050.angular_velocity.y,
+            Mpu6050.angular_velocity.z,
+            Mpu6050.linear_acceleration.x,
+            Mpu6050.linear_acceleration.y,
+            Mpu6050.linear_acceleration.z);
+
         Publish_ImuSensor();
         Publish_Voltage();
         Publish_Odom();
-        if (user_key == 1){
-          Publish_UserKey();  //user key
-        }
-        rclcpp::spin_some(this->get_node_base_interface());
+
+        last_sensor_time = current_time;
       }
-      last_time = current_time;
     }
 }
-
 origincar_base::origincar_base()
 : rclcpp::Node ("origincar_base")
 {
@@ -320,10 +351,11 @@ origincar_base::origincar_base()
   memset(&Send_Data, 0, sizeof(Send_Data));
   memset(&Mpu6050_Data, 0, sizeof(Mpu6050_Data));
 
-  // STM32 firmware now uses 921600 for X5 communication; keep the ROS-side default in sync.
-  int serial_baud_rate = 921600;
+  // The connected STM32 firmware uses 115200 baud and a 24-byte feedback frame.
+  int serial_baud_rate = 115200;
 
-  this->declare_parameter<std::string>("usart_port_name", "/dev/ttyCH343USB0");
+  this->declare_parameter<int>("serial_baud_rate", 115200);
+  this->declare_parameter<std::string>("usart_port_name", "/dev/ttyACM0");
   this->declare_parameter<std::string>("cmd_vel", "cmd_vel");
   this->declare_parameter<std::string>("akm_cmd_vel", "ackermann_cmd");
   this->declare_parameter<std::string>("odom_frame_id", "odom");
@@ -360,9 +392,9 @@ origincar_base::origincar_base()
   // Sign_Switch_Sub = create_subscription<std_msgs::msg::Int32>(
   //     "/sign4return", 1, std::bind(&origincar_base::Sign_Switch_Callback, this, _1));
   try  {
-    Stm32_Serial.setPort("/dev/ttyACM0");
+    Stm32_Serial.setPort(usart_port_name);
     Stm32_Serial.setBaudrate(serial_baud_rate);
-    serial::Timeout _time = serial::Timeout::simpleTimeout(2000);
+    serial::Timeout _time = serial::Timeout::simpleTimeout(100);
     Stm32_Serial.setTimeout(_time);
     Stm32_Serial.open();
   } catch (serial::IOException& e) {
@@ -380,7 +412,7 @@ void sigintHandler(int sig)
       printf("OriginBot shutdown...\n");
     serial::Serial Stm32_Serial;
     Stm32_Serial.setPort("/dev/ttyACM0");
-    Stm32_Serial.setBaudrate(921600);
+    Stm32_Serial.setBaudrate(115200);
     serial::Timeout _time = serial::Timeout::simpleTimeout(2000);
     Stm32_Serial.setTimeout(_time);
     Stm32_Serial.open();                                       

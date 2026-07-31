@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "profile_name": "usb_camera",
+  "saved_at": "2026-07-29T13:51:38.365838+00:00",
+  "image_topic": "/image_out",
+  "frame_width": 640,
+  "frame_height": 480,
+  "roi": {
+    "y_start_ratio": 0.35,
+    "y_end_ratio": 0.9
+  },
+  "yellow": {
+    "h_min": 10,
+    "h_max": 49,
+    "s_min": 23,
+    "s_max": 107,
+    "v_min": 119,
+    "v_max": 227,
+    "prefer_bottom_connected": true
+  },
+  "green": {
+    "h_min": 51,
+    "h_max": 104,
+    "s_min": 33,
+    "s_max": 164,
+    "v_min": 0,
+    "v_max": 207,
+    "prefer_bottom_connected": false
+  },
+  "morphology": {
+    "open_kernel_size": 3,
+    "close_kernel_size": 9,
+    "open_iterations": 1,
+    "close_iterations": 2,
+    "min_component_area": 300,
+    "bottom_band_pixels": 24
+  },
+  "auto_calibration": {
+    "sample_frames": 120,
+    "max_samples_per_color_per_frame": 5000,
+    "low_percentile": 2.0,
+    "high_percentile": 98.0,
+    "hue_margin": 3,
+    "saturation_margin": 12,
+    "value_margin": 12,
+    "min_total_samples_per_color": 1500,
+    "yellow_sample_count": 0,
+    "green_sample_count": 0,
+    "suggested_yellow": null,
+    "suggested_green": null
+  },
+  "statistics": {
+    "yellow_pixels": 117140,
+    "green_pixels": 34193,
+    "overlap_pixels": 31,
+    "unknown_pixels": 17627,
+    "fps": 1.3211178151126257
+  }
+}
