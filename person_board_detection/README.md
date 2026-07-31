@@ -141,3 +141,15 @@ bash person_board_detection/scripts/stop_mock_llm_display_test.sh \
 
 RDK X5 首次使用需确认已安装 `python3-tk` 和中文字体（推荐
 `Noto Sans CJK SC`）。字体不可用时显示节点会自动回退并记录实际字体。
+# Stage 3: Qwen VL backend
+
+The optional real backend selects the best of the three fixed crops and sends
+only that JPEG to an OpenAI-compatible Qwen VL endpoint.  Stage 2 Mock remains
+available and must not run at the same time as the Qwen worker.
+
+Configure the private file `/root/.config/person_board_llm/env` with exported
+`DASHSCOPE_API_KEY`, `PERSON_BOARD_LLM_BASE_URL`, and
+`PERSON_BOARD_LLM_MODEL`.  The key is never a ROS parameter or log field.
+
+Run the real worker with `scripts/run_person_board_qwen_vl.sh`.  Validate the
+whole chain without a real key using `scripts/test_qwen_vl.sh --mode dry-run`.

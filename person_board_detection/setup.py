@@ -28,6 +28,10 @@ setup(
             os.path.join('share', package_name, 'config'),
             glob('config/*.yaml'),
         ),
+        (
+            os.path.join('share', package_name, 'prompts'),
+            glob('prompts/*.txt'),
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -48,6 +52,10 @@ setup(
             (
                 'person_board_display = '
                 'person_board_detection.person_board_display:main'
+            ),
+            (
+                'person_board_qwen_vl_worker = '
+                'person_board_detection.qwen_vl_worker:main'
             ),
         ],
     },
