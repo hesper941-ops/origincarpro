@@ -3,18 +3,35 @@ set -euo pipefail
 
 DESKTOP_USER="${PERSON_BOARD_DESKTOP_USER:-sunrise}"
 
-if [[ -f /opt/tros/humble/setup.bash ]]; then
+source_ros_environment() {
+  local nounset_was_enabled=0
+  local source_rc=0
+  case "$-" in
+    *u*) nounset_was_enabled=1 ;;
+  esac
+  set +u
   # shellcheck disable=SC1091
-  source /opt/tros/humble/setup.bash
-else
+  source /opt/tros/humble/setup.bash || source_rc=$?
+  if [[ "$source_rc" -eq 0 ]]; then
+    # shellcheck disable=SC1091
+    source /root/intelligent_car_ws/install/setup.bash || source_rc=$?
+  fi
+  if [[ "$nounset_was_enabled" -eq 1 ]]; then
+    set -u
+  fi
+  return "$source_rc"
+}
+
+if [[ ! -f /opt/tros/humble/setup.bash ]]; then
   echo "ERROR: /opt/tros/humble/setup.bash not found" >&2
   exit 1
 fi
-if [[ -f /root/intelligent_car_ws/install/setup.bash ]]; then
-  # shellcheck disable=SC1091
-  source /root/intelligent_car_ws/install/setup.bash
-else
+if [[ ! -f /root/intelligent_car_ws/install/setup.bash ]]; then
   echo "ERROR: workspace install/setup.bash not found; build the package first" >&2
+  exit 1
+fi
+if ! source_ros_environment; then
+  echo "ERROR: failed to source ROS/TROS environment" >&2
   exit 1
 fi
 

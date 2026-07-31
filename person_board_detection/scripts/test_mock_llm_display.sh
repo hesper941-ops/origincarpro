@@ -38,9 +38,10 @@ done
   echo "--capture-dir must be an absolute path" >&2; exit 2;
 }
 
-WORKSPACE="/root/intelligent_car_ws"
-SOURCE_ROOT="$WORKSPACE/src"
-PACKAGE_ROOT="$SOURCE_ROOT/person_board_detection"
+WORKSPACE="${PERSON_BOARD_WORKSPACE:-/root/intelligent_car_ws}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+SOURCE_ROOT="$(git -C "$PACKAGE_ROOT" rev-parse --show-toplevel)"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="$LOG_ROOT/$STAMP"
 PID_FILE="$LOG_DIR/test_processes.pid"
@@ -55,15 +56,38 @@ IMAGES_VALID=false
 CAPTURE_BATCH_SENT=false
 CLEANED_UP=false
 
+source_ros_environment() {
+  local include_workspace="${1:-false}"
+  local nounset_was_enabled=0
+  local source_rc=0
+  case "$-" in
+    *u*) nounset_was_enabled=1 ;;
+  esac
+  set +u
+  # shellcheck disable=SC1091
+  source /opt/tros/humble/setup.bash || source_rc=$?
+  if [[ "$source_rc" -eq 0 && "$include_workspace" == true ]]; then
+    # shellcheck disable=SC1091
+    source "$WORKSPACE/install/setup.bash" || source_rc=$?
+  fi
+  if [[ "$nounset_was_enabled" -eq 1 ]]; then
+    set -u
+  fi
+  return "$source_rc"
+}
+
 if [[ -f /opt/tros/humble/setup.bash ]]; then
   # shellcheck disable=SC1091
-  set +u
-  source /opt/tros/humble/setup.bash
-  set +u
+  if ! source_ros_environment false; then
+    echo "Failed to source /opt/tros/humble/setup.bash" >&2
+    exit 1
+  fi
 else
   echo "Missing /opt/tros/humble/setup.bash" >&2
   exit 1
 fi
+ROS_BASE_SOURCE="set +u; source /opt/tros/humble/setup.bash; set -u"
+ROS_WORKSPACE_SOURCE="set +u; source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; set -u"
 
 record_pid() {
   local pid="$1" label="$2" start
@@ -143,6 +167,8 @@ cleanup() {
     ros2 node list > "$LOG_DIR/node_list_after.txt" 2>&1 || true
   fi
   write_summary || true
+  echo "log_dir=$LOG_DIR"
+  echo "summary=$SUMMARY"
   stop_own_processes
 }
 
@@ -164,7 +190,9 @@ cd "$SOURCE_ROOT"
 ros2 node list > "$LOG_DIR/node_list_before.txt" 2>&1 || true
 
 if [[ "$NO_BUILD" == false ]]; then
-  if colcon build --symlink-install --packages-select person_board_detection \
+  cd "$WORKSPACE"
+  if colcon build --base-paths "$SOURCE_ROOT" --symlink-install \
+      --packages-select person_board_detection \
       --event-handlers console_direct+ > "$LOG_DIR/build.log" 2>&1; then
     BUILD_RESULT="PASS"
   else
@@ -172,6 +200,7 @@ if [[ "$NO_BUILD" == false ]]; then
     FAILURE_REASON="build_failed"
     exit 1
   fi
+  cd "$SOURCE_ROOT"
 else
   echo "Build skipped by --no-build" > "$LOG_DIR/build.log"
 fi
@@ -180,8 +209,10 @@ if [[ ! -f "$WORKSPACE/install/setup.bash" ]]; then
   FAILURE_REASON="workspace_setup_missing"
   exit 1
 fi
-# shellcheck disable=SC1091
-source "$WORKSPACE/install/setup.bash"
+if ! source_ros_environment true; then
+  FAILURE_REASON="workspace_setup_source_failed"
+  exit 1
+fi
 
 if ! ros2 pkg prefix person_board_detection >/dev/null 2>&1; then
   FAILURE_REASON="package_not_discovered"
@@ -195,7 +226,7 @@ fi
 display_command+=" bash person_board_detection/scripts/run_person_board_display.sh"
 DISPLAY_PID="$(start_group display "$LOG_DIR/display_launcher.log" "$display_command")"
 start_group display_status "$LOG_DIR/display_status.log" \
-  "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 topic echo /person_board/display_status std_msgs/msg/String --qos-durability transient_local" >/dev/null
+  "$ROS_WORKSPACE_SOURCE; ros2 topic echo /person_board/display_status std_msgs/msg/String --qos-durability transient_local --full-length" >/dev/null
 
 deadline=$((SECONDS + TIMEOUT_SEC))
 while ! grep -Eq 'WAITING|STARTING' "$LOG_DIR/display_status.log" 2>/dev/null; do
@@ -209,20 +240,20 @@ while ! grep -Eq 'WAITING|STARTING' "$LOG_DIR/display_status.log" 2>/dev/null; d
 done
 
 WORKER_PID="$(start_group mock_worker "$LOG_DIR/mock_worker.log" \
-  "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 launch person_board_detection person_board_mock_llm.launch.py allowed_capture_directory:='$CAPTURE_DIR'")"
+  "$ROS_WORKSPACE_SOURCE; ros2 launch person_board_detection person_board_mock_llm.launch.py allowed_capture_directory:='$CAPTURE_DIR'")"
 start_group llm_status "$LOG_DIR/llm_status.log" \
-  "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 topic echo /person_board/llm_status std_msgs/msg/String --qos-durability transient_local" >/dev/null
+  "$ROS_WORKSPACE_SOURCE; ros2 topic echo /person_board/llm_status std_msgs/msg/String --qos-durability transient_local --full-length" >/dev/null
 start_group llm_result "$LOG_DIR/llm_result.log" \
-  "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 topic echo /person_board/llm_result std_msgs/msg/String --qos-durability transient_local" >/dev/null
+  "$ROS_WORKSPACE_SOURCE; ros2 topic echo /person_board/llm_result std_msgs/msg/String --qos-durability transient_local --full-length" >/dev/null
 sleep 1
 
 if [[ "$MODE" == "full" ]]; then
   start_group capture_batch "$LOG_DIR/capture_batch.log" \
-    "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 topic echo /person_board/capture_batch std_msgs/msg/String" >/dev/null
+    "$ROS_WORKSPACE_SOURCE; ros2 topic echo /person_board/capture_batch std_msgs/msg/String --full-length" >/dev/null
   start_group capture_status "$LOG_DIR/capture_status.log" \
-    "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 topic echo /person_board/status std_msgs/msg/String" >/dev/null
+    "$ROS_WORKSPACE_SOURCE; ros2 topic echo /person_board/status std_msgs/msg/String --full-length" >/dev/null
   start_group capture_done "$LOG_DIR/capture_done.log" \
-    "source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 topic echo /person_board/capture_done std_msgs/msg/String" >/dev/null
+    "$ROS_WORKSPACE_SOURCE; ros2 topic echo /person_board/capture_done std_msgs/msg/String --full-length" >/dev/null
   echo "请将人形立牌逐渐靠近相机，等待三张裁剪完成。"
 
   if camera_has_data; then
@@ -231,7 +262,7 @@ if [[ "$MODE" == "full" ]]; then
     camera_label="camera"
     [[ "$KEEP_CAMERA" == true ]] && camera_label="keep_camera"
     CAMERA_PID="$(start_group "$camera_label" "$LOG_DIR/camera.log" \
-      "source /opt/tros/humble/setup.bash; ros2 launch deptrum-ros-driver-aurora930 aurora930_launch.py")"
+      "$ROS_BASE_SOURCE; ros2 launch deptrum-ros-driver-aurora930 aurora930_launch.py")"
     camera_deadline=$((SECONDS + 30))
     until camera_has_data; do
       if (( SECONDS >= camera_deadline )); then
@@ -247,7 +278,7 @@ if [[ "$MODE" == "full" ]]; then
   capture_parent="$(dirname "$CAPTURE_DIR")"
   capture_name="$(basename "$CAPTURE_DIR")"
   installed_capture_config="$(ros2 pkg prefix person_board_detection)/share/person_board_detection/config/person_board_capture.yaml"
-  detector_command="source /opt/tros/humble/setup.bash; source '$WORKSPACE/install/setup.bash'; ros2 run person_board_detection person_board_detector --ros-args --params-file '$installed_capture_config' -p runtime_directory:='$capture_parent' -p fixed_capture_subdirectory:='$capture_name'"
+  detector_command="$ROS_WORKSPACE_SOURCE; ros2 run person_board_detection person_board_detector --ros-args --params-file '$installed_capture_config' -p runtime_directory:='$capture_parent' -p fixed_capture_subdirectory:='$capture_name'"
   DETECTOR_PID="$(start_group detector "$LOG_DIR/detector.log" "$detector_command")"
   if ! wait_for_node /person_board_detector 20; then
     FAILURE_REASON="detector_start_timeout"; exit 1

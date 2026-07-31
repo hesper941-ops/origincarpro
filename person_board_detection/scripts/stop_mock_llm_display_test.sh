@@ -19,6 +19,7 @@ if [[ -z "$PID_FILE" || ! -f "$PID_FILE" ]]; then
 fi
 
 mapfile -t records < "$PID_FILE"
+validated_groups=()
 for ((index=${#records[@]}-1; index>=0; index--)); do
   read -r pid expected_start label <<< "${records[$index]}"
   if [[ "$label" == "keep_camera" ]]; then
@@ -31,16 +32,13 @@ for ((index=${#records[@]}-1; index>=0; index--)); do
     echo "Skip reused PID $pid ($label)" >&2
     continue
   fi
+  validated_groups+=("$pid $label")
   echo "Stopping $label pid=$pid"
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 done
 sleep 1
-for record in "${records[@]}"; do
-  read -r pid expected_start label <<< "$record"
-  [[ "$label" == "keep_camera" ]] && continue
-  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || continue
-  actual_start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
-  [[ "$actual_start" == "$expected_start" ]] || continue
+for record in "${validated_groups[@]}"; do
+  read -r pid label <<< "$record"
   echo "Force stopping $label pid=$pid"
   kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
 done
