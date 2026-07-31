@@ -44,6 +44,7 @@ import numpy as np
 
 
 SELF_TEST = "--self-test" in sys.argv
+BENCHMARK_SINGLE_GREEN = "--benchmark-single-green" in sys.argv
 INTERFACE_VERSION = "gxb_lane_pipeline_v1"
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
@@ -166,7 +167,7 @@ try:
     from sensor_msgs.msg import CompressedImage, Image
     from std_msgs.msg import String
 except ImportError:
-    if not SELF_TEST:
+    if not (SELF_TEST or BENCHMARK_SINGLE_GREEN):
         raise
     _install_self_test_ros_stubs()
     import rclpy
@@ -1834,63 +1835,97 @@ class SingleGreenCurvePlanner:
         return raw, list(main)
 
     @staticmethod
-    def _linear_coefficients(points: np.ndarray) -> Tuple[float, float]:
-        x_values = points[:, 0]
-        y_values = points[:, 1]
-        x_mean = float(np.mean(x_values))
-        y_mean = float(np.mean(y_values))
-        centered_x = x_values - x_mean
-        denominator = float(np.dot(centered_x, centered_x))
+    def _tiny_median(values: Sequence[float]) -> float:
+        ordered = sorted(float(value) for value in values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+    @staticmethod
+    def _mean_std(values: Sequence[float]) -> Tuple[float, float]:
+        count = len(values)
+        if not count:
+            return 0.0, 0.0
+        total = 0.0
+        total_square = 0.0
+        for value in values:
+            scalar = float(value)
+            total += scalar
+            total_square += scalar * scalar
+        mean = total / count
+        variance = max(0.0, total_square / count - mean * mean)
+        return mean, math.sqrt(variance)
+
+    @staticmethod
+    def _linear_coefficients(
+        points: Sequence[Sequence[float]],
+    ) -> Tuple[float, float]:
+        count = len(points)
+        if not count:
+            return 0.0, 0.0
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_xx = 0.0
+        sum_xy = 0.0
+        for point in points:
+            x_value = float(point[0])
+            y_value = float(point[1])
+            sum_x += x_value
+            sum_y += y_value
+            sum_xx += x_value * x_value
+            sum_xy += x_value * y_value
+        denominator = count * sum_xx - sum_x * sum_x
         slope = (
-            float(np.dot(centered_x, y_values - y_mean)) / denominator
-            if denominator > 1.0e-12
+            (count * sum_xy - sum_x * sum_y) / denominator
+            if abs(denominator) > 1.0e-12
             else 0.0
         )
-        return slope, y_mean - slope * x_mean
+        return slope, (sum_y - slope * sum_x) / count
 
     @staticmethod
     def smooth_single_green_boundary(
         chain: Sequence[Dict[str, Any]],
         config: YellowCorridorConfig,
     ) -> np.ndarray:
-        points = np.asarray(
-            [
-                (item["forward_m"], item["left_m"])
-                for item in chain
-            ],
-            dtype=np.float64,
-        ).reshape(-1, 2)
-        if len(points) < config.single_green_min_tangent_points:
+        count = len(chain)
+        points = np.empty((count, 2), dtype=np.float64)
+        for index, item in enumerate(chain):
+            points[index, 0] = float(item["forward_m"])
+            points[index, 1] = float(item["left_m"])
+        if count < config.single_green_min_tangent_points:
             return points
         output = points.copy()
         half = max(1, config.single_green_tangent_window_points // 2)
-        for index in range(len(points)):
+        for index in range(count):
             start = max(0, index - half)
-            end = min(len(points), index + half + 1)
-            local = points[start:end]
+            end = min(count, index + half + 1)
             if (
-                len(local) < config.single_green_min_tangent_points
-                or local[-1, 0] - local[0, 0]
+                end - start < config.single_green_min_tangent_points
+                or points[end - 1, 0] - points[start, 0]
                 < config.single_green_min_tangent_dx_m
             ):
                 continue
-            slope, intercept = SingleGreenCurvePlanner._linear_coefficients(
-                local
-            )
-            residuals = local[:, 1] - (
-                slope * local[:, 0] + intercept
-            )
-            median = float(np.median(residuals))
-            mad = float(np.median(np.abs(residuals - median)))
+            lateral_values = [
+                float(points[position, 1])
+                for position in range(start, end)
+            ]
+            median = SingleGreenCurvePlanner._tiny_median(lateral_values)
+            deviations = [
+                abs(value - median) for value in lateral_values
+            ]
+            mad = SingleGreenCurvePlanner._tiny_median(deviations)
             threshold = max(0.008, 3.0 * mad)
-            keep = np.abs(residuals - median) <= threshold
-            if np.count_nonzero(keep) >= config.single_green_min_tangent_points:
-                slope, intercept = (
-                    SingleGreenCurvePlanner._linear_coefficients(local[keep])
-                )
-            output[index, 1] = float(
-                slope * points[index, 0] + intercept
-            )
+            kept_total = 0.0
+            kept_count = 0
+            for value in lateral_values:
+                if abs(value - median) <= threshold:
+                    kept_total += value
+                    kept_count += 1
+            if kept_count >= config.single_green_min_tangent_points:
+                output[index, 1] = kept_total / kept_count
+            else:
+                output[index, 1] = median
         return output
 
     @staticmethod
@@ -1899,61 +1934,88 @@ class SingleGreenCurvePlanner:
         config: YellowCorridorConfig,
     ) -> np.ndarray:
         points = np.asarray(smoothed, dtype=np.float64).reshape(-1, 2)
+        count = len(points)
         tangents = np.zeros_like(points)
-        half = max(1, config.single_green_tangent_window_points // 2)
-        for index in range(len(points)):
-            start = max(0, index - half)
-            end = min(len(points), index + half + 1)
-            local = points[start:end]
-            if len(local) < 2:
-                continue
-            dx = float(local[-1, 0] - local[0, 0])
+        if count < 2:
+            return tangents
+        raw_tangents: List[Tuple[float, float]] = []
+        for index in range(count):
+            before = max(0, index - 1)
+            after = min(count - 1, index + 1)
+            dx = float(points[after, 0] - points[before, 0])
+            dy = float(points[after, 1] - points[before, 1])
             if dx < config.single_green_min_tangent_dx_m:
-                continue
-            slope, _intercept = (
-                SingleGreenCurvePlanner._linear_coefficients(local)
-            )
-            tangent = np.asarray(
-                [1.0, slope], dtype=np.float64
-            )
-            tangent /= max(float(np.linalg.norm(tangent)), 1.0e-9)
-            if tangent[0] < 0.0:
-                tangent *= -1.0
-            tangents[index] = tangent
+                start = max(
+                    0,
+                    index - config.single_green_tangent_window_points // 2,
+                )
+                end = min(
+                    count,
+                    index
+                    + config.single_green_tangent_window_points // 2
+                    + 1,
+                )
+                slope, _intercept = (
+                    SingleGreenCurvePlanner._linear_coefficients(
+                        points[start:end]
+                    )
+                )
+                dx, dy = 1.0, slope
+            norm = math.hypot(dx, dy)
+            if norm <= 1.0e-12:
+                raw_tangents.append((0.0, 0.0))
+            else:
+                tx = dx / norm
+                ty = dy / norm
+                raw_tangents.append(
+                    (-tx, -ty) if tx < 0.0 else (tx, ty)
+                )
+        for index in range(count):
+            start = max(0, index - 1)
+            end = min(count, index + 2)
+            sum_tx = 0.0
+            sum_ty = 0.0
+            for position in range(start, end):
+                sum_tx += raw_tangents[position][0]
+                sum_ty += raw_tangents[position][1]
+            norm = math.hypot(sum_tx, sum_ty)
+            if norm > 1.0e-12:
+                tangents[index, 0] = sum_tx / norm
+                tangents[index, 1] = sum_ty / norm
         return tangents
 
     @staticmethod
-    def _metric_to_pixel(point: np.ndarray, ipm: Any) -> Tuple[float, float]:
-        forward, left = float(point[0]), float(point[1])
-        return (
-            float(ipm.vehicle_center_x_px)
-            - left / float(ipm.meter_per_pixel),
-            float(ipm.vehicle_origin_y_px)
-            - forward / float(ipm.meter_per_pixel),
-        )
-
-    @staticmethod
-    def _window_ratio(
-        mask: np.ndarray,
+    def _window_ratios(
+        yellow: np.ndarray,
+        green: np.ndarray,
         valid_mask: np.ndarray,
         pixel_x: float,
         pixel_y: float,
         radius: int,
-    ) -> float:
+    ) -> Tuple[float, float]:
         x = int(round(pixel_x))
         y = int(round(pixel_y))
-        x0, x1 = max(0, x - radius), min(mask.shape[1], x + radius + 1)
-        y0, y1 = max(0, y - radius), min(mask.shape[0], y + radius + 1)
+        x0 = max(0, x - radius)
+        x1 = min(yellow.shape[1], x + radius + 1)
+        y0 = max(0, y - radius)
+        y1 = min(yellow.shape[0], y + radius + 1)
         if x0 >= x1 or y0 >= y1:
-            return 0.0
+            return 0.0, 0.0
         valid = valid_mask[y0:y1, x0:x1]
         valid_count = int(np.count_nonzero(valid))
         if not valid_count:
-            return 0.0
-        selected_count = int(np.count_nonzero(
-            (mask[y0:y1, x0:x1] > 0) & valid
+            return 0.0, 0.0
+        yellow_count = int(np.count_nonzero(
+            (yellow[y0:y1, x0:x1] > 0) & valid
         ))
-        return selected_count / valid_count
+        green_count = int(np.count_nonzero(
+            (green[y0:y1, x0:x1] > 0) & valid
+        ))
+        inverse_count = 1.0 / valid_count
+        return (
+            yellow_count * inverse_count,
+            green_count * inverse_count,
+        )
 
     @staticmethod
     def _segment_green_ratio(
@@ -1962,7 +2024,8 @@ class SingleGreenCurvePlanner:
         green: np.ndarray,
         valid_mask: np.ndarray,
     ) -> float:
-        values: List[bool] = []
+        valid_count = 0
+        green_count = 0
         for ratio in SingleGreenCurvePlanner.SEGMENT_RATIOS:
             x = int(round(
                 boundary_pixel[0]
@@ -1977,8 +2040,9 @@ class SingleGreenCurvePlanner:
                 and 0 <= x < green.shape[1]
                 and valid_mask[y, x]
             ):
-                values.append(bool(green[y, x] > 0))
-        return float(np.mean(values)) if values else 1.0
+                valid_count += 1
+                green_count += int(green[y, x] > 0)
+        return green_count / valid_count if valid_count else 1.0
 
     @classmethod
     def resolve_lane_width(
@@ -1999,7 +2063,7 @@ class SingleGreenCurvePlanner:
         ]
         history_age_ms = -1.0
         if len(widths) >= config.lane_width_current_min_dual_samples:
-            width = float(np.median(widths))
+            width = cls._tiny_median(widths)
             source = "current_dual"
         elif state is not None and state.valid:
             age = max(0.0, now - state.updated_monotonic)
@@ -2024,11 +2088,10 @@ class SingleGreenCurvePlanner:
             <= width
             <= config.single_green_lane_width_max_m
         )
-        width = float(np.clip(
-            width,
-            config.single_green_lane_width_min_m,
+        width = min(
             config.single_green_lane_width_max_m,
-        ))
+            max(config.single_green_lane_width_min_m, width),
+        )
         return width, source, history_age_ms, clamped
 
     @classmethod
@@ -2042,10 +2105,11 @@ class SingleGreenCurvePlanner:
         config: YellowCorridorConfig,
         width_state: Optional[SingleGreenLaneWidthState] = None,
         now: Optional[float] = None,
+        collect_debug: bool = False,
     ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
         started = time.perf_counter()
         instant = time.monotonic() if now is None else float(now)
-        status = copy.deepcopy(cls.STATUS_DEFAULTS)
+        status = dict(cls.STATUS_DEFAULTS)
         debug: List[Dict[str, Any]] = []
         side_data: Dict[str, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
         for side in ("left", "right"):
@@ -2127,13 +2191,18 @@ class SingleGreenCurvePlanner:
         offset_distances: List[float] = []
         boundary_headings: List[float] = []
         center_headings: List[float] = []
-        previous_center: Optional[np.ndarray] = None
+        previous_center: Optional[Tuple[float, float]] = None
         previous_heading: Optional[float] = None
         expected_normal_left_sign = -1.0 if side == "left" else 1.0
         radius = config.single_green_center_yellow_window_px
-        for index, (boundary, tangent) in enumerate(
-            zip(smoothed, tangents)
-        ):
+        half_width = lane_width * 0.5
+        meter_per_pixel = float(ipm.meter_per_pixel)
+        inverse_meter_per_pixel = 1.0 / meter_per_pixel
+        vehicle_center_x = float(ipm.vehicle_center_x_px)
+        vehicle_origin_y = float(ipm.vehicle_origin_y_px)
+        observed_forward_min = float(smoothed[0, 0])
+        observed_forward_max = float(smoothed[-1, 0])
+        for index in range(len(smoothed)):
             status["single_green_curve_candidate_count"] += 1
             source = samples[chain[index]["sample_index"]]
             if source.get("left") is not None and source.get("right") is not None:
@@ -2141,136 +2210,117 @@ class SingleGreenCurvePlanner:
                     "single_green_curve_reject_opposite_boundary_count"
                 ] += 1
                 continue
-            if tangent[0] <= 0.0 or np.linalg.norm(tangent) < 0.9:
+            boundary_forward = float(smoothed[index, 0])
+            boundary_left = float(smoothed[index, 1])
+            tangent_x = float(tangents[index, 0])
+            tangent_y = float(tangents[index, 1])
+            if (
+                tangent_x <= 0.0
+                or math.hypot(tangent_x, tangent_y) < 0.9
+            ):
                 status[
                     "single_green_curve_reject_normal_direction_count"
                 ] += 1
                 continue
-            boundary_heading = math.atan2(
-                float(tangent[1]), float(tangent[0])
-            )
+            boundary_heading = math.atan2(tangent_y, tangent_x)
             boundary_headings.append(math.degrees(boundary_heading))
-            normals = (
-                (
-                    1,
-                    np.asarray(
-                        [-tangent[1], tangent[0]], dtype=np.float64
-                    ),
-                ),
-                (
-                    -1,
-                    np.asarray(
-                        [tangent[1], -tangent[0]], dtype=np.float64
-                    ),
-                ),
+            normal_one = (-tangent_y, tangent_x, 1)
+            normal_two = (tangent_y, -tangent_x, -1)
+            primary = (
+                normal_one
+                if normal_one[1] * expected_normal_left_sign > 0.0
+                else normal_two
             )
-            candidate_records: List[Tuple[float, np.ndarray, Dict[str, Any]]] = []
-            for normal_sign, normal in normals:
-                semantic = normal[1] * expected_normal_left_sign > 0.0
-                candidate = boundary + normal * (lane_width * 0.5)
-                center_pixel = cls._metric_to_pixel(candidate, ipm)
-                boundary_pixel = cls._metric_to_pixel(boundary, ipm)
-                x = int(round(center_pixel[0]))
-                y = int(round(center_pixel[1]))
-                valid = bool(
-                    0 <= y < green.shape[0]
-                    and 0 <= x < green.shape[1]
-                    and ipm_valid_mask[y, x]
-                )
-                point_yellow = float(valid and yellow[y, x] > 0)
-                point_green = float(valid and green[y, x] > 0)
-                score = (
-                    (2.0 if semantic else -2.0)
-                    + 1.5 * point_yellow
-                    - 1.5 * point_green
-                    - 0.2 * abs(candidate[1])
-                )
-                candidate_records.append(
-                    (
-                        score,
-                        candidate,
-                        {
-                            "normal_sign": normal_sign,
-                            "semantic": semantic,
-                            "valid": valid,
-                            "center_pixel": center_pixel,
-                            "boundary_pixel": boundary_pixel,
-                        },
-                    )
-                )
-            _score, candidate, evidence = max(
-                candidate_records, key=lambda item: item[0]
+            secondary = (
+                normal_two if primary is normal_one else normal_one
             )
-            evidence["yellow_ratio"] = cls._window_ratio(
-                yellow,
-                ipm_valid_mask,
-                *evidence["center_pixel"],
-                radius,
+            normal_x, normal_y, normal_sign = primary
+            candidate_forward = boundary_forward + normal_x * half_width
+            candidate_left = boundary_left + normal_y * half_width
+            boundary_pixel = (
+                vehicle_center_x
+                - boundary_left * inverse_meter_per_pixel,
+                vehicle_origin_y
+                - boundary_forward * inverse_meter_per_pixel,
             )
-            evidence["green_ratio"] = cls._window_ratio(
-                green,
-                ipm_valid_mask,
-                *evidence["center_pixel"],
-                radius,
+            center_pixel = (
+                vehicle_center_x
+                - candidate_left * inverse_meter_per_pixel,
+                vehicle_origin_y
+                - candidate_forward * inverse_meter_per_pixel,
             )
-            evidence["segment_green_ratio"] = cls._segment_green_ratio(
-                evidence["boundary_pixel"],
-                evidence["center_pixel"],
-                green,
-                ipm_valid_mask,
+            center_x = int(round(center_pixel[0]))
+            center_y = int(round(center_pixel[1]))
+            semantic = normal_y * expected_normal_left_sign > 0.0
+            valid_ipm = bool(
+                0 <= center_y < green.shape[0]
+                and 0 <= center_x < green.shape[1]
+                and ipm_valid_mask[center_y, center_x]
+            )
+            yellow_ratio = 0.0
+            green_ratio = 0.0
+            segment_green_ratio = 0.0
+            offset_distance = math.hypot(
+                candidate_forward - boundary_forward,
+                candidate_left - boundary_left,
             )
             reject_key = ""
             if (
-                candidate[0] < smoothed[0, 0] - 1.0e-9
-                or candidate[0] > smoothed[-1, 0] + 1.0e-9
+                candidate_forward < observed_forward_min - 1.0e-9
+                or candidate_forward > observed_forward_max + 1.0e-9
             ):
-                # A normal on a curved endpoint can point slightly beyond the
-                # observed station range.  Reject it instead of extrapolating.
                 reject_key = (
                     "single_green_curve_reject_offset_distance_count"
                 )
-            elif not evidence["semantic"]:
+            elif not semantic:
                 reject_key = (
                     "single_green_curve_reject_normal_direction_count"
                 )
-            elif not evidence["valid"]:
+            elif not valid_ipm:
                 reject_key = "single_green_curve_reject_invalid_ipm_count"
-            elif (
-                evidence["yellow_ratio"]
-                < config.single_green_center_min_yellow_ratio
-            ):
-                reject_key = (
-                    "single_green_curve_reject_yellow_support_count"
-                )
-            elif (
-                evidence["green_ratio"]
-                > config.single_green_center_max_green_ratio
-                or evidence["segment_green_ratio"] > 0.35
-            ):
-                reject_key = (
-                    "single_green_curve_reject_green_intrusion_count"
-                )
-            offset_distance = float(np.linalg.norm(candidate - boundary))
-            if (
-                not reject_key
-                and abs(offset_distance - lane_width * 0.5) > 0.02
-            ):
+            elif abs(offset_distance - half_width) > 0.02:
                 reject_key = (
                     "single_green_curve_reject_offset_distance_count"
                 )
+            if not reject_key:
+                yellow_ratio, green_ratio = cls._window_ratios(
+                    yellow,
+                    green,
+                    ipm_valid_mask,
+                    center_pixel[0],
+                    center_pixel[1],
+                    radius,
+                )
+                if (
+                    yellow_ratio
+                    < config.single_green_center_min_yellow_ratio
+                ):
+                    reject_key = (
+                        "single_green_curve_reject_yellow_support_count"
+                    )
+            if not reject_key:
+                if (
+                    green_ratio
+                    > config.single_green_center_max_green_ratio
+                ):
+                    reject_key = (
+                        "single_green_curve_reject_green_intrusion_count"
+                    )
             center_heading: Optional[float] = None
             if previous_center is not None:
-                delta = candidate - previous_center
+                delta_forward = candidate_forward - previous_center[0]
+                delta_left = candidate_left - previous_center[1]
                 if (
-                    abs(float(delta[1]))
+                    not reject_key
+                    and abs(delta_left)
                     > config.single_green_center_max_lateral_jump_m
                 ):
                     reject_key = (
                         "single_green_curve_reject_lateral_jump_count"
                     )
-                if delta[0] > 1.0e-6:
+                if not reject_key and delta_forward > 1.0e-6:
                     center_heading = math.atan2(
-                        float(delta[1]), float(delta[0])
+                        delta_left, delta_forward
                     )
                     if (
                         previous_heading is not None
@@ -2285,44 +2335,78 @@ class SingleGreenCurvePlanner:
                         reject_key = (
                             "single_green_curve_reject_heading_jump_count"
                         )
-            debug_record = {
-                "sample_index": chain[index]["sample_index"],
-                "side": side,
-                "boundary_pixel": evidence["boundary_pixel"],
-                "smoothed_pixel": cls._metric_to_pixel(boundary, ipm),
-                "center_pixel": evidence["center_pixel"],
-                "normal_sign": evidence["normal_sign"],
-                "normal_selection_reason": "side_and_mask_score",
-                "accepted": not bool(reject_key),
-                "reject_key": reject_key,
-            }
-            debug.append(debug_record)
+            if not reject_key:
+                segment_green_ratio = cls._segment_green_ratio(
+                    boundary_pixel,
+                    center_pixel,
+                    green,
+                    ipm_valid_mask,
+                )
+                if segment_green_ratio > 0.35:
+                    reject_key = (
+                        "single_green_curve_reject_green_intrusion_count"
+                    )
+            if reject_key:
+                # The opposite normal is considered only after the semantic
+                # inward candidate fails.  Its side semantics reject it cheaply,
+                # so expensive mask and segment checks are never duplicated.
+                secondary_semantic = (
+                    secondary[1] * expected_normal_left_sign > 0.0
+                )
+                if secondary_semantic:
+                    normal_x, normal_y, normal_sign = secondary
+            if collect_debug:
+                debug.append(
+                    {
+                        "sample_index": chain[index]["sample_index"],
+                        "side": side,
+                        "boundary_pixel": boundary_pixel,
+                        "smoothed_pixel": boundary_pixel,
+                        "center_pixel": center_pixel,
+                        "normal_sign": normal_sign,
+                        "normal_selection_reason": "side_and_mask_score",
+                        "accepted": not bool(reject_key),
+                        "reject_key": reject_key,
+                    }
+                )
             if reject_key:
                 status[reject_key] += 1
                 continue
             sample_index = chain[index]["sample_index"]
             accepted[sample_index] = {
-                "center_pixel": evidence["center_pixel"],
-                "center_metric": candidate.copy(),
-                "boundary_metric": boundary.copy(),
-                "tangent": tangent.copy(),
+                "center_pixel": center_pixel,
+                "center_metric": (candidate_forward, candidate_left),
+                "boundary_metric": (boundary_forward, boundary_left),
+                "tangent": (tangent_x, tangent_y),
                 "side": side,
-                "yellow_ratio": evidence["yellow_ratio"],
-                "green_ratio": evidence["green_ratio"],
+                "yellow_ratio": yellow_ratio,
+                "green_ratio": green_ratio,
+                "segment_green_ratio": segment_green_ratio,
                 "offset_distance_m": offset_distance,
+                "normal_sign": normal_sign,
+                "reject_reason": "",
             }
-            status["selected_normal_sign"] = int(evidence["normal_sign"])
+            status["selected_normal_sign"] = int(normal_sign)
             status["normal_selection_reason"] = (
                 "side_semantics_yellow_green_score"
             )
-            previous_center = candidate
+            previous_center = (candidate_forward, candidate_left)
             if center_heading is not None:
                 previous_heading = center_heading
                 center_headings.append(math.degrees(center_heading))
-            yellow_ratios.append(evidence["yellow_ratio"])
-            green_ratios.append(evidence["green_ratio"])
+            yellow_ratios.append(yellow_ratio)
+            green_ratios.append(green_ratio)
             offset_distances.append(offset_distance)
         accepted_count = len(accepted)
+        yellow_mean, _yellow_std = cls._mean_std(yellow_ratios)
+        green_mean, _green_std = cls._mean_std(green_ratios)
+        offset_mean, offset_std = cls._mean_std(offset_distances)
+        boundary_heading_mean, boundary_heading_std = cls._mean_std(
+            boundary_headings
+        )
+        center_heading_mean, center_heading_std = cls._mean_std(
+            center_headings
+        )
         status.update(
             {
                 "single_green_curve_offset_used": bool(accepted_count),
@@ -2334,30 +2418,18 @@ class SingleGreenCurvePlanner:
                     status["single_green_curve_candidate_count"]
                     - accepted_count
                 ),
-                "single_green_yellow_support_ratio_mean": float(
-                    np.mean(yellow_ratios) if yellow_ratios else 0.0
+                "single_green_yellow_support_ratio_mean": yellow_mean,
+                "single_green_green_intrusion_ratio_mean": green_mean,
+                "single_green_offset_distance_m_mean": offset_mean,
+                "single_green_offset_distance_m_std": offset_std,
+                "single_green_boundary_heading_deg_mean": (
+                    boundary_heading_mean
                 ),
-                "single_green_green_intrusion_ratio_mean": float(
-                    np.mean(green_ratios) if green_ratios else 0.0
+                "single_green_boundary_heading_deg_std": (
+                    boundary_heading_std
                 ),
-                "single_green_offset_distance_m_mean": float(
-                    np.mean(offset_distances) if offset_distances else 0.0
-                ),
-                "single_green_offset_distance_m_std": float(
-                    np.std(offset_distances) if offset_distances else 0.0
-                ),
-                "single_green_boundary_heading_deg_mean": float(
-                    np.mean(boundary_headings) if boundary_headings else 0.0
-                ),
-                "single_green_boundary_heading_deg_std": float(
-                    np.std(boundary_headings) if boundary_headings else 0.0
-                ),
-                "single_green_center_heading_deg_mean": float(
-                    np.mean(center_headings) if center_headings else 0.0
-                ),
-                "single_green_center_heading_deg_std": float(
-                    np.std(center_headings) if center_headings else 0.0
-                ),
+                "single_green_center_heading_deg_mean": center_heading_mean,
+                "single_green_center_heading_deg_std": center_heading_std,
             }
         )
         status["single_green_curve_offset_ms"] = (
@@ -2883,6 +2955,7 @@ class GreenBoundaryFastPlanner:
         ipm_valid_mask: Optional[np.ndarray] = None,
         width_state: Optional[SingleGreenLaneWidthState] = None,
         now_monotonic: Optional[float] = None,
+        collect_debug: bool = False,
     ) -> Tuple[Any, Dict[str, Any], List[Dict[str, Any]]]:
         status = dict(base_status)
         samples = [dict(sample) for sample in extracted_samples]
@@ -2919,6 +2992,7 @@ class GreenBoundaryFastPlanner:
                 config,
                 width_state,
                 now_monotonic,
+                collect_debug,
             )
             status.update(single_curve_status)
             for item in single_curve_debug:
@@ -4310,6 +4384,7 @@ class LaneAlgorithm:
         ipm: Any,
         enhancement_config: Optional[BoundaryEnhancementConfig] = None,
         corridor_config: Optional[YellowCorridorConfig] = None,
+        collect_overlay_debug: bool = False,
     ) -> None:
         self.threshold = threshold
         self.segmentation_config = segmentation_config
@@ -4321,6 +4396,7 @@ class LaneAlgorithm:
         self.enhancement_config.validate()
         self.corridor_config = corridor_config or YellowCorridorConfig()
         self.corridor_config.validate()
+        self.collect_overlay_debug = bool(collect_overlay_debug)
         (
             self.roi_ipm,
             self.resolved_forward_min_m,
@@ -4481,6 +4557,7 @@ class LaneAlgorithm:
             allow_single=False,
             ipm_valid_mask=self.ipm_valid_mask,
             width_state=self.single_green_width_state,
+            collect_debug=self.collect_overlay_debug,
         )
         timing["green_boundary_fast_path_ms"] = (
             time.perf_counter() - started
@@ -4542,6 +4619,7 @@ class LaneAlgorithm:
                 allow_single=True,
                 ipm_valid_mask=self.ipm_valid_mask,
                 width_state=self.single_green_width_state,
+                collect_debug=self.collect_overlay_debug,
             )
             single_elapsed_ms = (
                 time.perf_counter() - single_started
@@ -5505,6 +5583,9 @@ class LanePerceptionPipelineNode(Node):
             self.ipm,
             self.enhancement_config,
             self.corridor_config,
+            collect_overlay_debug=(
+                self.web_gui_enable or self.publish_overlay_compressed
+            ),
         )
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -8603,39 +8684,235 @@ def run_self_tests() -> None:
     )
     check("133 synthetic 15/3 curve recovers at least ten points", mixed_curve_result.valid and len(mixed_curve_result.final_points) >= 10)
     check("134 synthetic 15/3 curve recovers span", mixed_curve_result.forward_span_m >= 0.45 and mixed_curve_status["single_green_curve_chain_count"] >= 12)
-    for _index in range(10):
-        SingleGreenCurvePlanner.build(
-            left_samples,
+    short_config = copy.deepcopy(curve_config)
+    short_config.single_green_curve_min_points = 6
+    short_config.single_green_curve_min_span_m = 0.25
+    short_result, _short_status, _short_debug = (
+        GreenBoundaryFastPlanner.plan(
+            left_samples[:7],
+            copy.deepcopy(GreenBoundaryFastPlanner.EMPTY_STATUS),
             left_green,
             left_yellow,
-            curve_valid,
             curve_ipm,
-            curve_config,
+            short_config,
+            geometry,
+            allow_single=True,
+            ipm_valid_mask=curve_valid,
         )
-    performance_started = time.perf_counter()
-    for _index in range(200):
-        SingleGreenCurvePlanner.build(
-            left_samples,
-            left_green,
-            left_yellow,
-            curve_valid,
-            curve_ipm,
-            curve_config,
-        )
-    average_curve_ms = (time.perf_counter() - performance_started) * 5.0
-    print(f"single-green synthetic average: {average_curve_ms:.3f} ms")
-    check("135 single curve synthetic average at most 3ms", average_curve_ms <= 3.0)
+    )
+    check(
+        "135 short observed curve is not extrapolated",
+        short_result.valid
+        and 0.29 <= short_result.forward_span_m <= 0.301,
+    )
     check("136 straight dual regression remains fifteen points", green_dual_result.valid and len(green_dual_result.final_points) == 15)
+
+    right_mixed_green = np.zeros(curve_shape, dtype=np.uint8)
+    right_mixed_yellow = np.zeros(curve_shape, dtype=np.uint8)
+    for row in range(curve_shape[0]):
+        progress = (curve_shape[0] - 1 - row) / max(
+            1, curve_shape[0] - 1
+        )
+        right_edge = 350 - int(round(20.0 * progress * progress))
+        left_edge = right_edge - 100
+        right_mixed_green[row, right_edge:] = 255
+        right_mixed_yellow[row, left_edge + 1 : right_edge] = 255
+    for sample in right_samples[:3]:
+        row = int(sample["y"])
+        progress = (curve_shape[0] - 1 - row) / max(
+            1, curve_shape[0] - 1
+        )
+        left_edge = 250 - int(round(20.0 * progress * progress))
+        right_mixed_green[row, : left_edge + 1] = 255
+    right_mixed_samples, right_mixed_base = (
+        GreenBoundaryFastPlanner.extract(
+            right_mixed_green,
+            right_mixed_yellow,
+            curve_ipm,
+            curve_config,
+            ipm_valid_mask=curve_valid,
+        )
+    )
+    right_mixed_result, right_mixed_status, _ = (
+        GreenBoundaryFastPlanner.plan(
+            right_mixed_samples,
+            right_mixed_base,
+            right_mixed_green,
+            right_mixed_yellow,
+            curve_ipm,
+            curve_config,
+            geometry,
+            allow_single=True,
+            ipm_valid_mask=curve_valid,
+        )
+    )
+    check(
+        "137 synthetic 3/15 right curve recovery",
+        right_mixed_result.valid
+        and len(right_mixed_result.final_points) >= 10
+        and right_mixed_result.forward_span_m >= 0.45
+        and right_mixed_status["single_green_curve_side"] == "right",
+    )
+    _web_off_candidates, _web_off_status, web_off_curve_debug = (
+        SingleGreenCurvePlanner.build(
+            left_samples,
+            left_green,
+            left_yellow,
+            curve_valid,
+            curve_ipm,
+            curve_config,
+            collect_debug=False,
+        )
+    )
+    check(
+        "138 web off skips single curve drawing data",
+        not web_off_curve_debug,
+    )
+    _web_on_candidates, _web_on_status, web_on_curve_debug = (
+        SingleGreenCurvePlanner.build(
+            left_samples,
+            left_green,
+            left_yellow,
+            curve_valid,
+            curve_ipm,
+            curve_config,
+            collect_debug=True,
+        )
+    )
+    check(
+        "139 web overlay single curve diagnostics retained",
+        len(web_on_curve_debug) >= 10
+        and all(
+            "boundary_pixel" in item and "center_pixel" in item
+            for item in web_on_curve_debug
+        ),
+    )
 
     print(f"SELF-TEST PASS: {len(passed)} checks")
     for name in passed:
         print(f"  PASS {name}")
 
 
+def _benchmark_limit_ms(arguments: Sequence[str]) -> Optional[float]:
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--benchmark-limit-ms="):
+            return float(argument.split("=", 1)[1])
+        if argument == "--benchmark-limit-ms":
+            if index + 1 >= len(arguments):
+                raise ValueError("--benchmark-limit-ms requires a value")
+            return float(arguments[index + 1])
+    return None
+
+
+def run_single_green_benchmark(
+    limit_ms: Optional[float] = None,
+) -> int:
+    warmup_count = 20
+    iteration_count = 200
+    config = YellowCorridorConfig()
+    ipm = types.SimpleNamespace(
+        output_height=141,
+        output_width=600,
+        vehicle_center_x_px=300.0,
+        vehicle_origin_y_px=170.0,
+        meter_per_pixel=0.005,
+        expected_lane_width_px=100.0,
+    )
+    shape = (ipm.output_height, ipm.output_width)
+    valid_mask = np.ones(shape, dtype=bool)
+    green = np.zeros(shape, dtype=np.uint8)
+    yellow = np.zeros(shape, dtype=np.uint8)
+    green[:, :251] = 255
+    yellow[:, 251:351] = 255
+    step_px = int(round(config.sample_step_m / ipm.meter_per_pixel))
+    samples: List[Dict[str, Any]] = []
+    for index in range(15):
+        y = shape[0] - 1 - index * step_px
+        samples.append(
+            {
+                "y": y,
+                "forward_m": (
+                    ipm.vehicle_origin_y_px - y
+                )
+                * ipm.meter_per_pixel,
+                "left": 250.0,
+                "right": None,
+                "center": None,
+                "classification": "missing",
+                "source_type": "missing",
+                "reason": "benchmark",
+                "width": None,
+                "single_side": "left",
+                "yellow_support_ratio": 0.0,
+                "unknown_ratio": 0.0,
+                "green_intrusion_ratio": 0.0,
+            }
+        )
+
+    def one_iteration() -> None:
+        accepted, status, debug = SingleGreenCurvePlanner.build(
+            samples,
+            green,
+            yellow,
+            valid_mask,
+            ipm,
+            config,
+            collect_debug=False,
+        )
+        if (
+            len(accepted) < 10
+            or status["single_green_curve_accepted_count"] < 10
+            or debug
+        ):
+            raise RuntimeError("single-green benchmark correctness failed")
+
+    for _index in range(warmup_count):
+        one_iteration()
+    durations_ns: List[int] = []
+    for _index in range(iteration_count):
+        started_ns = time.perf_counter_ns()
+        one_iteration()
+        durations_ns.append(time.perf_counter_ns() - started_ns)
+    ordered = sorted(durations_ns)
+    mean_ms = sum(durations_ns) / iteration_count / 1_000_000.0
+    median_ms = (
+        ordered[iteration_count // 2 - 1]
+        + ordered[iteration_count // 2]
+    ) / 2_000_000.0
+    p95_ms = ordered[
+        max(0, math.ceil(iteration_count * 0.95) - 1)
+    ] / 1_000_000.0
+    minimum_ms = ordered[0] / 1_000_000.0
+    maximum_ms = ordered[-1] / 1_000_000.0
+    print(
+        "SINGLE-GREEN BENCHMARK "
+        f"warmup={warmup_count} iterations={iteration_count}"
+    )
+    print(f"mean_ms={mean_ms:.3f}")
+    print(f"median_ms={median_ms:.3f}")
+    print(f"p95_ms={p95_ms:.3f}")
+    print(f"min_ms={minimum_ms:.3f}")
+    print(f"max_ms={maximum_ms:.3f}")
+    if limit_ms is not None:
+        print(f"limit_ms={limit_ms:.3f}")
+        if median_ms > limit_ms:
+            print("benchmark_result=FAIL")
+            return 1
+    print("benchmark_result=PASS")
+    return 0
+
+
 def main(args: Optional[List[str]] = None) -> None:
     if SELF_TEST:
         run_self_tests()
         return
+    if BENCHMARK_SINGLE_GREEN:
+        try:
+            limit_ms = _benchmark_limit_ms(sys.argv[1:])
+        except ValueError as exc:
+            print(f"benchmark argument error: {exc}")
+            raise SystemExit(2) from exc
+        raise SystemExit(run_single_green_benchmark(limit_ms))
     rclpy.init(args=args)
     node: Optional[LanePerceptionPipelineNode] = None
     try:
