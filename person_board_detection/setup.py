@@ -41,6 +41,14 @@ setup(
                 'person_board_detector = '
                 'person_board_detection.person_board_detector:main'
             ),
+            (
+                'person_board_mock_llm_worker = '
+                'person_board_detection.mock_llm_worker:main'
+            ),
+            (
+                'person_board_display = '
+                'person_board_detection.person_board_display:main'
+            ),
         ],
     },
 )

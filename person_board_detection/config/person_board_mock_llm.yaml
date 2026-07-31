@@ -1,0 +1,16 @@
+person_board_mock_llm_worker:
+  ros__parameters:
+    capture_batch_topic: /person_board/capture_batch
+    llm_status_topic: /person_board/llm_status
+    llm_result_topic: /person_board/llm_result
+
+    backend_name: mock
+    mock_result_text: 检测到人形立牌
+    mock_processing_delay_sec: 1.5
+
+    validate_images: true
+    allowed_capture_directory: /root/intelligent_car_ws/runtime/person_board/latest_capture
+
+    max_pending_jobs: 1
+    remember_processed_request_count: 100
+    status_heartbeat_sec: 1.0
