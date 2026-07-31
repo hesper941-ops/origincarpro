@@ -81,7 +81,17 @@ start_one() {
   local name="$1"
   local log_dir="$2"
   shift 2
-  setsid "$@" >"${log_dir}/${name}.log" 2>&1 &
+
+  # Always load ROS inside the detached shell as well.  `bash +u` makes the
+  # child safe even when nounset arrived through SHELLOPTS; source_ros then
+  # restores nounset after both setup files have finished loading.
+  export WORKSPACE
+  export -f source_ros
+  setsid bash +u -c '
+    set -eo pipefail
+    source_ros
+    exec "$@"
+  ' "lane-test-${name}" "$@" >"${log_dir}/${name}.log" 2>&1 &
   local pid=$!
   printf '%s\n' "${pid}" >"${log_dir}/${name}.pid"
   echo "started ${name} pid=${pid}"
@@ -167,6 +177,16 @@ stop_all() {
       [[ ${any_alive} -eq 0 ]] && break
       sleep 1
     done
+    for name in "${PROCESS_NAMES[@]}"; do
+      [[ -f "${log_dir}/${name}.pid" ]] || continue
+      local remaining_pid
+      remaining_pid="$(cat "${log_dir}/${name}.pid")"
+      if pid_alive "${remaining_pid}"; then
+        kill -KILL -- "-${remaining_pid}" 2>/dev/null \
+          || kill -KILL "${remaining_pid}" 2>/dev/null \
+          || true
+      fi
+    done
   fi
   local residual pid command
   while IFS= read -r residual; do
@@ -176,6 +196,17 @@ stop_all() {
     case "${command}" in
       *lane_perception_pipeline.py*|*5_lane_path_controller.py*|*watch_controller_v2.py*|*watch_single_green_status.py*)
         kill -TERM "${pid}" 2>/dev/null || true
+        ;;
+    esac
+  done < <(known_residuals)
+  sleep 1
+  while IFS= read -r residual; do
+    [[ -n "${residual}" ]] || continue
+    pid="${residual%% *}"
+    command="${residual#* }"
+    case "${command}" in
+      *lane_perception_pipeline.py*|*5_lane_path_controller.py*|*watch_controller_v2.py*|*watch_single_green_status.py*)
+        kill -KILL "${pid}" 2>/dev/null || true
         ;;
     esac
   done < <(known_residuals)
