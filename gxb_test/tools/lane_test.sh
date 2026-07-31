@@ -27,14 +27,30 @@ source_ros() {
     echo "ERROR: /opt/tros/humble/setup.bash not found" >&2
     return 1
   }
-  # shellcheck disable=SC1091
-  source /opt/tros/humble/setup.bash
   [[ -f "${WORKSPACE}/install/setup.bash" ]] || {
     echo "ERROR: ${WORKSPACE}/install/setup.bash not found" >&2
     return 1
   }
+
+  # ROS/TROS setup 脚本会读取若干未预先定义的环境变量。
+  # 加载期间临时关闭 nounset，加载完成后立即恢复。
+  set +u
+
+  # shellcheck disable=SC1091
+  if ! source /opt/tros/humble/setup.bash; then
+    set -u
+    echo "ERROR: failed to source TROS environment" >&2
+    return 1
+  fi
+
   # shellcheck disable=SC1090
-  source "${WORKSPACE}/install/setup.bash"
+  if ! source "${WORKSPACE}/install/setup.bash"; then
+    set -u
+    echo "ERROR: failed to source workspace environment" >&2
+    return 1
+  fi
+
+  set -u
 }
 
 pid_alive() {
