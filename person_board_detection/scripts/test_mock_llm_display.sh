@@ -57,7 +57,9 @@ CLEANED_UP=false
 
 if [[ -f /opt/tros/humble/setup.bash ]]; then
   # shellcheck disable=SC1091
+  set +u
   source /opt/tros/humble/setup.bash
+  set +u
 else
   echo "Missing /opt/tros/humble/setup.bash" >&2
   exit 1
