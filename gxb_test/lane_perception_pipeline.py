@@ -721,14 +721,19 @@ class YellowCorridorPlanner:
 
     @staticmethod
     def _intervals(row: np.ndarray) -> List[Tuple[int, int]]:
-        active = row > 0
-        if not np.any(active):
+        active = np.asarray(row) > 0
+        if not bool(np.any(active)):
             return []
-        padded = np.pad(active.astype(np.int8), (1, 1))
-        changes = np.diff(padded)
-        starts = np.where(changes == 1)[0]
-        ends = np.where(changes == -1)[0] - 1
-        return [(int(start), int(end)) for start, end in zip(starts, ends)]
+        changes = np.flatnonzero(active[1:] != active[:-1]) + 1
+        starts = changes[active[changes]]
+        ends = changes[~active[changes]] - 1
+        if active[0]:
+            starts = np.concatenate((np.asarray([0]), starts))
+        if active[-1]:
+            ends = np.concatenate((ends, np.asarray([len(active) - 1])))
+        return [
+            (int(start), int(end)) for start, end in zip(starts, ends)
+        ]
 
     @staticmethod
     def _edge_valid(
@@ -1069,6 +1074,11 @@ class YellowCorridorPlanner:
         candidate = np.asarray(points, dtype=np.float64).reshape(-1, 2).copy()
         count = len(candidate)
         if count < 3 or smoothing_lambda <= 0:
+            return candidate
+        lateral = candidate[:, 0]
+        if np.all(np.abs(
+            lateral[:-2] - 2.0 * lateral[1:-1] + lateral[2:]
+        ) <= 1.0e-12):
             return candidate
         second_difference = np.zeros((count - 2, count), dtype=np.float64)
         for index in range(count - 2):
@@ -1713,6 +1723,21 @@ class SingleGreenLaneWidthState:
         self.valid = True
 
 
+@dataclass
+class _SingleGreenMaskCache:
+    yellow: np.ndarray
+    green: np.ndarray
+    valid: np.ndarray
+    yellow_integral: Optional[np.ndarray]
+    green_integral: Optional[np.ndarray]
+    valid_integral: Optional[np.ndarray]
+    yellow_scale: float
+    green_scale: float
+    all_valid: bool
+    integral_origin_x: int = 0
+    integral_origin_y: int = 0
+
+
 class SingleGreenCurvePlanner:
     """Build a centerline only over an observed single-green boundary chain."""
 
@@ -1815,11 +1840,11 @@ class SingleGreenCurvePlanner:
 
     @staticmethod
     def _metric_point(
-        sample: Dict[str, Any], side: str, ipm: Any
+        sample: Dict[str, Any], side: str, ipm: Any, sample_index: int
     ) -> Dict[str, Any]:
         pixel_x = float(sample[side])
         return {
-            "sample_index": int(sample["_sample_index"]),
+            "sample_index": sample_index,
             "pixel_x": pixel_x,
             "pixel_y": float(sample["y"]),
             "forward_m": float(sample["forward_m"]),
@@ -1841,9 +1866,7 @@ class SingleGreenCurvePlanner:
         for index, source in enumerate(samples):
             if source.get(side) is None:
                 continue
-            sample = dict(source)
-            sample["_sample_index"] = index
-            raw.append(cls._metric_point(sample, side, ipm))
+            raw.append(cls._metric_point(source, side, ipm, index))
         raw.sort(key=lambda item: item["forward_m"])
         chains: List[List[Dict[str, Any]]] = []
         current: List[Dict[str, Any]] = []
@@ -1885,7 +1908,20 @@ class SingleGreenCurvePlanner:
 
     @staticmethod
     def _tiny_median(values: Sequence[float]) -> float:
-        ordered = sorted(float(value) for value in values)
+        count = len(values)
+        if count == 1:
+            return float(values[0])
+        if count == 2:
+            return 0.5 * (float(values[0]) + float(values[1]))
+        if count == 3:
+            first, second, third = (
+                float(values[0]), float(values[1]), float(values[2])
+            )
+            return first + second + third - min(first, second, third) - max(
+                first, second, third
+            )
+        ordered = list(values)
+        ordered.sort()
         middle = len(ordered) // 2
         if len(ordered) % 2:
             return ordered[middle]
@@ -1955,10 +1991,7 @@ class SingleGreenCurvePlanner:
                 < config.single_green_min_tangent_dx_m
             ):
                 continue
-            lateral_values = [
-                float(points[position, 1])
-                for position in range(start, end)
-            ]
+            lateral_values = points[start:end, 1].tolist()
             median = SingleGreenCurvePlanner._tiny_median(lateral_values)
             deviations = [
                 abs(value - median) for value in lateral_values
@@ -1986,6 +2019,26 @@ class SingleGreenCurvePlanner:
         count = len(points)
         tangents = np.zeros_like(points)
         if count < 2:
+            return tangents
+        before = np.maximum(np.arange(count, dtype=np.intp) - 1, 0)
+        after = np.minimum(np.arange(count, dtype=np.intp) + 1, count - 1)
+        delta = points[after] - points[before]
+        if np.all(delta[:, 0] >= config.single_green_min_tangent_dx_m):
+            norms = np.hypot(delta[:, 0], delta[:, 1])
+            usable = norms > 1.0e-12
+            raw = np.zeros_like(delta)
+            raw[usable] = delta[usable] / norms[usable, None]
+            raw[raw[:, 0] < 0.0] *= -1.0
+            sums = raw.copy()
+            sums[0] = raw[0] + raw[1]
+            sums[-1] = raw[-2] + raw[-1]
+            if count > 2:
+                sums[1:-1] = raw[:-2] + raw[1:-1] + raw[2:]
+            smooth_norms = np.hypot(sums[:, 0], sums[:, 1])
+            smooth_usable = smooth_norms > 1.0e-12
+            tangents[smooth_usable] = (
+                sums[smooth_usable] / smooth_norms[smooth_usable, None]
+            )
             return tangents
         raw_tangents: List[Tuple[float, float]] = []
         for index in range(count):
@@ -2034,14 +2087,77 @@ class SingleGreenCurvePlanner:
         return tangents
 
     @staticmethod
-    def _window_ratios(
+    def _build_mask_cache(
+        yellow: np.ndarray,
+        green: np.ndarray,
+        valid_mask: np.ndarray,
+    ) -> _SingleGreenMaskCache:
+        valid = np.asarray(valid_mask, dtype=bool)
+        all_valid = bool(np.all(valid))
+        yellow_max = cv2.minMaxLoc(yellow)[1]
+        green_max = cv2.minMaxLoc(green)[1]
+        if yellow_max in (0.0, 1.0, 255.0):
+            yellow_active = yellow
+            yellow_scale = max(1.0, yellow_max)
+        else:
+            yellow_active = cv2.threshold(
+                yellow, 0, 1, cv2.THRESH_BINARY
+            )[1]
+            yellow_scale = 1.0
+        if green_max in (0.0, 1.0, 255.0):
+            green_active = green
+            green_scale = max(1.0, green_max)
+        else:
+            green_active = cv2.threshold(
+                green, 0, 1, cv2.THRESH_BINARY
+            )[1]
+            green_scale = 1.0
+        if not all_valid:
+            valid_uint8 = valid.astype(np.uint8, copy=False)
+            yellow_active = cv2.bitwise_and(
+                yellow_active, yellow_active, mask=valid_uint8
+            )
+            green_active = cv2.bitwise_and(
+                green_active, green_active, mask=valid_uint8
+            )
+        return _SingleGreenMaskCache(
+            yellow=yellow_active,
+            green=green_active,
+            valid=valid,
+            yellow_integral=None,
+            green_integral=None,
+            valid_integral=None,
+            yellow_scale=yellow_scale,
+            green_scale=green_scale,
+            all_valid=all_valid,
+        )
+
+    @staticmethod
+    def _integral_count(
+        integral: np.ndarray,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+    ) -> int:
+        return int(
+            integral[y1, x1]
+            - integral[y0, x1]
+            - integral[y1, x0]
+            + integral[y0, x0]
+        )
+
+    @classmethod
+    def _window_stats(
+        cls,
         yellow: np.ndarray,
         green: np.ndarray,
         valid_mask: np.ndarray,
         pixel_x: float,
         pixel_y: float,
         radius: int,
-    ) -> Tuple[float, float]:
+        mask_cache: Optional[_SingleGreenMaskCache] = None,
+    ) -> Tuple[float, float, float]:
         x = int(round(pixel_x))
         y = int(round(pixel_y))
         x0 = max(0, x - radius)
@@ -2049,48 +2165,173 @@ class SingleGreenCurvePlanner:
         y0 = max(0, y - radius)
         y1 = min(yellow.shape[0], y + radius + 1)
         if x0 >= x1 or y0 >= y1:
-            return 0.0, 0.0
-        valid = valid_mask[y0:y1, x0:x1]
-        valid_count = int(np.count_nonzero(valid))
+            return 0.0, 0.0, 0.0
+        if mask_cache is not None:
+            integral_height = (
+                mask_cache.yellow_integral.shape[0] - 1
+                if mask_cache.yellow_integral is not None
+                else 0
+            )
+            integral_width = (
+                mask_cache.yellow_integral.shape[1] - 1
+                if mask_cache.yellow_integral is not None
+                else 0
+            )
+            origin_x = mask_cache.integral_origin_x
+            origin_y = mask_cache.integral_origin_y
+            if (
+                mask_cache.yellow_integral is None
+                or x0 < origin_x
+                or y0 < origin_y
+                or x1 > origin_x + integral_width
+                or y1 > origin_y + integral_height
+            ):
+                mask_cache.yellow_integral = cv2.integral(
+                    mask_cache.yellow, sdepth=cv2.CV_32S
+                )
+                mask_cache.green_integral = cv2.integral(
+                    mask_cache.green, sdepth=cv2.CV_32S
+                )
+                mask_cache.valid_integral = (
+                    None
+                    if mask_cache.all_valid
+                    else cv2.integral(
+                        mask_cache.valid.astype(np.uint8, copy=False),
+                        sdepth=cv2.CV_32S,
+                    )
+                )
+                mask_cache.integral_origin_x = 0
+                mask_cache.integral_origin_y = 0
+                origin_x = 0
+                origin_y = 0
+            ix0 = x0 - origin_x
+            ix1 = x1 - origin_x
+            iy0 = y0 - origin_y
+            iy1 = y1 - origin_y
+            integral = mask_cache.valid_integral
+            if integral is None:
+                valid_count = (x1 - x0) * (y1 - y0)
+            else:
+                valid_count = int(
+                    integral[iy1, ix1] - integral[iy0, ix1]
+                    - integral[iy1, ix0] + integral[iy0, ix0]
+                )
+            integral = mask_cache.yellow_integral
+            yellow_count = int(
+                integral[iy1, ix1] - integral[iy0, ix1]
+                - integral[iy1, ix0] + integral[iy0, ix0]
+            ) / mask_cache.yellow_scale
+            integral = mask_cache.green_integral
+            green_count = int(
+                integral[iy1, ix1] - integral[iy0, ix1]
+                - integral[iy1, ix0] + integral[iy0, ix0]
+            ) / mask_cache.green_scale
+        else:
+            valid = valid_mask[y0:y1, x0:x1]
+            valid_count = int(np.count_nonzero(valid))
+            yellow_count = int(np.count_nonzero(
+                (yellow[y0:y1, x0:x1] > 0) & valid
+            ))
+            green_count = int(np.count_nonzero(
+                (green[y0:y1, x0:x1] > 0) & valid
+            ))
         if not valid_count:
-            return 0.0, 0.0
-        yellow_count = int(np.count_nonzero(
-            (yellow[y0:y1, x0:x1] > 0) & valid
-        ))
-        green_count = int(np.count_nonzero(
-            (green[y0:y1, x0:x1] > 0) & valid
-        ))
+            return 0.0, 0.0, 0.0
         inverse_count = 1.0 / valid_count
         return (
             yellow_count * inverse_count,
             green_count * inverse_count,
+            valid_count / float((x1 - x0) * (y1 - y0)),
         )
 
-    @staticmethod
+    @classmethod
+    def _window_ratios(
+        cls,
+        yellow: np.ndarray,
+        green: np.ndarray,
+        valid_mask: np.ndarray,
+        pixel_x: float,
+        pixel_y: float,
+        radius: int,
+        mask_cache: Optional[_SingleGreenMaskCache] = None,
+    ) -> Tuple[float, float]:
+        yellow_ratio, green_ratio, _valid_ratio = cls._window_stats(
+            yellow,
+            green,
+            valid_mask,
+            pixel_x,
+            pixel_y,
+            radius,
+            mask_cache,
+        )
+        return yellow_ratio, green_ratio
+
+    @classmethod
     def _segment_green_ratio(
+        cls,
         boundary_pixel: Tuple[float, float],
         center_pixel: Tuple[float, float],
         green: np.ndarray,
         valid_mask: np.ndarray,
+        mask_cache: Optional[_SingleGreenMaskCache] = None,
     ) -> float:
+        height, width = green.shape
+        boundary_x = float(boundary_pixel[0])
+        boundary_y = float(boundary_pixel[1])
+        delta_x = float(center_pixel[0]) - boundary_x
+        delta_y = float(center_pixel[1]) - boundary_y
+        cached_green = mask_cache.green if mask_cache is not None else None
+        cached_valid = mask_cache.valid if mask_cache is not None else None
+        if cached_valid is not None and delta_y == 0.0:
+            y = int(round(boundary_y))
+            if not 0 <= y < height:
+                return 1.0
+            x0 = int(round(boundary_x + 0.20 * delta_x))
+            x1 = int(round(boundary_x + 0.36 * delta_x))
+            x2 = int(round(boundary_x + 0.52 * delta_x))
+            x3 = int(round(boundary_x + 0.68 * delta_x))
+            x4 = int(round(boundary_x + 0.84 * delta_x))
+            x5 = int(round(boundary_x + delta_x))
+            valid_row = cached_valid[y]
+            green_row = cached_green[y]
+            valid0 = 0 <= x0 < width and bool(valid_row[x0])
+            valid1 = 0 <= x1 < width and bool(valid_row[x1])
+            valid2 = 0 <= x2 < width and bool(valid_row[x2])
+            valid3 = 0 <= x3 < width and bool(valid_row[x3])
+            valid4 = 0 <= x4 < width and bool(valid_row[x4])
+            valid5 = 0 <= x5 < width and bool(valid_row[x5])
+            valid_count = sum((valid0, valid1, valid2, valid3, valid4, valid5))
+            if not valid_count:
+                return 1.0
+            green_count = (
+                int(valid0 and green_row[x0])
+                + int(valid1 and green_row[x1])
+                + int(valid2 and green_row[x2])
+                + int(valid3 and green_row[x3])
+                + int(valid4 and green_row[x4])
+                + int(valid5 and green_row[x5])
+            )
+            return green_count / valid_count
         valid_count = 0
         green_count = 0
-        for ratio in SingleGreenCurvePlanner.SEGMENT_RATIOS:
-            x = int(round(
-                boundary_pixel[0]
-                + ratio * (center_pixel[0] - boundary_pixel[0])
-            ))
-            y = int(round(
-                boundary_pixel[1]
-                + ratio * (center_pixel[1] - boundary_pixel[1])
-            ))
+        for ratio in cls.SEGMENT_RATIOS:
+            x = int(round(boundary_x + ratio * delta_x))
+            y = int(round(boundary_y + ratio * delta_y))
             if (
-                0 <= y < green.shape[0]
-                and 0 <= x < green.shape[1]
-                and valid_mask[y, x]
+                0 <= y < height
+                and 0 <= x < width
+                and (
+                    bool(cached_valid[y, x])
+                    if cached_valid is not None
+                    else bool(valid_mask[y, x])
+                )
             ):
                 valid_count += 1
-                green_count += int(green[y, x] > 0)
+                green_count += int(
+                    cached_green[y, x]
+                    if cached_green is not None
+                    else green[y, x] > 0
+                )
         return green_count / valid_count if valid_count else 1.0
 
     @classmethod
@@ -2178,6 +2419,8 @@ class SingleGreenCurvePlanner:
         config: YellowCorridorConfig,
         half_width_m: float,
         boundary_pixel_x: float,
+        mask_cache: Optional[_SingleGreenMaskCache] = None,
+        station_index: int = -1,
     ) -> None:
         x = int(round(pixel_x))
         y = int(pixel_y)
@@ -2187,14 +2430,22 @@ class SingleGreenCurvePlanner:
             or not valid_mask[y, x]
         ):
             return
+        source_cost = float(cls.DP_WEIGHTS[source_type])
+        for existing in candidates:
+            if (
+                existing["pixel_x"] == float(x)
+                and source_cost >= existing["source_cost"]
+            ):
+                return
         is_dual_anchor = source_type == "anchor_dual"
-        yellow_ratio, green_ratio = cls._window_ratios(
+        yellow_ratio, green_ratio, valid_ratio = cls._window_stats(
             yellow,
             green,
             valid_mask,
             float(x),
             float(y),
             config.single_green_center_yellow_window_px,
+            mask_cache,
         )
         if green_ratio > config.single_green_center_max_green_ratio:
             return
@@ -2207,6 +2458,7 @@ class SingleGreenCurvePlanner:
             (float(x), float(y)),
             green,
             valid_mask,
+            mask_cache,
         ) > 0.35:
             return
         meter_per_pixel = float(ipm.meter_per_pixel)
@@ -2239,6 +2491,13 @@ class SingleGreenCurvePlanner:
             "source_type": source_type,
             "yellow_ratio": float(yellow_ratio),
             "green_ratio": float(green_ratio),
+            "valid_ratio": float(valid_ratio),
+            "width_error": float(width_error),
+            "normal_prior_distance": float(
+                abs(float(x) - normal_prior_x) * meter_per_pixel
+            ),
+            "source_cost": source_cost,
+            "station_index": int(station_index),
             "candidate_cost": float(cost),
         }
         for index, existing in enumerate(candidates):
@@ -2335,6 +2594,7 @@ class SingleGreenCurvePlanner:
         geometry_config: Any,
         status: Dict[str, Any],
         collect_debug: bool,
+        mask_cache: _SingleGreenMaskCache,
     ) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
         started = time.perf_counter()
         status["single_green_dp_attempted"] = True
@@ -2352,6 +2612,42 @@ class SingleGreenCurvePlanner:
             "yellow_center": 0,
             "yellow_peak": 0,
         }
+        sample_rows = [
+            int(round(float(samples[int(item["sample_index"])]["y"])))
+            for item in chain
+        ]
+        unique_rows = list(dict.fromkeys(
+            y for y in sample_rows if 0 <= y < yellow.shape[0]
+        ))
+        interval_cache: Dict[int, Sequence[Tuple[int, int]]] = {
+            y: [] for y in unique_rows
+        }
+        row_pattern_cache: Dict[bytes, Tuple[Tuple[int, int], ...]] = {}
+        for y in unique_rows:
+            row = yellow[y]
+            row_key = row.tobytes()
+            intervals = row_pattern_cache.get(row_key)
+            if intervals is None:
+                active = row > 0
+                changes = np.flatnonzero(active[1:] != active[:-1]) + 1
+                starts: List[int] = [0] if active[0] else []
+                ends: List[int] = []
+                for column_value in changes:
+                    column = int(column_value)
+                    if active[column]:
+                        starts.append(column)
+                    else:
+                        ends.append(column - 1)
+                if active[-1]:
+                    ends.append(len(active) - 1)
+                intervals = tuple(zip(starts, ends))
+                row_pattern_cache[row_key] = intervals
+            interval_cache[y] = intervals
+
+        station_builds: List[Dict[str, Any]] = []
+        proposal_station: List[int] = []
+        proposal_x: List[float] = []
+        proposal_source: List[str] = []
         for chain_index, chain_item in enumerate(chain):
             sample_index = int(chain_item["sample_index"])
             source = samples[sample_index]
@@ -2370,105 +2666,288 @@ class SingleGreenCurvePlanner:
             boundary_pixel_x = (
                 vehicle_center_x - boundary_left_m * inverse_meter_per_pixel
             )
-            candidates: List[Dict[str, Any]] = []
-            if source.get("left") is not None and source.get("right") is not None:
-                cls._dp_add_candidate(
-                    candidates,
-                    0.5 * (float(source["left"]) + float(source["right"])),
-                    y,
-                    forward_m,
-                    boundary_left_m,
-                    normal_prior_x,
-                    "anchor_dual",
-                    yellow,
-                    green,
-                    valid_mask,
-                    ipm,
-                    config,
-                    half_width,
-                    boundary_pixel_x,
+            station_builds.append({
+                "chain_index": chain_index,
+                "sample_index": sample_index,
+                "forward_m": forward_m,
+                "boundary_left_m": boundary_left_m,
+                "normal_prior_x": normal_prior_x,
+                "boundary_pixel_x": boundary_pixel_x,
+                "pixel_y": y,
+                "has_dual": bool(
+                    source.get("left") is not None
+                    and source.get("right") is not None
+                ),
+                "candidates": [],
+            })
+            station_build_index = len(station_builds) - 1
+            if station_builds[-1]["has_dual"]:
+                proposal_station.append(station_build_index)
+                proposal_x.append(
+                    0.5 * (float(source["left"]) + float(source["right"]))
                 )
-            if candidates:
-                candidates = [
-                    min(candidates, key=lambda item: item["candidate_cost"])
-                ]
-            else:
-                if source.get("center") is not None:
-                    cls._dp_add_candidate(
-                        candidates,
-                        float(source["center"]),
-                        y,
-                        forward_m,
-                        boundary_left_m,
-                        normal_prior_x,
-                        "anchor_hybrid",
-                        yellow,
-                        green,
-                        valid_mask,
-                        ipm,
-                        config,
-                        half_width,
-                        boundary_pixel_x,
-                    )
-                cls._dp_add_candidate(
-                    candidates,
-                    normal_prior_x,
-                    y,
-                    forward_m,
-                    boundary_left_m,
-                    normal_prior_x,
-                    "normal",
-                    yellow,
-                    green,
-                    valid_mask,
-                    ipm,
-                    config,
-                    half_width,
-                    boundary_pixel_x,
-                )
+                proposal_source.append("anchor_dual")
+            if source.get("center") is not None:
+                proposal_station.append(station_build_index)
+                proposal_x.append(float(source["center"]))
+                proposal_source.append("anchor_hybrid")
+            proposal_station.append(station_build_index)
+            proposal_x.append(normal_prior_x)
+            proposal_source.append("normal")
+            intervals = interval_cache.get(y, ())
+            if len(intervals) > 2:
                 intervals = sorted(
-                    YellowCorridorPlanner._intervals(yellow[y]),
+                    intervals,
                     key=lambda interval: abs(
                         0.5 * (interval[0] + interval[1]) - normal_prior_x
                     ),
                 )[:2]
-                for interval_left, interval_right in intervals:
-                    interval_width = interval_right - interval_left + 1
-                    interval_center = 0.5 * (interval_left + interval_right)
-                    cls._dp_add_candidate(
-                        candidates,
-                        interval_center,
-                        y,
-                        forward_m,
-                        boundary_left_m,
-                        normal_prior_x,
-                        "yellow_center",
-                        yellow,
-                        green,
-                        valid_mask,
-                        ipm,
-                        config,
-                        half_width,
-                        boundary_pixel_x,
+            for interval_left, interval_right in intervals:
+                interval_width = interval_right - interval_left + 1
+                proposal_station.append(station_build_index)
+                proposal_x.append(0.5 * (interval_left + interval_right))
+                proposal_source.append("yellow_center")
+                if interval_width >= 10:
+                    for ratio in (0.35, 0.65):
+                        proposal_station.append(station_build_index)
+                        proposal_x.append(
+                            interval_left + ratio * (interval_width - 1)
+                        )
+                        proposal_source.append("yellow_peak")
+
+        if proposal_x:
+            station_indices = np.asarray(proposal_station, dtype=np.intp)
+            pixel_x = np.rint(np.asarray(proposal_x)).astype(np.intp)
+            station_pixel_y = np.fromiter(
+                (item["pixel_y"] for item in station_builds),
+                dtype=np.intp,
+                count=len(station_builds),
+            )
+            station_boundary_pixel_x = np.fromiter(
+                (item["boundary_pixel_x"] for item in station_builds),
+                dtype=np.float64,
+                count=len(station_builds),
+            )
+            station_boundary_left_m = np.fromiter(
+                (item["boundary_left_m"] for item in station_builds),
+                dtype=np.float64,
+                count=len(station_builds),
+            )
+            station_normal_prior_x = np.fromiter(
+                (item["normal_prior_x"] for item in station_builds),
+                dtype=np.float64,
+                count=len(station_builds),
+            )
+            station_forward = np.fromiter(
+                (item["forward_m"] for item in station_builds),
+                dtype=np.float64,
+                count=len(station_builds),
+            )
+            pixel_y = station_pixel_y[station_indices]
+            boundary_pixel_x = station_boundary_pixel_x[station_indices]
+            boundary_left_m = station_boundary_left_m[station_indices]
+            normal_prior_x = station_normal_prior_x[station_indices]
+            forward_values = station_forward[station_indices]
+            height, width = yellow.shape
+            in_bounds = (
+                (pixel_y >= 0) & (pixel_y < height)
+                & (pixel_x >= 0) & (pixel_x < width)
+            )
+            safe_x = np.clip(pixel_x, 0, width - 1)
+            safe_y = np.clip(pixel_y, 0, height - 1)
+            center_valid = (
+                in_bounds
+                if mask_cache.all_valid
+                else in_bounds & mask_cache.valid[safe_y, safe_x]
+            )
+            radius = config.single_green_center_yellow_window_px
+            x0 = np.maximum(0, safe_x - radius)
+            x1 = np.minimum(width, safe_x + radius + 1)
+            y0 = np.maximum(0, safe_y - radius)
+            y1 = np.minimum(height, safe_y + radius + 1)
+            integral_origin_x = int(np.min(x0))
+            integral_end_x = int(np.max(x1))
+            integral_origin_y = int(np.min(y0))
+            integral_end_y = int(np.max(y1))
+            mask_cache.integral_origin_x = integral_origin_x
+            mask_cache.integral_origin_y = integral_origin_y
+            mask_cache.yellow_integral = cv2.integral(
+                mask_cache.yellow[
+                    integral_origin_y:integral_end_y,
+                    integral_origin_x:integral_end_x,
+                ],
+                sdepth=cv2.CV_32S,
+            )
+            mask_cache.green_integral = cv2.integral(
+                mask_cache.green[
+                    integral_origin_y:integral_end_y,
+                    integral_origin_x:integral_end_x,
+                ],
+                sdepth=cv2.CV_32S,
+            )
+            mask_cache.valid_integral = (
+                None
+                if mask_cache.all_valid
+                else cv2.integral(
+                    mask_cache.valid[
+                        integral_origin_y:integral_end_y,
+                        integral_origin_x:integral_end_x,
+                    ].astype(np.uint8, copy=False),
+                    sdepth=cv2.CV_32S,
+                )
+            )
+            integral_x0 = x0 - integral_origin_x
+            integral_x1 = x1 - integral_origin_x
+            integral_y0 = y0 - integral_origin_y
+            integral_y1 = y1 - integral_origin_y
+
+            def rectangle_counts(integral: np.ndarray) -> np.ndarray:
+                return (
+                    integral[integral_y1, integral_x1]
+                    - integral[integral_y0, integral_x1]
+                    - integral[integral_y1, integral_x0]
+                    + integral[integral_y0, integral_x0]
+                )
+
+            valid_counts = (
+                (x1 - x0) * (y1 - y0)
+                if mask_cache.all_valid
+                else rectangle_counts(mask_cache.valid_integral)
+            )
+            yellow_counts = (
+                rectangle_counts(mask_cache.yellow_integral)
+                / mask_cache.yellow_scale
+            )
+            green_counts = (
+                rectangle_counts(mask_cache.green_integral)
+                / mask_cache.green_scale
+            )
+            inverse_valid = 1.0 / np.maximum(valid_counts, 1)
+            yellow_ratios_all = yellow_counts * inverse_valid
+            green_ratios_all = green_counts * inverse_valid
+            valid_ratios_all = valid_counts / (
+                (x1 - x0) * (y1 - y0)
+            )
+            sample_ratios = np.asarray(cls.SEGMENT_RATIOS, dtype=np.float64)
+            segment_x = np.rint(
+                boundary_pixel_x[:, None]
+                + (pixel_x - boundary_pixel_x)[:, None] * sample_ratios
+            ).astype(np.intp)
+            segment_in_bounds = (segment_x >= 0) & (segment_x < width)
+            safe_segment_x = np.clip(segment_x, 0, width - 1)
+            segment_y = safe_y[:, None]
+            segment_valid = (
+                segment_in_bounds
+                if mask_cache.all_valid
+                else segment_in_bounds & mask_cache.valid[
+                    segment_y, safe_segment_x
+                ]
+            )
+            segment_valid_counts = np.count_nonzero(segment_valid, axis=1)
+            segment_green_counts = np.count_nonzero(
+                segment_valid & mask_cache.green[segment_y, safe_segment_x],
+                axis=1,
+            )
+            segment_green_ratios = segment_green_counts / np.maximum(
+                segment_valid_counts, 1
+            )
+            segment_green_ratios[segment_valid_counts == 0] = 1.0
+            candidate_left_m = (vehicle_center_x - pixel_x) * meter_per_pixel
+            width_errors = np.abs(
+                np.abs(candidate_left_m - boundary_left_m) - half_width
+            )
+            inverse_half_width = 1.0 / max(half_width, 1.0e-6)
+            width_error_ratios = width_errors * inverse_half_width
+            normal_distances = np.abs(pixel_x - normal_prior_x) * meter_per_pixel
+            normal_distance_ratios = normal_distances * inverse_half_width
+            source_costs = np.asarray(
+                [cls.DP_WEIGHTS[source] for source in proposal_source],
+                dtype=np.float64,
+            )
+            is_dual_anchor = np.asarray(
+                [source == "anchor_dual" for source in proposal_source],
+                dtype=bool,
+            )
+            accepted_mask = (
+                center_valid
+                & (valid_counts > 0)
+                & (green_ratios_all <= config.single_green_center_max_green_ratio)
+                & (
+                    is_dual_anchor
+                    | (
+                        mask_cache.yellow[safe_y, safe_x]
+                        & (yellow_ratios_all >= cls.DP_MIN_YELLOW_RATIO)
+                        & (segment_green_ratios <= 0.35)
+                        & (
+                            width_errors
+                            <= max(0.18, half_width * 0.72)
+                        )
                     )
-                    if interval_width >= 10:
-                        for ratio in (0.35, 0.65):
-                            cls._dp_add_candidate(
-                                candidates,
-                                interval_left + ratio * (interval_width - 1),
-                                y,
-                                forward_m,
-                                boundary_left_m,
-                                normal_prior_x,
-                                "yellow_peak",
-                                yellow,
-                                green,
-                                valid_mask,
-                                ipm,
-                                config,
-                                half_width,
-                                boundary_pixel_x,
-                            )
+                )
+            )
+            non_dual = ~is_dual_anchor
+            status["single_green_curve_reject_green_intrusion_count"] += int(
+                np.count_nonzero(
+                    non_dual
+                    & center_valid
+                    & (
+                        (green_ratios_all
+                         > config.single_green_center_max_green_ratio)
+                        | (segment_green_ratios > 0.35)
+                    )
+                )
+            )
+            candidate_costs = (
+                cls.DP_WEIGHTS["yellow"] * (1.0 - yellow_ratios_all)
+                + cls.DP_WEIGHTS["green"] * green_ratios_all
+                + cls.DP_WEIGHTS["width"] * np.minimum(width_error_ratios, 2.0)
+                + cls.DP_WEIGHTS["normal_prior"]
+                * np.minimum(normal_distance_ratios, 2.0)
+                + source_costs
+            )
+            for proposal_index in np.flatnonzero(accepted_mask):
+                station_index = int(station_indices[proposal_index])
+                candidate = {
+                    "pixel_x": float(pixel_x[proposal_index]),
+                    "pixel_y": float(pixel_y[proposal_index]),
+                    "forward_m": float(forward_values[proposal_index]),
+                    "left_m": float(candidate_left_m[proposal_index]),
+                    "source_type": proposal_source[proposal_index],
+                    "yellow_ratio": float(yellow_ratios_all[proposal_index]),
+                    "green_ratio": float(green_ratios_all[proposal_index]),
+                    "valid_ratio": float(valid_ratios_all[proposal_index]),
+                    "width_error": float(width_errors[proposal_index]),
+                    "normal_prior_distance": float(normal_distances[proposal_index]),
+                    "source_cost": float(source_costs[proposal_index]),
+                    "station_index": station_index,
+                    "candidate_cost": float(candidate_costs[proposal_index]),
+                }
+                candidates = station_builds[station_index]["candidates"]
+                if candidate["source_type"] == "anchor_dual":
+                    candidates.append(candidate)
+                    continue
+                for existing_index, existing in enumerate(candidates):
+                    if existing["source_type"] == "anchor_dual":
+                        continue
+                    if abs(existing["pixel_x"] - candidate["pixel_x"]) <= (
+                        cls.DP_DEDUPLICATE_PX
+                    ):
+                        if candidate["candidate_cost"] < existing["candidate_cost"]:
+                            candidates[existing_index] = candidate
+                        break
+                else:
+                    candidates.append(candidate)
+
+        for station_build in station_builds:
+            sample_index = int(station_build["sample_index"])
+            candidates = station_build["candidates"]
+            dual_candidates = [
+                item for item in candidates if item["source_type"] == "anchor_dual"
+            ]
+            if dual_candidates:
+                candidates = [
+                    min(dual_candidates, key=lambda item: item["candidate_cost"])
+                ]
             candidates.sort(key=lambda item: item["candidate_cost"])
             candidates = candidates[: cls.DP_MAX_CANDIDATES_PER_STATION]
             for candidate in candidates:
@@ -2478,13 +2957,16 @@ class SingleGreenCurvePlanner:
                 status["single_green_dp_candidate_count_max"], len(candidates)
             )
             if collect_debug:
+                y = int(station_build["pixel_y"])
+                boundary_pixel_x_value = float(station_build["boundary_pixel_x"])
+                normal_prior_x_value = float(station_build["normal_prior_x"])
                 debug_by_sample[sample_index] = {
                     "sample_index": sample_index,
                     "side": side,
-                    "boundary_pixel": (boundary_pixel_x, float(y)),
-                    "smoothed_pixel": (boundary_pixel_x, float(y)),
-                    "center_pixel": (normal_prior_x, float(y)),
-                    "normal_prior_pixel": (normal_prior_x, float(y)),
+                    "boundary_pixel": (boundary_pixel_x_value, float(y)),
+                    "smoothed_pixel": (boundary_pixel_x_value, float(y)),
+                    "center_pixel": (normal_prior_x_value, float(y)),
+                    "normal_prior_pixel": (normal_prior_x_value, float(y)),
                     "normal_sign": int(expected_sign),
                     "normal_selection_reason": "shared_corridor_dp",
                     "accepted": False,
@@ -2502,9 +2984,9 @@ class SingleGreenCurvePlanner:
             if candidates:
                 stations.append(
                     {
-                        "chain_index": chain_index,
+                        "chain_index": int(station_build["chain_index"]),
                         "sample_index": sample_index,
-                        "forward_m": forward_m,
+                        "forward_m": float(station_build["forward_m"]),
                         "candidates": candidates,
                     }
                 )
@@ -2531,15 +3013,20 @@ class SingleGreenCurvePlanner:
             return {}, list(debug_by_sample.values())
         groups: List[List[Dict[str, Any]]] = []
         group: List[Dict[str, Any]] = []
-        for station in stations:
-            if (
-                group
-                and cls._dp_station_gap_count(
-                    group[-1]["forward_m"],
+        for station_index, station in enumerate(stations):
+            gap_from_previous = (
+                cls._dp_station_gap_count(
+                    stations[station_index - 1]["forward_m"],
                     station["forward_m"],
                     config.sample_step_m,
                 )
-                > cls.DP_MAX_INTERNAL_GAP_STATIONS
+                if station_index
+                else 0
+            )
+            station["gap_from_previous"] = gap_from_previous
+            if (
+                group
+                and gap_from_previous > cls.DP_MAX_INTERNAL_GAP_STATIONS
             ):
                 groups.append(group)
                 group = []
@@ -2560,67 +3047,218 @@ class SingleGreenCurvePlanner:
                 time.perf_counter() - started
             ) * 1000.0
             return {}, list(debug_by_sample.values())
-        states: Dict[Tuple[int, int], Dict[str, Any]] = {}
-        for candidate_index, candidate in enumerate(
-            selected_stations[0]["candidates"]
-        ):
-            states[(-1, candidate_index)] = {
-                "cost": float(candidate["candidate_cost"]),
-                "path": [candidate_index],
-                "transition_total": 0.0,
-            }
+        weights = cls.DP_WEIGHTS
+        heading_scale = 1.0 / math.radians(35.0)
+        curvature_scale = 1.0 / math.radians(30.0)
+        max_heading_change = math.radians(85.0)
+        transition_tables: List[
+            List[List[Optional[Tuple[float, float, float]]]]
+        ] = []
+        gap_counts: List[int] = []
         for station_index in range(1, len(selected_stations)):
             current_station = selected_stations[station_index]
             previous_station = selected_stations[station_index - 1]
-            gap_count = cls._dp_station_gap_count(
-                previous_station["forward_m"],
-                current_station["forward_m"],
-                config.sample_step_m,
+            gap_count = int(current_station["gap_from_previous"])
+            gap_counts.append(gap_count)
+            delta_forward = float(
+                current_station["forward_m"] - previous_station["forward_m"]
             )
-            next_states: Dict[Tuple[int, int], Dict[str, Any]] = {}
-            for (previous_previous_index, previous_index), record in states.items():
-                previous = previous_station["candidates"][previous_index]
-                previous_previous = None
-                if station_index >= 2 and previous_previous_index >= 0:
-                    previous_previous = selected_stations[station_index - 2][
-                        "candidates"
-                    ][previous_previous_index]
-                for current_index, current in enumerate(
-                    current_station["candidates"]
+            if station_index > 1:
+                earlier_station = selected_stations[station_index - 2]
+                earlier_gap = gap_counts[-2]
+                earlier_delta_forward = float(
+                    previous_station["forward_m"]
+                    - earlier_station["forward_m"]
+                )
+                earlier_candidates = earlier_station["candidates"]
+                previous_candidates = previous_station["candidates"]
+                current_candidates = current_station["candidates"]
+                if (
+                    gap_count == earlier_gap
+                    and delta_forward == earlier_delta_forward
+                    and len(earlier_candidates) == len(previous_candidates)
+                    and len(previous_candidates) == len(current_candidates)
+                    and all(
+                        earlier["left_m"] == previous["left_m"]
+                        and previous["left_m"] == current["left_m"]
+                        for earlier, previous, current in zip(
+                            earlier_candidates,
+                            previous_candidates,
+                            current_candidates,
+                        )
+                    )
                 ):
-                    transition = cls._dp_transition_cost(
-                        previous_previous,
-                        previous,
-                        current,
-                        gap_count,
-                    )
-                    if transition is None:
+                    transition_tables.append(transition_tables[-1])
+                    continue
+            allowed_step = cls.DP_MAX_LATERAL_STEP_M * max(1, gap_count + 1)
+            lateral_denominator = max(0.10 * (gap_count + 1), 1.0e-6)
+            table: List[List[Optional[Tuple[float, float, float]]]] = []
+            for previous in previous_station["candidates"]:
+                row: List[Optional[Tuple[float, float, float]]] = []
+                previous_left = float(previous["left_m"])
+                for current in current_station["candidates"]:
+                    delta_left = float(current["left_m"]) - previous_left
+                    if delta_forward <= 1.0e-6 or abs(delta_left) > allowed_step:
+                        row.append(None)
                         continue
-                    total_cost = (
-                        record["cost"]
-                        + current["candidate_cost"]
-                        + transition
+                    heading = math.atan2(delta_left, delta_forward)
+                    base_cost = (
+                        weights["transition_lateral"]
+                        * (abs(delta_left) / lateral_denominator) ** 2
+                        + weights["transition_heading"]
+                        * (abs(heading) * heading_scale) ** 2
+                        + weights["transition_gap"] * gap_count
                     )
-                    key = (previous_index, current_index)
-                    if key not in next_states or total_cost < next_states[key]["cost"]:
-                        next_states[key] = {
-                            "cost": float(total_cost),
-                            "path": record["path"] + [current_index],
-                            "transition_total": (
-                                record["transition_total"] + transition
-                            ),
-                        }
-            if not next_states:
+                    row.append((float(base_cost), heading, delta_left))
+                table.append(row)
+            transition_tables.append(table)
+
+        first_table = transition_tables[0]
+        first_previous = selected_stations[0]["candidates"]
+        first_current = selected_stations[1]["candidates"]
+        state_costs = [
+            [math.inf] * len(first_current) for _ in first_previous
+        ]
+        for previous_index, row in enumerate(first_table):
+            for current_index, transition_data in enumerate(row):
+                if transition_data is None:
+                    continue
+                transition = transition_data[0]
+                state_costs[previous_index][current_index] = (
+                    first_previous[previous_index]["candidate_cost"]
+                    + first_current[current_index]["candidate_cost"]
+                    + transition
+                )
+        if not any(cost != math.inf for row in state_costs for cost in row):
+            status["single_green_dp_failure_reason"] = "transition_disconnected"
+            status["single_green_dp_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+            return {}, list(debug_by_sample.values())
+        parent_layers: List[List[List[int]]] = []
+        curvature_weight = weights["transition_curvature"]
+        reversal_weight = weights["transition_reversal"]
+        for station_index in range(2, len(selected_stations)):
+            current_candidates = selected_stations[station_index]["candidates"]
+            current_candidate_costs = [
+                item["candidate_cost"] for item in current_candidates
+            ]
+            current_table = transition_tables[station_index - 1]
+            previous_table = transition_tables[station_index - 2]
+            previous_previous_count = len(previous_table)
+            previous_count = len(current_table)
+            current_count = len(current_candidates)
+            next_costs = [
+                [math.inf] * current_count for _ in range(previous_count)
+            ]
+            parents = [[-1] * current_count for _ in range(previous_count)]
+            for previous_index in range(previous_count):
+                current_transition_row = current_table[previous_index]
+                for current_index, current_transition in enumerate(
+                    current_transition_row
+                ):
+                    if current_transition is None:
+                        continue
+                    current_heading = current_transition[1]
+                    current_delta_left = current_transition[2]
+                    current_cost = current_candidate_costs[current_index]
+                    best_cost = math.inf
+                    best_parent = -1
+                    for previous_previous_index in range(
+                        previous_previous_count
+                    ):
+                        previous_cost = state_costs[
+                            previous_previous_index
+                        ][previous_index]
+                        if previous_cost == math.inf:
+                            continue
+                        previous_transition = previous_table[
+                            previous_previous_index
+                        ][previous_index]
+                        heading_change = abs(
+                            current_heading - previous_transition[1]
+                        )
+                        if heading_change > max_heading_change:
+                            continue
+                        transition = (
+                            current_transition[0]
+                            + curvature_weight
+                            * (heading_change * curvature_scale) ** 2
+                        )
+                        previous_delta_left = previous_transition[2]
+                        if (
+                            current_delta_left * previous_delta_left < 0.0
+                            and abs(current_delta_left) > 0.015
+                            and abs(previous_delta_left) > 0.015
+                        ):
+                            transition += reversal_weight
+                        total_cost = previous_cost + current_cost + transition
+                        if total_cost < best_cost:
+                            best_cost = total_cost
+                            best_parent = previous_previous_index
+                    next_costs[previous_index][current_index] = best_cost
+                    parents[previous_index][current_index] = best_parent
+            if not any(
+                cost != math.inf for row in next_costs for cost in row
+            ):
                 status["single_green_dp_failure_reason"] = "transition_disconnected"
                 status["single_green_dp_ms"] = (
                     time.perf_counter() - started
                 ) * 1000.0
                 return {}, list(debug_by_sample.values())
-            states = next_states
-        best = min(states.values(), key=lambda item: item["cost"])
+            parent_layers.append(parents)
+            state_costs = next_costs
+        best_cost = math.inf
+        best_previous = -1
+        best_current = -1
+        for previous_index, row in enumerate(state_costs):
+            for current_index, cost in enumerate(row):
+                if cost < best_cost:
+                    best_cost = cost
+                    best_previous = previous_index
+                    best_current = current_index
+        selected_indices = [0] * len(selected_stations)
+        selected_indices[-2] = best_previous
+        selected_indices[-1] = best_current
+        for station_index in range(len(selected_stations) - 1, 1, -1):
+            previous_previous = parent_layers[station_index - 2][
+                best_previous
+            ][best_current]
+            selected_indices[station_index - 2] = previous_previous
+            best_current = best_previous
+            best_previous = previous_previous
+        best_transition_total = transition_tables[0][
+            selected_indices[0]
+        ][selected_indices[1]][0]
+        for station_index in range(2, len(selected_stations)):
+            previous_transition = transition_tables[station_index - 2][
+                selected_indices[station_index - 2]
+            ][selected_indices[station_index - 1]]
+            current_transition = transition_tables[station_index - 1][
+                selected_indices[station_index - 1]
+            ][selected_indices[station_index]]
+            heading_change = abs(
+                current_transition[1] - previous_transition[1]
+            )
+            transition = (
+                current_transition[0]
+                + curvature_weight
+                * (heading_change * curvature_scale) ** 2
+            )
+            if (
+                current_transition[2] * previous_transition[2] < 0.0
+                and abs(current_transition[2]) > 0.015
+                and abs(previous_transition[2]) > 0.015
+            ):
+                transition += reversal_weight
+            best_transition_total += transition
+        best = {
+            "cost": float(best_cost),
+            "transition_total": float(best_transition_total),
+        }
         selected_candidates = [
             station["candidates"][candidate_index]
-            for station, candidate_index in zip(selected_stations, best["path"])
+            for station, candidate_index in zip(selected_stations, selected_indices)
         ]
         raw_points = np.asarray(
             [
@@ -2692,11 +3330,7 @@ class SingleGreenCurvePlanner:
             sample_index = int(station["sample_index"])
             candidate_cost_total += float(candidate["candidate_cost"])
             if index:
-                gap_total += cls._dp_station_gap_count(
-                    selected_stations[index - 1]["forward_m"],
-                    station["forward_m"],
-                    config.sample_step_m,
-                )
+                gap_total += gap_counts[index - 1]
             selected[sample_index] = {
                 "center_pixel": (float(point[0]), float(point[1])),
                 "center_metric": (
@@ -2857,6 +3491,73 @@ class SingleGreenCurvePlanner:
                 ),
             }
         )
+        mask_cache = cls._build_mask_cache(yellow, green, ipm_valid_mask)
+        dp_candidates, dp_debug = cls._run_corridor_dp(
+            samples,
+            chain,
+            smoothed,
+            tangents,
+            side,
+            lane_width,
+            yellow,
+            green,
+            ipm_valid_mask,
+            ipm,
+            config,
+            geometry_config,
+            status,
+            collect_debug,
+            mask_cache,
+        )
+        if dp_candidates:
+            selected_count = len(dp_candidates)
+            yellow_total = 0.0
+            green_total = 0.0
+            offset_total = 0.0
+            offset_square_total = 0.0
+            for item in dp_candidates.values():
+                yellow_total += float(item["yellow_ratio"])
+                green_total += float(item["green_ratio"])
+                offset = float(item["offset_distance_m"])
+                offset_total += offset
+                offset_square_total += offset * offset
+            inverse_selected = 1.0 / selected_count
+            yellow_mean = yellow_total * inverse_selected
+            green_mean = green_total * inverse_selected
+            offset_mean = offset_total * inverse_selected
+            offset_std = math.sqrt(max(
+                0.0,
+                offset_square_total * inverse_selected
+                - offset_mean * offset_mean,
+            ))
+            boundary_headings = [
+                math.degrees(math.atan2(float(item[1]), float(item[0])))
+                for item in tangents
+            ]
+            boundary_heading_mean, boundary_heading_std = cls._mean_std(
+                boundary_headings
+            )
+            status.update({
+                "single_green_curve_offset_used": True,
+                "single_green_curve_failure_reason": "valid",
+                "single_green_curve_candidate_count": len(chain),
+                "single_green_curve_accepted_count": len(dp_candidates),
+                "single_green_curve_rejected_count": max(
+                    0, len(chain) - len(dp_candidates)
+                ),
+                "single_green_yellow_support_ratio_mean": yellow_mean,
+                "single_green_green_intrusion_ratio_mean": green_mean,
+                "single_green_offset_distance_m_mean": offset_mean,
+                "single_green_offset_distance_m_std": offset_std,
+                "single_green_boundary_heading_deg_mean": boundary_heading_mean,
+                "single_green_boundary_heading_deg_std": boundary_heading_std,
+                "selected_normal_sign": -1 if side == "left" else 1,
+                "normal_selection_reason": "shared_corridor_dp",
+                "single_green_curve_offset_ms": (
+                    time.perf_counter() - started
+                ) * 1000.0,
+            })
+            return dp_candidates, status, dp_debug
         accepted: Dict[int, Dict[str, Any]] = {}
         yellow_ratios: List[float] = []
         green_ratios: List[float] = []
@@ -2955,13 +3656,14 @@ class SingleGreenCurvePlanner:
                     "single_green_curve_reject_offset_distance_count"
                 )
             if not reject_key:
-                yellow_ratio, green_ratio = cls._window_ratios(
+                yellow_ratio, green_ratio, _valid_ratio = cls._window_stats(
                     yellow,
                     green,
                     ipm_valid_mask,
                     center_pixel[0],
                     center_pixel[1],
                     radius,
+                    mask_cache,
                 )
                 if (
                     yellow_ratio
@@ -3013,6 +3715,7 @@ class SingleGreenCurvePlanner:
                     center_pixel,
                     green,
                     ipm_valid_mask,
+                    mask_cache,
                 )
                 if segment_green_ratio > 0.35:
                     reject_key = (
@@ -3104,27 +3807,6 @@ class SingleGreenCurvePlanner:
                 "single_green_center_heading_deg_std": center_heading_std,
             }
         )
-        dp_candidates, dp_debug = cls._run_corridor_dp(
-            samples,
-            chain,
-            smoothed,
-            tangents,
-            side,
-            lane_width,
-            yellow,
-            green,
-            ipm_valid_mask,
-            ipm,
-            config,
-            geometry_config,
-            status,
-            collect_debug,
-        )
-        if dp_candidates:
-            accepted = dp_candidates
-            debug = dp_debug
-            status["single_green_curve_offset_used"] = True
-            status["single_green_curve_failure_reason"] = "valid"
         status["single_green_curve_offset_ms"] = (
             time.perf_counter() - started
         ) * 1000.0
