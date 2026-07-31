@@ -165,7 +165,10 @@ stop_all() {
       local pid
       pid="$(cat "${pid_file}")"
       if pid_alive "${pid}"; then
-        kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+        # These ROS nodes raise shutdown tracebacks when SIGTERM invalidates
+        # their context while worker threads are still publishing.  They are
+        # isolated test process groups, so stop them atomically instead.
+        kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
       fi
     done
     for _attempt in 1 2 3 4 5; do
@@ -195,7 +198,7 @@ stop_all() {
     command="${residual#* }"
     case "${command}" in
       *lane_perception_pipeline.py*|*5_lane_path_controller.py*|*watch_controller_v2.py*|*watch_single_green_status.py*)
-        kill -TERM "${pid}" 2>/dev/null || true
+        kill -KILL "${pid}" 2>/dev/null || true
         ;;
     esac
   done < <(known_residuals)
