@@ -103,3 +103,33 @@ def test_failed_new_request():
     assert failed.text == "识别失败，请重试"
     assert "socket_timeout" not in failed.text
     assert state.current_event.text != "A"
+
+
+def test_clear_then_late_old_result_is_ignored():
+    state = reducer()
+    state.handle_result(result("A"))
+    state.handle_control_text('{"command":"clear"}')
+    assert state.handle_status(status("SUCCEEDED")) is None
+    assert state.handle_result(result("A")) is None
+    assert state.current_event.state == "WAITING"
+    assert state.current_event.text == "等待识别"
+
+
+def test_late_status_after_success_is_ignored():
+    state = reducer()
+    shown = state.handle_result(result("A"))
+    assert state.handle_status(status("ANALYZING")) is None
+    assert state.current_event == shown
+    assert state.current_event.text == "A"
+
+
+def test_stale_status_is_ignored():
+    state = reducer()
+    state.handle_status(status("VALIDATING"))
+    current = state.handle_status(
+        status("VALIDATING", "req-b", "event-b")
+    )
+    assert state.handle_status(status("VALIDATING")) is None
+    assert state.handle_status(status("ANALYZING")) is None
+    assert state.current_event == current
+    assert state.current_request_id == "req-b"

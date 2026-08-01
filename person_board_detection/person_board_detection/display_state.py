@@ -57,6 +57,13 @@ class DisplayStateReducer:
             return request_id in self._superseded_request_ids
         return bool(event_id and event_id in self._superseded_event_ids)
 
+    def _is_current_identity(self, event_id: str, request_id: str) -> bool:
+        if request_id:
+            return request_id == self.current_request_id
+        if event_id:
+            return event_id == self.current_event_id
+        return True
+
     def _adopt(self, event_id: str, request_id: str) -> None:
         if request_id and request_id != self.current_request_id:
             self._remember_current_as_superseded()
@@ -91,6 +98,12 @@ class DisplayStateReducer:
         if state in {"IDLE", "SUCCEEDED"}:
             return None
         if self._is_superseded(event_id, request_id):
+            return None
+        if (
+            self.current_event.state
+            in {"SHOWING_RESULT", "SHOWING_ERROR"}
+            and self._is_current_identity(event_id, request_id)
+        ):
             return None
         if state in ACTIVE_STATES:
             self._adopt(event_id, request_id)
