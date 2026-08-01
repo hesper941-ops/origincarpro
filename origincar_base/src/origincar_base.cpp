@@ -351,10 +351,10 @@ origincar_base::origincar_base()
   memset(&Send_Data, 0, sizeof(Send_Data));
   memset(&Mpu6050_Data, 0, sizeof(Mpu6050_Data));
 
-  // The connected STM32 firmware uses 115200 baud and a 24-byte feedback frame.
-  int serial_baud_rate = 115200;
+  // The connected STM32 firmware uses 921600 baud and a 24-byte feedback frame.
+  int serial_baud_rate = 921600;
 
-  this->declare_parameter<int>("serial_baud_rate", 115200);
+  this->declare_parameter<int>("serial_baud_rate", 921600);
   this->declare_parameter<std::string>("usart_port_name", "/dev/ttyACM0");
   this->declare_parameter<std::string>("cmd_vel", "cmd_vel");
   this->declare_parameter<std::string>("akm_cmd_vel", "ackermann_cmd");
@@ -412,7 +412,7 @@ void sigintHandler(int sig)
       printf("OriginBot shutdown...\n");
     serial::Serial Stm32_Serial;
     Stm32_Serial.setPort("/dev/ttyACM0");
-    Stm32_Serial.setBaudrate(115200);
+    Stm32_Serial.setBaudrate(921600);
     serial::Timeout _time = serial::Timeout::simpleTimeout(2000);
     Stm32_Serial.setTimeout(_time);
     Stm32_Serial.open();                                       
