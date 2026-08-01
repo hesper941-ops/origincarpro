@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""第五阶段：车道路径控制观察节点（只读 dry-run）。
+"""第五阶段：车道路径控制计算与中间命令节点。
 
 运行：
   source /opt/tros/humble/setup.bash
@@ -10,10 +10,11 @@
 
 查看：
   ros2 topic echo /gxb_test/controller/status
+  ros2 topic echo /gxb_test/lane_control_cmd
 
-本节点只订阅感知 Path/status、计算控制预览并发布 JSON 诊断。它不导入底盘
-速度消息、不创建速度发布器，也不控制车辆。即使 dry_run 参数传入 false，
-控制输出仍保持禁用。
+本节点订阅感知 Path/status，发布 JSON 诊断和 JSON 中间控制命令。它不导入
+底盘速度消息、不发布 /cmd_vel，也不直接控制车辆；只有 lane_control_gate.py
+可以把通过安全检查的中间命令转换为底盘 Twist。
 """
 
 from __future__ import annotations
@@ -169,6 +170,7 @@ class ControllerConfig:
     path_topic: str = "/gxb_test/pipeline/centerline_path"
     status_topic: str = "/gxb_test/pipeline/status"
     controller_status_topic: str = "/gxb_test/controller/status"
+    control_cmd_topic: str = "/gxb_test/lane_control_cmd"
     dry_run: bool = True
     log_rate_hz: float = 2.0
     status_publish_rate_hz: float = 5.0
@@ -553,6 +555,34 @@ class ControllerPreview:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def to_control_command(self) -> Dict[str, Any]:
+        """Return the stable JSON interface consumed by the safety gate."""
+        return {
+            "schema_version": 1,
+            "interface_version": "gxb_lane_control_v1",
+            "timestamp": self.timestamp,
+            "linear_x": self.suggested_linear_x,
+            "angular_z": self.suggested_angular_z,
+            "ready": self.controller_ready,
+            "quality": self.control_quality_level,
+            "mode": self.centerline_mode,
+            "lateral_error": self.lateral_error_m,
+            "heading_error": self.heading_error_rad,
+            "controller_confidence": self.controller_confidence,
+            "reason": self.control_block_reason,
+            "path_valid": bool(
+                self.path_received
+                and self.path_point_count > 0
+                and self.path_span_m > 0.0
+            ),
+            "path_age_ms": self.path_age_ms,
+            "pipeline_age_ms": self.status_age_ms,
+            "path_point_count": self.path_point_count,
+            "path_span_m": self.path_span_m,
+            "process_fps": self.process_fps,
+            "processing_time_ms": self.processing_time_ms,
+        }
 
 
 class RateMeter:
@@ -1600,10 +1630,14 @@ class LanePathControllerNode(Node):
             self._status_callback,
             qos,
         )
-        # The only publisher is diagnostic JSON.
         self.controller_status_publisher = self.create_publisher(
             String,
             self.config.controller_status_topic,
+            qos,
+        )
+        self.control_cmd_publisher = self.create_publisher(
+            String,
+            self.config.control_cmd_topic,
             qos,
         )
         self.create_timer(
@@ -1613,7 +1647,9 @@ class LanePathControllerNode(Node):
         self.get_logger().info(
             "lane controller observer started: "
             f"path={self.config.path_topic} status={self.config.status_topic} "
-            f"output={self.config.controller_status_topic} dry_run=true "
+            f"status_output={self.config.controller_status_topic} "
+            f"control_output={self.config.control_cmd_topic} dry_run=true "
+            "direct_cmd_vel=false "
             "qos=BEST_EFFORT/VOLATILE/depth1"
         )
 
@@ -1697,6 +1733,11 @@ class LanePathControllerNode(Node):
         message = String()
         message.data = serialize_json(self.preview.to_dict())
         self.controller_status_publisher.publish(message)
+        control_message = String()
+        control_message.data = serialize_json(
+            self.preview.to_control_command()
+        )
+        self.control_cmd_publisher.publish(control_message)
         if now - self.last_log_monotonic >= 1.0 / self.config.log_rate_hz:
             self.last_log_monotonic = now
             if self.preview.controller_ready:
@@ -1742,6 +1783,11 @@ class LanePathControllerNode(Node):
             message = String()
             message.data = serialize_json(self.preview.to_dict())
             self.controller_status_publisher.publish(message)
+            control_message = String()
+            control_message.data = serialize_json(
+                self.preview.to_control_command()
+            )
+            self.control_cmd_publisher.publish(control_message)
         except Exception:
             pass
         try:
@@ -2003,11 +2049,11 @@ def run_self_test() -> None:
         forbidden_type = "Twi" + "st"
         assert f"create_publisher({forbidden_type}" not in source
 
-    @test("27 source has no standard velocity target")
+    @test("27 source has no chassis velocity publisher")
     def _() -> None:
         source = FilePath(__file__).read_text(encoding="utf-8")
-        target = "/" + "cmd" + "_vel"
-        assert target not in source
+        forbidden = "create_" + "publisher(" + "Twi" + "st"
+        assert forbidden not in source
 
     @test("28 source has no raw velocity target")
     def _() -> None:
@@ -2771,15 +2817,18 @@ def run_self_test() -> None:
         package_name = "geometry" + "_msgs.msg"
         assert f"from {package_name} import {message_name}" not in source
 
-    @test("97 exactly one ROS publisher call remains")
+    @test("97 exactly two JSON publishers remain")
     def _() -> None:
         source = FilePath(__file__).read_text(encoding="utf-8")
-        assert source.count("self.create_" + "publisher(") == 1
+        assert source.count("self.create_" + "publisher(") == 2
 
-    @test("98 source has no standard speed topic")
+    @test("98 source does not import chassis Twist")
     def _() -> None:
         source = FilePath(__file__).read_text(encoding="utf-8")
-        assert ("/" + "cmd" + "_vel") not in source
+        forbidden = (
+            "from geometry" + "_msgs.msg import " + "Twi" + "st"
+        )
+        assert forbidden not in source
 
     @test("99 false dry run still forced true")
     def _() -> None:
@@ -2873,6 +2922,37 @@ def run_self_test() -> None:
             config,
         )
         assert level == "degraded"
+
+    @test("106 intermediate control interface is complete")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        command = preview.to_control_command()
+        for key in (
+            "linear_x",
+            "angular_z",
+            "ready",
+            "quality",
+            "mode",
+            "lateral_error",
+            "heading_error",
+            "timestamp",
+        ):
+            assert key in command
+        assert command["interface_version"] == "gxb_lane_control_v1"
+
+    @test("107 blocked intermediate command is zero")
+    def _() -> None:
+        preview = ControllerPreview(
+            controller_ready=False,
+            control_block_reason="test_block",
+        )
+        command = preview.to_control_command()
+        assert not command["ready"]
+        assert command["linear_x"] == 0.0
+        assert command["angular_z"] == 0.0
 
     failures: List[str] = []
     for name, function in tests:
