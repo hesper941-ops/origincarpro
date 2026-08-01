@@ -56,8 +56,8 @@ class GateConfig:
     pipeline_timeout_sec: float = 0.75
     feedback_timeout_sec: float = 0.20
     path_timeout_sec: float = 0.40
-    max_linear_normal: float = 0.03
-    max_linear_recovery: float = 0.018
+    max_linear_normal: float = 0.05
+    max_linear_recovery: float = 0.025
     max_angular: float = 0.15
     max_angular_slew_rad_s2: float = 0.30
     max_feedback_linear_speed: float = 0.15
@@ -84,10 +84,10 @@ class GateConfig:
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive")
             setattr(self, name, value)
-        if self.max_linear_normal > 0.03:
-            raise ValueError("max_linear_normal cannot exceed 0.03")
-        if not 0.015 <= self.max_linear_recovery <= 0.02:
-            raise ValueError("max_linear_recovery must be in [0.015, 0.02]")
+        if self.max_linear_normal > 0.05:
+            raise ValueError("max_linear_normal cannot exceed 0.05")
+        if not 0.015 <= self.max_linear_recovery <= 0.03:
+            raise ValueError("max_linear_recovery must be in [0.015, 0.03]")
         if self.max_angular > 0.15:
             raise ValueError("max_angular cannot exceed 0.15")
 

@@ -117,8 +117,8 @@ start_all() {
     echo "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
     echo "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY}"
     echo "motion_enabled=${motion_value}"
-    echo "max_linear_normal=0.03"
-    echo "max_linear_recovery=0.018"
+    echo "max_linear_normal=0.05"
+    echo "max_linear_recovery=0.025"
     echo "max_angular=0.15"
     echo "serial=/dev/ttyACM0"
     echo "baud=921600"
@@ -149,8 +149,8 @@ start_all() {
     python3 "${GATE_SCRIPT}" --ros-args \
       -p motion_enabled:="${motion_value}" \
       -p telemetry_log_path:="${log_dir}/feedback.log" \
-      -p max_linear_normal:=0.03 \
-      -p max_linear_recovery:=0.018 \
+      -p max_linear_normal:=0.05 \
+      -p max_linear_recovery:=0.025 \
       -p max_angular:=0.15
   sleep 2
   local name pid
