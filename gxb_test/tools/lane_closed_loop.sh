@@ -24,7 +24,7 @@ source_ros() {
     source /root/install/ackermann_msgs/share/ackermann_msgs/package.bash
   fi
   # shellcheck disable=SC1090
-  source "${WORKSPACE}/install/setup.bash"
+  source "${WORKSPACE}/install/local_setup.bash"
   set -u
 }
 
