@@ -4,6 +4,8 @@
 #include "ackermann_msgs/msg/ackermann_drive_stamped.hpp" 
 #include "origincar_msg/msg/data.hpp"
 
+#include <algorithm>
+
 using std::placeholders::_1;
 using namespace std;
 void sigintHandler(int sig);
@@ -224,38 +226,26 @@ unsigned char origincar_base::Check_Sum(unsigned char Count_Number,unsigned char
 bool origincar_base::Get_Sensor_Data()
 {
     short transition_16 = 0;
-    uint8_t raw[RECEIVE_DATA_SIZE] = {0};
+    constexpr size_t kReadChunkSize = 256;
 
-    const size_t bytes_read = Stm32_Serial.read(raw, sizeof(raw));
-    if (bytes_read != RECEIVE_DATA_SIZE) {
+    if (!rx_parser_.has_frame()) {
+      const size_t available = Stm32_Serial.available();
+      if (available > 0) {
+        uint8_t raw[kReadChunkSize] = {0};
+        const size_t requested = std::min(available, kReadChunkSize);
+        const size_t bytes_read = Stm32_Serial.read(raw, requested);
+        rx_parser_.append(raw, bytes_read);
+      }
+    }
+
+    Log_Rx_Stats_If_Due();
+
+    origincar_base_rx::Frame frame{};
+    if (!rx_parser_.pop_frame(frame)) {
       return false;
     }
 
-    bool valid_frame = false;
-    for (int start = 0; start < RECEIVE_DATA_SIZE; ++start) {
-      if (raw[start] != FRAME_HEADER) {
-        continue;
-      }
-
-      for (int i = 0; i < RECEIVE_DATA_SIZE; ++i) {
-        Receive_Data.rx[i] = raw[(start + i) % RECEIVE_DATA_SIZE];
-      }
-
-      if (Receive_Data.rx[23] != FRAME_TAIL) {
-        continue;
-      }
-
-      if (Receive_Data.rx[22] != Check_Sum(22, READ_DATA_CHECK)) {
-        continue;
-      }
-
-      valid_frame = true;
-      break;
-    }
-
-    if (!valid_frame) {
-      return false;
-    }
+    std::copy(frame.begin(), frame.end(), Receive_Data.rx);
 
     Receive_Data.Frame_Header = Receive_Data.rx[0];
     Receive_Data.Frame_Tail = Receive_Data.rx[23];
@@ -300,6 +290,29 @@ bool origincar_base::Get_Sensor_Data()
 
     user_key = 0;
     return true;
+}
+
+void origincar_base::Log_Rx_Stats_If_Due()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_rx_stats_log_ < std::chrono::seconds(5)) {
+      return;
+    }
+    last_rx_stats_log_ = now;
+    const auto & stats = rx_parser_.stats();
+    RCLCPP_INFO(
+      this->get_logger(),
+      "RX stats: bytes=%llu valid=%llu checksum_fail=%llu tail_fail=%llu "
+      "resync=%llu discarded=%llu overflow=%llu buffer=%zu queued=%zu",
+      static_cast<unsigned long long>(stats.bytes_total),
+      static_cast<unsigned long long>(stats.valid_frames),
+      static_cast<unsigned long long>(stats.checksum_failures),
+      static_cast<unsigned long long>(stats.tail_failures),
+      static_cast<unsigned long long>(stats.resync_events),
+      static_cast<unsigned long long>(stats.discarded_bytes),
+      static_cast<unsigned long long>(stats.overflow_events),
+      rx_parser_.buffer_size(),
+      rx_parser_.queued_frame_count());
 }
 
 void origincar_base::Control()
@@ -350,6 +363,8 @@ origincar_base::origincar_base()
   memset(&Receive_Data, 0, sizeof(Receive_Data));
   memset(&Send_Data, 0, sizeof(Send_Data));
   memset(&Mpu6050_Data, 0, sizeof(Mpu6050_Data));
+
+  last_rx_stats_log_ = std::chrono::steady_clock::now();
 
   // The connected STM32 firmware uses 921600 baud and a 24-byte feedback frame.
   int serial_baud_rate = 921600;

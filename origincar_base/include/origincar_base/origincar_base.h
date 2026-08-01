@@ -4,7 +4,9 @@
 
 #include <memory>
 #include <inttypes.h>
+#include <chrono>
 #include "rclcpp/rclcpp.hpp"
+#include "origincar_base/rx_stream_parser.hpp"
 #include "std_msgs/msg/string.hpp"
 #include <csignal>
 #include <thread>
@@ -149,6 +151,7 @@ private:
 	auto createQuaternionMsgFromYaw(double yaw);
 
 	bool Get_Sensor_Data();
+	void Log_Rx_Stats_If_Due();
 	unsigned char Check_Sum(unsigned char Count_Number,unsigned char mode);
 	short IMU_Trans(uint8_t Data_High,uint8_t Data_Low);
 	float Odom_Trans(uint8_t Data_High,uint8_t Data_Low);
@@ -192,6 +195,8 @@ private:
 	string usart_port_name, robot_frame_id, gyro_frame_id, odom_frame_id, akm_cmd_vel, test;
 	std::string cmd_vel;
 	int serial_baud_rate;
+	origincar_base_rx::RxStreamParser rx_parser_;
+	std::chrono::steady_clock::time_point last_rx_stats_log_;
 	RECEIVE_DATA Receive_Data;
 	SEND_DATA Send_Data;
   
