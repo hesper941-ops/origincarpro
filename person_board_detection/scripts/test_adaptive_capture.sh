@@ -3,6 +3,10 @@
 set -u
 set -o pipefail
 
+# Keep every real-vehicle test process isolated from the site-wide ROS graph.
+export ROS_DOMAIN_ID=73
+export ROS_LOCALHOST_ONLY=1
+
 EXPECTED_BRANCH="feature/person-board-adaptive-capture"
 WORKSPACE="/root/intelligent_car_ws"
 SOURCE_ROOT="${WORKSPACE}/src"

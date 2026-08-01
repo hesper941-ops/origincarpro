@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Keep every real-vehicle test process isolated from the site-wide ROS graph.
+export ROS_DOMAIN_ID=73
+export ROS_LOCALHOST_ONLY=1
+
 MODE=dry-run
 TIMEOUT_SEC=120
 EVENT_ID=person_board_qwen_001

@@ -9,8 +9,8 @@ def generate_launch_description():
 
     robot_parameters = [
         {'usart_port_name': '/dev/ttyACM0',
-         # The connected STM32 firmware uses 115200 baud and a 24-byte feedback frame.
-         'serial_baud_rate': 115200,
+         # The connected STM32 firmware uses 921600 baud and a 24-byte feedback frame.
+         'serial_baud_rate': 921600,
          'robot_frame_id': 'base_footprint',
          'odom_frame_id': 'odom_combined',
          'cmd_vel': 'cmd_vel',

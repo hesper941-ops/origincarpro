@@ -27,14 +27,30 @@ source_ros() {
     echo "ERROR: /opt/tros/humble/setup.bash not found" >&2
     return 1
   }
-  # shellcheck disable=SC1091
-  source /opt/tros/humble/setup.bash
   [[ -f "${WORKSPACE}/install/setup.bash" ]] || {
     echo "ERROR: ${WORKSPACE}/install/setup.bash not found" >&2
     return 1
   }
+
+  # ROS/TROS setup 脚本会读取若干未预先定义的环境变量。
+  # 加载期间临时关闭 nounset，加载完成后立即恢复。
+  set +u
+
+  # shellcheck disable=SC1091
+  if ! source /opt/tros/humble/setup.bash; then
+    set -u
+    echo "ERROR: failed to source TROS environment" >&2
+    return 1
+  fi
+
   # shellcheck disable=SC1090
-  source "${WORKSPACE}/install/setup.bash"
+  if ! source "${WORKSPACE}/install/setup.bash"; then
+    set -u
+    echo "ERROR: failed to source workspace environment" >&2
+    return 1
+  fi
+
+  set -u
 }
 
 pid_alive() {
@@ -65,7 +81,17 @@ start_one() {
   local name="$1"
   local log_dir="$2"
   shift 2
-  setsid "$@" >"${log_dir}/${name}.log" 2>&1 &
+
+  # Always load ROS inside the detached shell as well.  `bash +u` makes the
+  # child safe even when nounset arrived through SHELLOPTS; source_ros then
+  # restores nounset after both setup files have finished loading.
+  export WORKSPACE
+  export -f source_ros
+  setsid bash +u -c '
+    set -eo pipefail
+    source_ros
+    exec "$@"
+  ' "lane-test-${name}" "$@" >"${log_dir}/${name}.log" 2>&1 &
   local pid=$!
   printf '%s\n' "${pid}" >"${log_dir}/${name}.pid"
   echo "started ${name} pid=${pid}"
@@ -139,7 +165,10 @@ stop_all() {
       local pid
       pid="$(cat "${pid_file}")"
       if pid_alive "${pid}"; then
-        kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+        # These ROS nodes raise shutdown tracebacks when SIGTERM invalidates
+        # their context while worker threads are still publishing.  They are
+        # isolated test process groups, so stop them atomically instead.
+        kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
       fi
     done
     for _attempt in 1 2 3 4 5; do
@@ -151,6 +180,16 @@ stop_all() {
       [[ ${any_alive} -eq 0 ]] && break
       sleep 1
     done
+    for name in "${PROCESS_NAMES[@]}"; do
+      [[ -f "${log_dir}/${name}.pid" ]] || continue
+      local remaining_pid
+      remaining_pid="$(cat "${log_dir}/${name}.pid")"
+      if pid_alive "${remaining_pid}"; then
+        kill -KILL -- "-${remaining_pid}" 2>/dev/null \
+          || kill -KILL "${remaining_pid}" 2>/dev/null \
+          || true
+      fi
+    done
   fi
   local residual pid command
   while IFS= read -r residual; do
@@ -159,7 +198,18 @@ stop_all() {
     command="${residual#* }"
     case "${command}" in
       *lane_perception_pipeline.py*|*5_lane_path_controller.py*|*watch_controller_v2.py*|*watch_single_green_status.py*)
-        kill -TERM "${pid}" 2>/dev/null || true
+        kill -KILL "${pid}" 2>/dev/null || true
+        ;;
+    esac
+  done < <(known_residuals)
+  sleep 1
+  while IFS= read -r residual; do
+    [[ -n "${residual}" ]] || continue
+    pid="${residual%% *}"
+    command="${residual#* }"
+    case "${command}" in
+      *lane_perception_pipeline.py*|*5_lane_path_controller.py*|*watch_controller_v2.py*|*watch_single_green_status.py*)
+        kill -KILL "${pid}" 2>/dev/null || true
         ;;
     esac
   done < <(known_residuals)
