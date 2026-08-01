@@ -1,0 +1,29 @@
+person_board_qwen_vl_worker:
+  ros__parameters:
+    capture_batch_topic: /person_board/capture_batch
+    llm_status_topic: /person_board/llm_status
+    llm_result_topic: /person_board/llm_result
+    backend_name: qwen_vl
+    default_model: qwen3-vl-flash
+    prompt_file: ""
+    allowed_capture_directory: /root/intelligent_car_ws/runtime/person_board/latest_capture
+    validate_images: true
+    sharpness_weight: 0.55
+    confidence_weight: 0.30
+    area_weight: 0.15
+    sharpness_saturation: 100.0
+    minimum_sharpness: 30.0
+    minimum_crop_width: 80
+    minimum_crop_height: 80
+    maximum_image_bytes: 5242880
+    request_timeout_sec: 12.0
+    overall_deadline_sec: 20.0
+    max_retries: 1
+    retry_delay_sec: 1.0
+    enable_thinking: false
+    temperature: 0.1
+    max_completion_tokens: 120
+    max_description_chars: 50
+    max_pending_jobs: 1
+    remember_processed_request_count: 100
+    status_heartbeat_sec: 1.0
