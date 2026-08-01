@@ -36,6 +36,7 @@ SELF_TEST = "--self-test" in sys.argv
 if not SELF_TEST:
     import rclpy
     from nav_msgs.msg import Path as RosPath
+    from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import (
         DurabilityPolicy,
@@ -177,7 +178,7 @@ class ControllerConfig:
     min_path_points: int = 6
     min_path_span_m: float = 0.25
     path_timeout_sec: float = 0.40
-    status_timeout_sec: float = 0.40
+    status_timeout_sec: float = 1.00
     max_point_lateral_jump_m: float = 0.15
     min_centerline_confidence: float = 0.70
     min_centerline_span_m: float = 0.25
@@ -198,23 +199,24 @@ class ControllerConfig:
     lateral_gain: float = 1.8
     heading_gain: float = 1.2
     max_suggested_angular_z: float = 0.60
-    nominal_suggested_linear_x: float = 0.10
+    nominal_suggested_linear_x: float = 0.50
     normal_min_path_points: int = 10
     normal_min_path_span_m: float = 0.45
     normal_min_confidence: float = 0.80
-    normal_suggested_linear_x: float = 0.10
+    normal_suggested_linear_x: float = 0.50
     normal_max_angular_z: float = 0.60
     degraded_min_path_points: int = 6
     degraded_min_path_span_m: float = 0.25
     degraded_min_confidence: float = 0.75
-    degraded_suggested_linear_x: float = 0.02
-    degraded_max_angular_z: float = 0.30
+    degraded_suggested_linear_x: float = 0.35
+    short_path_suggested_linear_x: float = 0.20
+    degraded_max_angular_z: float = 0.35
     recovery_min_path_points: int = 6
     recovery_min_path_span_m: float = 0.25
     recovery_min_confidence: float = 0.70
     recovery_required_stable_frames: int = 4
-    recovery_suggested_linear_x: float = 0.01
-    recovery_max_angular_z: float = 0.20
+    recovery_suggested_linear_x: float = 0.32
+    recovery_max_angular_z: float = 0.30
     recovery_max_heading_std_deg: float = 4.0
     recovery_max_target_y_delta_m: float = 0.025
     recovery_max_lateral_delta_m: float = 0.025
@@ -301,6 +303,9 @@ class ControllerConfig:
         )
         self.degraded_suggested_linear_x = max(
             0.0, finite_float(self.degraded_suggested_linear_x)
+        )
+        self.short_path_suggested_linear_x = max(
+            0.0, finite_float(self.short_path_suggested_linear_x)
         )
         self.recovery_suggested_linear_x = max(
             0.0, finite_float(self.recovery_suggested_linear_x)
@@ -873,8 +878,7 @@ def evaluate_mode_policy(
     if mode in UNSUPPORTED_SINGLE_MODES:
         return "blocked", "unsupported_single_boundary_mode"
     if mode in PREFERRED_MODES:
-        level = "normal"
-        requirements = (
+        normal_requirements = (
             (
                 analysis.point_count >= config.normal_min_path_points,
                 "normal_path_points_low",
@@ -894,6 +898,35 @@ def evaluate_mode_policy(
                 "normal_confidence_low",
             ),
         )
+        normal_failure = next(
+            (reason for passed, reason in normal_requirements if not passed),
+            "",
+        )
+        if not normal_failure:
+            return "normal", "normal_mode_accepted"
+        short_path_requirements = (
+            (
+                analysis.point_count >= config.degraded_min_path_points,
+                "normal_path_points_low",
+            ),
+            (
+                min(
+                    analysis.span_m,
+                    perception.centerline_forward_span_m,
+                )
+                + 1.0e-9
+                >= config.degraded_min_path_span_m,
+                "normal_path_span_low",
+            ),
+            (
+                perception.centerline_confidence
+                >= config.degraded_min_confidence,
+                "normal_confidence_low",
+            ),
+        )
+        if all(passed for passed, _reason in short_path_requirements):
+            return "degraded", "short_path_degraded"
+        return "blocked", normal_failure
     elif mode in DEGRADED_MODES:
         level = "degraded"
         requirements = (
@@ -1378,7 +1411,11 @@ def compute_preview_command(
         base_speed = config.normal_suggested_linear_x
     elif level == "degraded":
         angular_limit = config.degraded_max_angular_z
-        base_speed = config.degraded_suggested_linear_x
+        base_speed = (
+            config.short_path_suggested_linear_x
+            if policy_reason == "short_path_degraded"
+            else config.degraded_suggested_linear_x
+        )
     else:
         angular_limit = config.recovery_max_angular_z
         base_speed = config.recovery_suggested_linear_x
@@ -1948,11 +1985,19 @@ def run_self_test() -> None:
         result = validate_path("base_link", points, config)
         assert not result.valid and result.reason == "path_lateral_jump"
 
-    @test("17 status timeout blocks")
+    @test("17 status age 0.5 remains usable")
     def _() -> None:
         result = validate_path("base_link", _path_points(), config)
         preview = compute_preview_command(
             result, _healthy_perception(), config, 0.01, 0.5
+        )
+        assert preview.controller_ready
+
+    @test("17b status age over 1.0 blocks")
+    def _() -> None:
+        result = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            result, _healthy_perception(), config, 0.01, 1.01
         )
         assert preview.control_block_reason == "status_timeout"
 
@@ -2607,7 +2652,7 @@ def run_self_test() -> None:
             _healthy_perception(mode="green_yellow_hybrid"),
             config, 0.01, 0.01
         )
-        assert abs(preview.suggested_angular_z_mode_limited) <= 0.30
+        assert abs(preview.suggested_angular_z_mode_limited) <= 0.35
 
     @test("80 recovery angular mode limit")
     def _() -> None:
@@ -2623,7 +2668,7 @@ def run_self_test() -> None:
             _healthy_perception(mode="single_green_width_offset"),
             config, 0.01, 0.01
         )
-        assert abs(preview.suggested_angular_z_mode_limited) <= 0.20
+        assert abs(preview.suggested_angular_z_mode_limited) <= 0.30
 
     @test("81 angular slew rate limit")
     def _() -> None:
@@ -2861,7 +2906,7 @@ def run_self_test() -> None:
         snapshot = _healthy_perception()
         snapshot.centerline_forward_span_m = 0.30
         level, reason = evaluate_mode_policy(analysis, snapshot, config)
-        assert level == "blocked" and reason == "normal_path_span_low"
+        assert level == "degraded" and reason == "short_path_degraded"
 
     @test("103 degraded direction instability blocks")
     def _() -> None:
@@ -2905,7 +2950,7 @@ def run_self_test() -> None:
             now=1.2,
             advance_state=False,
         )
-        assert abs(preview.suggested_angular_z) <= 0.30
+        assert abs(preview.suggested_angular_z) <= 0.35
 
     @test("105 dual boundary midpoint is capped degraded")
     def _() -> None:
@@ -2954,6 +2999,50 @@ def run_self_test() -> None:
         assert command["linear_x"] == 0.0
         assert command["angular_z"] == 0.0
 
+    @test("108 preferred six-point path stays ready degraded")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(start=0.30, end=0.55, count=6), config
+        )
+        perception = _healthy_perception()
+        perception.centerline_forward_span_m = 0.25
+        preview = compute_preview_command(
+            analysis, perception, config, 0.01, 0.50
+        )
+        assert preview.controller_ready
+        assert preview.control_quality_level == "degraded"
+        assert preview.mode_policy_reason == "short_path_degraded"
+        assert 0.0 < preview.suggested_linear_x <= 0.20
+
+    @test("109 preferred five-point path remains blocked")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(count=5), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        assert not preview.controller_ready
+        assert preview.suggested_linear_x == 0.0
+
+    @test("110 preferred span below 0.25 remains blocked")
+    def _() -> None:
+        analysis = validate_path(
+            "base_link", _path_points(start=0.30, end=0.54, count=6), config
+        )
+        preview = compute_preview_command(
+            analysis, _healthy_perception(), config, 0.01, 0.01
+        )
+        assert not preview.controller_ready
+        assert preview.suggested_linear_x == 0.0
+
+    @test("111 clean normal path can approach 0.50")
+    def _() -> None:
+        analysis = validate_path("base_link", _path_points(), config)
+        preview = compute_preview_command(
+            analysis, _healthy_perception(confidence=1.0), config, 0.01, 0.01
+        )
+        assert preview.controller_ready
+        assert 0.45 <= preview.suggested_linear_x <= 0.50
+
     failures: List[str] = []
     for name, function in tests:
         try:
@@ -2976,7 +3065,7 @@ def main() -> None:
     try:
         node = LanePathControllerNode()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as exc:
         if node is not None:
@@ -2991,8 +3080,12 @@ def main() -> None:
         raise
     finally:
         if node is not None:
-            node.destroy_node()
-        rclpy.shutdown()
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

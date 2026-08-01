@@ -7622,6 +7622,11 @@ class LanePerceptionPipelineNode(Node):
                     if result.geometry.valid
                     else STAGE4.PathConverter.empty(self.ipm, source)
                 )
+                # 后台线程可能正在完成 shutdown 前的最后一帧。
+                # ROS context 已失效后禁止继续 publish。
+                if self.stop_event.is_set() or not rclpy.ok():
+                    return
+
                 self.path_publisher.publish(path)
                 result.timing_ms["path_publish_ms"] = (
                     time.perf_counter() - path_started
@@ -7699,6 +7704,11 @@ class LanePerceptionPipelineNode(Node):
                         }
                     )
             except Exception as exc:
+                # 如果异常来自 ROS shutdown，就直接结束 processing thread。
+                # 不能在异常处理里再次向已经失效的 publisher 发布消息。
+                if self.stop_event.is_set() or not rclpy.ok():
+                    return
+
                 processing_ms = (
                     time.perf_counter() - processing_started
                 ) * 1000.0
@@ -10729,10 +10739,36 @@ def main(args: Optional[List[str]] = None) -> None:
         node = LanePerceptionPipelineNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        if node is not None:
+            node.stop_event.set()
+
+    except BaseException as exc:
+        # Humble 外部 shutdown 通常表现为 ExternalShutdownException；
+        # context 已关闭时的 RCLError 同样属于正常停止流程。
+        if node is not None:
+            node.stop_event.set()
+
+        normal_shutdown = (
+            exc.__class__.__name__ == "ExternalShutdownException"
+            or (
+                exc.__class__.__name__ == "RCLError"
+                and not rclpy.ok()
+            )
+        )
+
+        if not normal_shutdown:
+            raise
+
     finally:
         if node is not None:
-            node.destroy_node()
+            node.stop_event.set()
+
+            try:
+                node.destroy_node()
+            except Exception:
+                if rclpy.ok():
+                    raise
+
         if rclpy.ok():
             rclpy.shutdown()
 

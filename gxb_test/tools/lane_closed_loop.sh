@@ -43,6 +43,46 @@ pid_alive() {
   [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null
 }
 
+pid_matches_label() {
+  local pid="$1" label="$2" command_line
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+  command_line="$(tr '\0' ' ' <"/proc/${pid}/cmdline")"
+  case "${label}" in
+    base) [[ "${command_line}" == *"ros2 launch origincar_base base_serial.launch.py"* || "${command_line}" == *"/origincar_base_node"* ]] ;;
+    perception) [[ "${command_line}" == *lane_perception_pipeline.py* ]] ;;
+    controller) [[ "${command_line}" == *5_lane_path_controller.py* ]] ;;
+    gate) [[ "${command_line}" == *lane_control_gate.py* ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+existing_closed_loop_details() {
+  local pattern matches found=false
+  for pattern in \
+    'origincar_base_node' \
+    'lane_perception_pipeline.py' \
+    '5_lane_path_controller.py' \
+    'lane_control_gate.py'; do
+    matches="$(pgrep -af -- "${pattern}" 2>/dev/null || true)"
+    if [[ -n "${matches}" ]]; then
+      printf '%s\n' "${matches}"
+      found=true
+    fi
+  done
+  if fuser -s /dev/ttyACM0 2>/dev/null; then
+    echo "serial_owner=/dev/ttyACM0"
+    fuser -v /dev/ttyACM0 2>&1 || true
+    found=true
+  fi
+  matches="$(ss -ltnp 2>/dev/null | grep ':8093 ' || true)"
+  if [[ -n "${matches}" ]]; then
+    echo "web_port_owner=8093"
+    printf '%s\n' "${matches}"
+    found=true
+  fi
+  [[ "${found}" == false ]]
+}
+
 start_one() {
   local name="$1" log_dir="$2"
   shift 2
@@ -66,7 +106,7 @@ topic_count() {
 
 send_gate_control() {
   local command="$1"
-  ros2 topic pub --once /gxb_test/lane_control_gate/control \
+  timeout 2 ros2 topic pub --once /gxb_test/lane_control_gate/control \
     std_msgs/msg/String "{data: '{\"command\":\"${command}\"}'}" \
     >/dev/null 2>&1 || true
 }
@@ -77,16 +117,83 @@ zero_burst() {
     --topic /cmd_vel >"${log_file}" 2>&1
 }
 
+process_group_alive() {
+  local pgid="${1:-}"
+  [[ "${pgid}" =~ ^[0-9]+$ ]] || return 1
+  pgrep -g "${pgid}" >/dev/null 2>&1
+}
+
+process_group_matches_label() {
+  local pgid="$1" label="$2" member
+
+  while IFS= read -r member; do
+    [[ "${member}" =~ ^[0-9]+$ ]] || continue
+    if pid_matches_label "${member}" "${label}"; then
+      return 0
+    fi
+  done < <(pgrep -g "${pgid}" 2>/dev/null || true)
+
+  return 1
+}
+
 stop_group() {
   local pid="$1" label="$2" cleanup_log="$3"
-  pid_alive "${pid}" || return 0
+
+  # start_one() 使用 setsid，因此记录 PID 同时也是 PGID。
+  # ros2 launch leader 可能先退出，但子节点仍留在原进程组。
+  if ! pid_alive "${pid}" && ! process_group_alive "${pid}"; then
+    return 0
+  fi
+
   for signal_name in INT TERM KILL; do
-    pid_alive "${pid}" || break
-    echo "signal=${signal_name} pid=${pid} label=${label}" >>"${cleanup_log}"
+    if ! pid_alive "${pid}" && ! process_group_alive "${pid}"; then
+      break
+    fi
+
+    echo "signal=${signal_name} pid=${pid} label=${label}" \
+      >>"${cleanup_log}"
+
     kill -"${signal_name}" -- "-${pid}" 2>/dev/null \
       || kill -"${signal_name}" "${pid}" 2>/dev/null \
       || true
+
     [[ "${signal_name}" == KILL ]] || sleep 2
+  done
+}
+
+stop_registered_processes() {
+  local cleanup_log="$1" name pid_file pid seen=" "
+
+  for name in gate controller perception base; do
+    while IFS= read -r pid_file; do
+      pid="$(head -n 1 "${pid_file}" 2>/dev/null || true)"
+
+      [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+      [[ "${seen}" == *" ${pid} "* ]] && continue
+      seen+="${pid} "
+
+      if pid_alive "${pid}"; then
+        if pid_matches_label "${pid}" "${name}"; then
+          stop_group "${pid}" "${name}" "${cleanup_log}"
+        else
+          echo "skip_pid_mismatch pid=${pid} label=${name} file=${pid_file}" \
+            >>"${cleanup_log}"
+        fi
+
+      elif process_group_alive "${pid}" \
+        && process_group_matches_label "${pid}" "${name}"; then
+
+        # leader 已退出，但我们确认该 PGID 中仍存在同类闭环子进程。
+        echo "leader_dead_group_alive pgid=${pid} label=${name}" \
+          >>"${cleanup_log}"
+
+        stop_group "${pid}" "${name}" "${cleanup_log}"
+      fi
+
+    done < <(
+      find "${LOG_ROOT}" -maxdepth 2 -type f -name "${name}.pid" \
+        -print 2>/dev/null | sort -r
+    )
   done
 }
 
@@ -97,6 +204,13 @@ start_all() {
   [[ -e /dev/ttyACM0 ]] || { echo "ERROR: /dev/ttyACM0 missing" >&2; return 1; }
   [[ -e /dev/video0 ]] || { echo "ERROR: /dev/video0 missing" >&2; return 1; }
   mkdir -p "${LOG_ROOT}"
+  local existing_details
+  if ! existing_details="$(existing_closed_loop_details)"; then
+    echo "ERROR: EXISTING CLOSED LOOP INSTANCE DETECTED" >&2
+    printf '%s\n' "${existing_details}" >&2
+    echo "Run first: bash gxb_test/tools/lane_closed_loop.sh stop" >&2
+    return 1
+  fi
   local existing_publishers
   existing_publishers="$(topic_count /cmd_vel Publisher || true)"
   existing_publishers="${existing_publishers:-0}"
@@ -117,9 +231,13 @@ start_all() {
     echo "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
     echo "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY}"
     echo "motion_enabled=${motion_value}"
-    echo "max_linear_normal=0.05"
-    echo "max_linear_recovery=0.025"
-    echo "max_angular=0.15"
+    echo "max_linear_normal=0.50"
+    echo "max_linear_hybrid=0.40"
+    echo "max_linear_degraded=0.20"
+    echo "max_linear_recovery=0.25"
+    echo "max_angular_normal=0.60"
+    echo "max_angular_degraded=0.35"
+    echo "max_angular_recovery=0.30"
     echo "serial=/dev/ttyACM0"
     echo "baud=921600"
   } >"${log_dir}/startup_parameters.txt"
@@ -143,15 +261,26 @@ start_all() {
   sleep 1
   start_one controller "${log_dir}" \
     python3 "${REPO_ROOT}/gxb_test/5_lane_path_controller.py" \
-      --ros-args -p dry_run:=true
+      --ros-args \
+      -p dry_run:=true \
+      -p status_timeout_sec:=1.00 \
+      -p normal_suggested_linear_x:=0.50 \
+      -p degraded_suggested_linear_x:=0.35 \
+      -p short_path_suggested_linear_x:=0.20 \
+      -p recovery_suggested_linear_x:=0.32
   sleep 1
   start_one gate "${log_dir}" \
     python3 "${GATE_SCRIPT}" --ros-args \
       -p motion_enabled:="${motion_value}" \
       -p telemetry_log_path:="${log_dir}/feedback.log" \
-      -p max_linear_normal:=0.05 \
-      -p max_linear_recovery:=0.025 \
-      -p max_angular:=0.15
+      -p pipeline_timeout_sec:=1.20 \
+      -p max_linear_normal:=0.50 \
+      -p max_linear_hybrid:=0.40 \
+      -p max_linear_degraded:=0.20 \
+      -p max_linear_recovery:=0.25 \
+      -p max_angular:=0.60 \
+      -p max_angular_degraded:=0.35 \
+      -p max_angular_recovery:=0.30
   sleep 2
   local name pid
   for name in "${PROCESS_NAMES[@]}"; do
@@ -163,6 +292,11 @@ start_all() {
     fi
   done
   echo "log_dir=${log_dir}"
+  echo "NORMAL MAX V=0.50 m/s"
+  echo "HYBRID MAX V=0.40 m/s"
+  echo "DEGRADED MAX V=0.20 m/s"
+  echo "RECOVERY MAX V=0.25 m/s"
+  echo "MAX W=0.60 rad/s (DEGRADED=0.35 RECOVERY=0.30)"
   if [[ "${allow_motion}" == true ]]; then
     echo "MOTION_ARMED=true; gate remains WAIT_READY until four fresh frames"
   else
@@ -187,12 +321,7 @@ stop_all() {
   : >"${cleanup_log}"
   send_gate_control stop
   zero_burst 2.0 "${log_dir}/stop_zero.log" || true
-  local name pid
-  for name in gate controller perception base; do
-    [[ -f "${log_dir}/${name}.pid" ]] || continue
-    pid="$(cat "${log_dir}/${name}.pid")"
-    stop_group "${pid}" "${name}" "${cleanup_log}"
-  done
+  stop_registered_processes "${cleanup_log}"
   sleep 1
   {
     echo "cmd_vel_publishers=$(topic_count /cmd_vel Publisher || echo 0)"

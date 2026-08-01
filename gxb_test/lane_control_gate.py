@@ -30,10 +30,10 @@ SELF_TEST = "--self-test" in sys.argv
 REPORT_MODE = "--report" in sys.argv
 
 NORMAL_MODES = frozenset({"green_dual_inner_edge"})
-DEGRADED_MODES = frozenset(
-    {"green_yellow_hybrid", "single_green_width_offset"}
-)
-ALLOWED_MODES = NORMAL_MODES | DEGRADED_MODES
+HYBRID_MODES = frozenset({"green_yellow_hybrid"})
+RECOVERY_MODES = frozenset({"single_green_width_offset"})
+DEGRADED_MODES = HYBRID_MODES | RECOVERY_MODES
+ALLOWED_MODES = NORMAL_MODES | HYBRID_MODES | RECOVERY_MODES
 FORBIDDEN_MODES = frozenset({"single_boundary_normal_offset", "invalid"})
 
 
@@ -52,29 +52,47 @@ def finite(value: Any, default: float = 0.0) -> float:
 @dataclass
 class GateConfig:
     ready_frames: int = 4
+    normal_recovery_frames: int = 2
+    min_path_points: int = 6
+    min_path_span_m: float = 0.25
     controller_timeout_sec: float = 0.40
-    pipeline_timeout_sec: float = 0.75
+    pipeline_timeout_sec: float = 1.20
     feedback_timeout_sec: float = 0.20
     path_timeout_sec: float = 0.40
-    max_linear_normal: float = 0.05
-    max_linear_recovery: float = 0.025
-    max_angular: float = 0.15
-    max_angular_slew_rad_s2: float = 0.30
-    max_feedback_linear_speed: float = 0.15
-    max_feedback_angular_speed: float = 0.60
+    max_linear_normal: float = 0.50
+    max_linear_hybrid: float = 0.40
+    max_linear_degraded: float = 0.20
+    max_linear_recovery: float = 0.25
+    max_angular: float = 0.60
+    max_angular_degraded: float = 0.35
+    max_angular_recovery: float = 0.30
+    max_linear_accel_m_s2: float = 0.40
+    max_linear_decel_m_s2: float = 0.80
+    max_angular_slew_rad_s2: float = 1.20
+    max_feedback_linear_speed: float = 0.70
+    max_feedback_angular_speed: float = 0.90
     publish_rate_hz: float = 20.0
     motion_enabled: bool = False
 
     def validate(self) -> None:
         self.ready_frames = max(1, int(self.ready_frames))
+        self.normal_recovery_frames = max(1, int(self.normal_recovery_frames))
+        self.min_path_points = max(3, int(self.min_path_points))
         for name in (
             "controller_timeout_sec",
             "pipeline_timeout_sec",
             "feedback_timeout_sec",
             "path_timeout_sec",
+            "min_path_span_m",
             "max_linear_normal",
+            "max_linear_hybrid",
+            "max_linear_degraded",
             "max_linear_recovery",
             "max_angular",
+            "max_angular_degraded",
+            "max_angular_recovery",
+            "max_linear_accel_m_s2",
+            "max_linear_decel_m_s2",
             "max_angular_slew_rad_s2",
             "max_feedback_linear_speed",
             "max_feedback_angular_speed",
@@ -84,12 +102,20 @@ class GateConfig:
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive")
             setattr(self, name, value)
-        if self.max_linear_normal > 0.05:
-            raise ValueError("max_linear_normal cannot exceed 0.05")
-        if not 0.015 <= self.max_linear_recovery <= 0.03:
-            raise ValueError("max_linear_recovery must be in [0.015, 0.03]")
-        if self.max_angular > 0.15:
-            raise ValueError("max_angular cannot exceed 0.15")
+        if self.max_linear_normal > 0.50:
+            raise ValueError("max_linear_normal cannot exceed 0.50")
+        if self.max_linear_hybrid > 0.40:
+            raise ValueError("max_linear_hybrid cannot exceed 0.40")
+        if self.max_linear_degraded > 0.20:
+            raise ValueError("max_linear_degraded cannot exceed 0.20")
+        if self.max_linear_recovery > 0.25:
+            raise ValueError("max_linear_recovery cannot exceed 0.25")
+        if self.max_angular > 0.60:
+            raise ValueError("max_angular cannot exceed 0.60")
+        if self.max_angular_degraded > 0.35:
+            raise ValueError("max_angular_degraded cannot exceed 0.35")
+        if self.max_angular_recovery > 0.30:
+            raise ValueError("max_angular_recovery cannot exceed 0.30")
 
 
 @dataclass
@@ -133,7 +159,9 @@ class LaneControlGateCore:
         self.state = "WAIT_READY"
         self.reason = "waiting_for_inputs"
         self.ready_count = 0
+        self.normal_recovery_count = 0
         self.last_evaluated_controller_sequence = 0
+        self.last_output_v = 0.0
         self.last_output_w = 0.0
         self.last_output_time = 0.0
         self.estop_latched = False
@@ -206,6 +234,16 @@ class LaneControlGateCore:
             return str(command.get("reason") or "controller_blocked")
         if not bool(command.get("path_valid", False)):
             return "path_invalid"
+        if (
+            int(finite(command.get("path_point_count"), -1.0))
+            < self.config.min_path_points
+        ):
+            return "path_points_low"
+        if (
+            finite(command.get("path_span_m"), -1.0) + 1.0e-9
+            < self.config.min_path_span_m
+        ):
+            return "path_span_low"
         path_age_ms = finite(command.get("path_age_ms"), math.inf)
         if path_age_ms > self.config.path_timeout_sec * 1000.0:
             return "path_timeout"
@@ -226,6 +264,16 @@ class LaneControlGateCore:
         pipeline = self.pipeline.document
         if not bool(pipeline.get("centerline_valid", False)):
             return "pipeline_invalid"
+        if (
+            int(finite(pipeline.get("final_centerline_point_count"), -1.0))
+            < self.config.min_path_points
+        ):
+            return "pipeline_path_points_low"
+        if (
+            finite(pipeline.get("centerline_forward_span_m"), -1.0) + 1.0e-9
+            < self.config.min_path_span_m
+        ):
+            return "pipeline_path_span_low"
         mode = str(command.get("mode", ""))
         pipeline_mode = str(pipeline.get("centerline_mode", ""))
         if mode in FORBIDDEN_MODES or pipeline_mode in FORBIDDEN_MODES:
@@ -254,6 +302,8 @@ class LaneControlGateCore:
         self.state = state
         self.reason = reason
         self.ready_count = 0
+        self.normal_recovery_count = 0
+        self.last_output_v = 0.0
         self.last_output_w = 0.0
         self.last_output_time = now
         return self._decision(now, 0.0, 0.0)
@@ -271,28 +321,58 @@ class LaneControlGateCore:
             feedback_age_ms=self._age(now, self.feedback.received_at) * 1000.0,
         )
 
-    def _shape_command(self, now: float, degraded: bool) -> Tuple[float, float]:
+    def _control_class(self) -> str:
         command = self.controller.document or {}
-        cap = (
-            self.config.max_linear_recovery
-            if degraded
-            else self.config.max_linear_normal
-        )
+        mode = str(command.get("mode", ""))
+        quality = str(command.get("quality", ""))
+        if mode in RECOVERY_MODES or quality == "recovery":
+            return "recovery"
+        if mode in NORMAL_MODES and quality == "degraded":
+            return "degraded"
+        if mode in HYBRID_MODES:
+            return "hybrid"
+        return "normal"
+
+    def _shape_command(self, now: float, control_class: str) -> Tuple[float, float]:
+        command = self.controller.document or {}
+        linear_caps = {
+            "normal": self.config.max_linear_normal,
+            "hybrid": self.config.max_linear_hybrid,
+            "degraded": self.config.max_linear_degraded,
+            "recovery": self.config.max_linear_recovery,
+        }
+        angular_caps = {
+            "normal": self.config.max_angular,
+            "hybrid": self.config.max_angular_degraded,
+            "degraded": self.config.max_angular_degraded,
+            "recovery": self.config.max_angular_recovery,
+        }
+        cap = linear_caps[control_class]
+        angular_cap = angular_caps[control_class]
         requested_v = clamp(finite(command.get("linear_x")), 0.0, cap)
         requested_w = clamp(
             finite(command.get("angular_z")),
-            -self.config.max_angular,
-            self.config.max_angular,
+            -angular_cap,
+            angular_cap,
         )
         lateral = abs(finite(command.get("lateral_error")))
         heading = abs(finite(command.get("heading_error")))
         confidence = clamp(
             finite(command.get("controller_confidence"), 0.0), 0.0, 1.0
         )
-        requested_v *= clamp(1.0 - lateral / 0.25, 0.35, 1.0)
-        requested_v *= clamp(1.0 - heading / math.radians(40.0), 0.35, 1.0)
-        requested_v *= clamp(1.0 - abs(requested_w) / 0.30, 0.50, 1.0)
-        requested_v *= clamp(0.55 + 0.45 * confidence, 0.55, 1.0)
+        # The controller has already applied the primary geometry/quality speed
+        # reduction.  The gate applies a milder independent envelope so the two
+        # layers do not unintentionally square the same penalty.
+        requested_v *= clamp(1.0 - lateral / 0.50, 0.70, 1.0)
+        requested_v *= clamp(
+            1.0 - heading / math.radians(80.0), 0.70, 1.0
+        )
+        requested_v *= clamp(
+            1.0 - abs(requested_w) / max(2.0 * angular_cap, 1.0e-6),
+            0.70,
+            1.0,
+        )
+        requested_v *= clamp(0.90 + 0.10 * confidence, 0.90, 1.0)
         dt = (
             now - self.last_output_time
             if self.last_output_time > 0.0
@@ -303,8 +383,20 @@ class LaneControlGateCore:
             requested_w - self.last_output_w, -max_delta, max_delta
         )
         self.last_output_w = output_w
+        linear_rate = (
+            self.config.max_linear_accel_m_s2
+            if requested_v >= self.last_output_v
+            else self.config.max_linear_decel_m_s2
+        )
+        max_linear_delta = linear_rate * max(0.0, dt)
+        output_v = self.last_output_v + clamp(
+            requested_v - self.last_output_v,
+            -max_linear_delta,
+            max_linear_delta,
+        )
+        self.last_output_v = output_v
         self.last_output_time = now
-        return max(0.0, requested_v), output_w
+        return max(0.0, output_v), output_w
 
     def evaluate(self, now: Optional[float] = None) -> GateDecision:
         instant = time.monotonic() if now is None else float(now)
@@ -319,23 +411,37 @@ class LaneControlGateCore:
                 state = "WAIT_READY"
             return self._zero_decision(instant, state, reason)
 
-        if self.controller.sequence != self.last_evaluated_controller_sequence:
+        new_controller_frame = bool(
+            self.controller.sequence != self.last_evaluated_controller_sequence
+        )
+        if new_controller_frame:
             self.last_evaluated_controller_sequence = self.controller.sequence
             self.ready_count += 1
         if self.ready_count < self.config.ready_frames:
             self.state = "WAIT_READY"
             self.reason = "ready_stabilizing"
+            self.last_output_v = 0.0
             self.last_output_w = 0.0
             self.last_output_time = instant
             return self._decision(instant, 0.0, 0.0)
 
-        command = self.controller.document or {}
-        quality = str(command.get("quality", ""))
-        mode = str(command.get("mode", ""))
-        degraded = mode in DEGRADED_MODES or quality in {"degraded", "recovery"}
+        control_class = self._control_class()
+        if self.state == "DEGRADED" and control_class == "normal":
+            if new_controller_frame:
+                self.normal_recovery_count += 1
+            if self.normal_recovery_count < self.config.normal_recovery_frames:
+                self.state = "DEGRADED"
+                self.reason = "normal_recovery_stabilizing"
+                linear_x, angular_z = self._shape_command(instant, "degraded")
+                return self._decision(instant, linear_x, angular_z)
+        else:
+            self.normal_recovery_count = 0
+        degraded = control_class != "normal"
         self.state = "DEGRADED" if degraded else "RUNNING"
-        self.reason = "degraded_allowed" if degraded else "normal_allowed"
-        linear_x, angular_z = self._shape_command(instant, degraded)
+        self.reason = (
+            f"{control_class}_allowed" if degraded else "normal_allowed"
+        )
+        linear_x, angular_z = self._shape_command(instant, control_class)
         return self._decision(instant, linear_x, angular_z)
 
 
@@ -419,7 +525,7 @@ def _controller(mode: str = "green_dual_inner_edge", ready: bool = True) -> Dict
         "path_valid": True,
         "path_age_ms": 20.0,
         "pipeline_age_ms": 20.0,
-        "linear_x": 0.10,
+        "linear_x": 0.50,
         "angular_z": 0.10,
         "quality": "recovery" if mode == "single_green_width_offset" else "normal",
         "mode": mode,
@@ -474,7 +580,7 @@ def run_self_test() -> None:
     def _() -> None:
         core = LaneControlGateCore(GateConfig(motion_enabled=True))
         decision = _feed_ready(core)
-        assert 0.0 < decision.gate_v <= 0.03
+        assert 0.0 < decision.gate_v <= 0.50
 
     @test("recovery enters DEGRADED")
     def _() -> None:
@@ -486,7 +592,7 @@ def run_self_test() -> None:
             core.update_controller(_controller("single_green_width_offset"), now)
             decision = core.evaluate(now + 0.01)
         assert decision.gate_state == "DEGRADED"
-        assert 0.0 < decision.gate_v <= 0.02
+        assert 0.0 < decision.gate_v <= 0.25
 
     @test("green-yellow hybrid enters DEGRADED")
     def _() -> None:
@@ -533,9 +639,9 @@ def run_self_test() -> None:
     def _() -> None:
         core = LaneControlGateCore(GateConfig(motion_enabled=True))
         _feed_ready(core)
-        core.update_controller(_controller(), 2.09)
-        core.update_feedback(0.0, 0.0, 2.09)
-        assert core.evaluate(2.10).gate_reason == "pipeline_timeout"
+        core.update_controller(_controller(), 2.69)
+        core.update_feedback(0.0, 0.0, 2.69)
+        assert core.evaluate(2.70).gate_reason == "pipeline_timeout"
 
     @test("feedback timeout immediately zeros")
     def _() -> None:
@@ -551,15 +657,15 @@ def run_self_test() -> None:
         _feed_ready(core)
         core.update_controller(_controller(), 1.5)
         core.update_pipeline(_pipeline(), 1.5)
-        core.update_feedback(0.16, 0.0, 1.5)
+        core.update_feedback(0.71, 0.0, 1.5)
         assert core.evaluate(1.51).gate_reason == "feedback_linear_overspeed"
 
     @test("linear and angular limits hold")
     def _() -> None:
         core = LaneControlGateCore(GateConfig(motion_enabled=True))
         decision = _feed_ready(core)
-        assert 0.0 <= decision.gate_v <= 0.03
-        assert abs(decision.gate_w) <= 0.15
+        assert 0.0 <= decision.gate_v <= 0.50
+        assert abs(decision.gate_w) <= 0.60
 
     @test("reverse is forbidden")
     def _() -> None:
@@ -582,7 +688,171 @@ def run_self_test() -> None:
         core.update_feedback(0.0, 0.0, 1.4)
         core.update_pipeline(_pipeline(), 1.4)
         after = core.evaluate(1.41).gate_w
-        assert after > -0.15 and abs(after - before) <= 0.031
+        assert after > -0.15 and abs(after - before) <= 0.121
+
+    @test("RUNNING short path enters DEGRADED without zero")
+    def _() -> None:
+        core = LaneControlGateCore(GateConfig(motion_enabled=True))
+        assert _feed_ready(core).gate_state == "RUNNING"
+        now = 1.4
+        command = _controller()
+        command.update(
+            quality="degraded",
+            reason="",
+            path_point_count=6,
+            path_span_m=0.25,
+            linear_x=0.20,
+        )
+        core.update_controller(command, now)
+        core.update_pipeline(_pipeline(), now)
+        core.update_feedback(0.0, 0.0, now)
+        decision = core.evaluate(now + 0.01)
+        assert decision.gate_state == "DEGRADED"
+        assert decision.gate_v > 0.0
+        assert decision.ready_count >= 4
+
+    @test("DEGRADED needs two normal frames to recover RUNNING")
+    def _() -> None:
+        core = LaneControlGateCore(GateConfig(motion_enabled=True))
+        _feed_ready(core)
+        degraded = _controller()
+        degraded.update(quality="degraded", linear_x=0.20)
+        core.update_controller(degraded, 1.4)
+        core.update_pipeline(_pipeline(), 1.4)
+        core.update_feedback(0.0, 0.0, 1.4)
+        assert core.evaluate(1.41).gate_state == "DEGRADED"
+        for index, expected in enumerate(("DEGRADED", "RUNNING"), start=1):
+            now = 1.4 + index * 0.1
+            core.update_controller(_controller(), now)
+            core.update_pipeline(_pipeline(), now)
+            core.update_feedback(0.0, 0.0, now)
+            assert core.evaluate(now + 0.01).gate_state == expected
+
+    @test("true STOP resets four-frame startup requirement")
+    def _() -> None:
+        core = LaneControlGateCore(GateConfig(motion_enabled=True))
+        _feed_ready(core)
+        blocked = _controller(ready=False)
+        blocked["reason"] = "path_invalid"
+        core.update_controller(blocked, 1.4)
+        assert core.evaluate(1.41).gate_state == "STOPPED"
+        assert core.ready_count == 0
+        for index in range(3):
+            now = 1.5 + index * 0.1
+            core.update_controller(_controller(), now)
+            core.update_pipeline(_pipeline(), now)
+            core.update_feedback(0.0, 0.0, now)
+            assert core.evaluate(now + 0.01).gate_state == "WAIT_READY"
+        now = 1.8
+        core.update_controller(_controller(), now)
+        core.update_pipeline(_pipeline(), now)
+        core.update_feedback(0.0, 0.0, now)
+        assert core.evaluate(now + 0.01).gate_state == "RUNNING"
+
+    @test("pipeline status age 0.5 remains usable")
+    def _() -> None:
+        core = LaneControlGateCore(GateConfig(motion_enabled=True))
+        _feed_ready(core)
+        core.update_controller(_controller(), 1.8)
+        core.update_feedback(0.0, 0.0, 1.8)
+        assert core.evaluate(1.81).gate_state == "RUNNING"
+
+    @test("linear slew smooths quality speed change")
+    def _() -> None:
+        core = LaneControlGateCore(
+            GateConfig(motion_enabled=True, max_linear_accel_m_s2=5.0)
+        )
+        before = _feed_ready(core).gate_v
+        command = _controller()
+        command.update(quality="degraded", linear_x=0.20)
+        core.update_controller(command, 1.4)
+        core.update_pipeline(_pipeline(), 1.4)
+        core.update_feedback(0.0, 0.0, 1.4)
+        after = core.evaluate(1.41).gate_v
+        assert 0.0 < after <= before
+
+    @test("normal straight command can approach 0.50")
+    def _() -> None:
+        core = LaneControlGateCore(
+            GateConfig(motion_enabled=True, max_linear_accel_m_s2=5.0)
+        )
+        decision = core.evaluate(1.0)
+        for index in range(4):
+            now = 1.0 + index * 0.1
+            command = _controller()
+            command.update(
+                angular_z=0.0,
+                lateral_error=0.0,
+                heading_error=0.0,
+                controller_confidence=1.0,
+            )
+            core.update_controller(command, now)
+            core.update_pipeline(_pipeline(), now)
+            core.update_feedback(0.0, 0.0, now)
+            decision = core.evaluate(now + 0.01)
+        assert 0.45 <= decision.gate_v <= 0.50
+
+    @test("short path degraded caps v and w")
+    def _() -> None:
+        core = LaneControlGateCore(
+            GateConfig(motion_enabled=True, max_linear_accel_m_s2=5.0)
+        )
+        decision = core.evaluate(1.0)
+        for index in range(4):
+            now = 1.0 + index * 0.1
+            command = _controller()
+            command.update(
+                quality="degraded",
+                linear_x=0.50,
+                angular_z=0.60,
+                path_point_count=6,
+                path_span_m=0.25,
+            )
+            core.update_controller(command, now)
+            core.update_pipeline(_pipeline(), now)
+            core.update_feedback(0.0, 0.0, now)
+            decision = core.evaluate(now + 0.01)
+        assert decision.gate_state == "DEGRADED"
+        assert 0.0 < decision.gate_v <= 0.20
+        assert abs(decision.gate_w) <= 0.35
+
+    @test("single green recovery caps v and w")
+    def _() -> None:
+        core = LaneControlGateCore(
+            GateConfig(motion_enabled=True, max_linear_accel_m_s2=5.0)
+        )
+        decision = core.evaluate(1.0)
+        for index in range(4):
+            now = 1.0 + index * 0.1
+            command = _controller("single_green_width_offset")
+            command.update(linear_x=0.50, angular_z=0.60)
+            core.update_controller(command, now)
+            core.update_pipeline(_pipeline("single_green_width_offset"), now)
+            core.update_feedback(0.0, 0.0, now)
+            decision = core.evaluate(now + 0.01)
+        assert decision.gate_state == "DEGRADED"
+        assert 0.0 < decision.gate_v <= 0.25
+        assert abs(decision.gate_w) <= 0.30
+
+    @test("five path points stop immediately")
+    def _() -> None:
+        core = LaneControlGateCore(GateConfig(motion_enabled=True))
+        _feed_ready(core)
+        command = _controller()
+        command["path_point_count"] = 5
+        core.update_controller(command, 1.4)
+        assert core.evaluate(1.41).gate_reason == "path_points_low"
+        assert core.ready_count == 0
+
+    @test("path span below 0.25 stops immediately")
+    def _() -> None:
+        core = LaneControlGateCore(GateConfig(motion_enabled=True))
+        _feed_ready(core)
+        command = _controller()
+        command["path_span_m"] = 0.249
+        core.update_controller(command, 1.4)
+        assert core.evaluate(1.41).gate_reason == "path_span_low"
+        assert core.ready_count == 0
 
     @test("safety stop bypasses slew")
     def _() -> None:
@@ -629,7 +899,7 @@ def run_self_test() -> None:
     @test("Ctrl-C cleanup has a bounded zero burst")
     def _() -> None:
         source = Path(__file__).read_text(encoding="utf-8")
-        assert "except KeyboardInterrupt" in source
+        assert "KeyboardInterrupt, ExternalShutdownException" in source
         assert "node.publish_zero_burst(2.0)" in source
 
     @test("stop and estop scripts have independent zero bursts")
@@ -639,6 +909,17 @@ def run_self_test() -> None:
         ).read_text(encoding="utf-8")
         assert "zero_burst 2.0" in script
         assert "zero_burst 5.0" in script
+
+    @test("start rejects an existing closed-loop instance")
+    def _() -> None:
+        script = (
+            Path(__file__).resolve().parent / "tools" / "lane_closed_loop.sh"
+        ).read_text(encoding="utf-8")
+        assert "EXISTING CLOSED LOOP INSTANCE DETECTED" in script
+        assert "existing_closed_loop_details" in script
+        assert "fuser -s /dev/ttyACM0" in script
+        assert "grep ':8093 '" in script
+        assert "timeout 2 ros2 topic pub --once" in script
 
     @test("report JSON and CSV are generated")
     def _() -> None:
@@ -685,6 +966,7 @@ if not SELF_TEST and not REPORT_MODE:
     from geometry_msgs.msg import Twist
     from nav_msgs.msg import Odometry
     from origincar_msg.msg import Data
+    from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from std_msgs.msg import String
@@ -755,9 +1037,13 @@ if not SELF_TEST and not REPORT_MODE:
             self.get_logger().info(
                 "lane control gate started: motion_enabled="
                 f"{self.config.motion_enabled} max_v_normal="
-                f"{self.config.max_linear_normal:.3f} max_v_recovery="
+                f"{self.config.max_linear_normal:.3f} max_v_hybrid="
+                f"{self.config.max_linear_hybrid:.3f} max_v_degraded="
+                f"{self.config.max_linear_degraded:.3f} max_v_recovery="
                 f"{self.config.max_linear_recovery:.3f} "
-                f"max_w={self.config.max_angular:.3f}"
+                f"max_w_normal={self.config.max_angular:.3f} "
+                f"max_w_degraded={self.config.max_angular_degraded:.3f} "
+                f"max_w_recovery={self.config.max_angular_recovery:.3f}"
             )
 
         @staticmethod
@@ -972,18 +1258,33 @@ def main() -> None:
     try:
         node = LaneControlGateNode()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception:
-        if node is not None:
-            node.core.request_estop()
-            node.publish_zero_burst(2.0)
-        raise
+        # stop/launch shutdown 时 ROS context 可能先失效，此时 Humble
+        # 不一定抛 ExternalShutdownException，也可能抛 RCLError。
+        # context 已关闭属于正常退出；运行期真实异常仍然继续上抛。
+        if rclpy.ok():
+            if node is not None:
+                node.core.request_estop()
+                node.publish_zero_burst(2.0)
+            raise
     finally:
         if node is not None:
             node.core.request_estop()
-            node.publish_zero_burst(2.0)
-            node.destroy_node()
+
+            # context 有效时由 Gate 自己补零；
+            # context 已失效时不能再 spin/publish，外层 stop/estop
+            # 已有独立 zero guard 负责 /cmd_vel 归零。
+            if rclpy.ok():
+                node.publish_zero_burst(2.0)
+
+            try:
+                node.destroy_node()
+            except Exception:
+                if rclpy.ok():
+                    raise
+
         if rclpy.ok():
             rclpy.shutdown()
 
