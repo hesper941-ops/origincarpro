@@ -76,6 +76,23 @@ HDMI 节点的 Tk `mainloop` 固定运行在主线程，ROS executor 运行在�
 退出全屏，F11 切换全屏，允许键盘退出时 q 关闭节点。显示内容变化会发布
 transient local 的 `/person_board/display_status`。
 
+识别成功后，HDMI 会一直保持当前结果；后续 `IDLE` 心跳不会自动清屏。新任务
+开始时会显示“正在识别……”，成功后由新结果覆盖旧结果，失败时显示“识别失败，
+请重试”。显示节点按 `request_id` 跟踪任务，已被新任务取代的旧请求不能用迟到
+结果覆盖当前画面。
+
+手动清屏使用 `/person_board/display_control`（`std_msgs/msg/String`）：
+
+```bash
+ros2 topic pub --once \
+  /person_board/display_control \
+  std_msgs/msg/String \
+  "{data: '{\"command\":\"clear\"}'}"
+```
+
+`clear` 只把画面恢复为“等待识别”并清除当前 `event_id/request_id`，不会关闭
+display 节点、Tk 窗口或全屏模式。下一条有效 LLM 结果会正常显示并再次持续保持。
+
 ### 单独启动
 
 Mock worker：

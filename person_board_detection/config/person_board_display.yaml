@@ -3,6 +3,7 @@ person_board_display:
     llm_status_topic: /person_board/llm_status
     llm_result_topic: /person_board/llm_result
     display_status_topic: /person_board/display_status
+    display_control_topic: /person_board/display_control
 
     fullscreen: true
     always_on_top: false
@@ -10,8 +11,8 @@ person_board_display:
     allow_keyboard_exit: true
 
     waiting_text: 等待识别
-    analyzing_text: 正在分析……
-    failed_text: 识别失败
+    analyzing_text: 正在识别……
+    failed_text: 识别失败，请重试
 
     font_family: Noto Sans CJK SC
     font_size: 56

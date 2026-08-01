@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import queue
 import threading
-from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import rclpy
@@ -14,6 +13,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
+from .display_state import DisplayEvent, DisplayStateReducer
 from .result_protocol import (
     ProtocolError,
     dumps_message,
@@ -22,15 +22,6 @@ from .result_protocol import (
     validate_llm_result,
     validate_llm_status,
 )
-
-
-@dataclass(frozen=True)
-class DisplayEvent:
-    state: str
-    text: str
-    event_id: str = ""
-    request_id: str = ""
-    error_reason: str = ""
 
 
 class PersonBoardDisplayNode(Node):
@@ -45,6 +36,9 @@ class PersonBoardDisplayNode(Node):
         )
         self.display_status_topic = str(
             self.get_parameter("display_status_topic").value
+        )
+        self.display_control_topic = str(
+            self.get_parameter("display_control_topic").value
         )
         self.fullscreen = bool(self.get_parameter("fullscreen").value)
         self.always_on_top = bool(self.get_parameter("always_on_top").value)
@@ -82,20 +76,30 @@ class PersonBoardDisplayNode(Node):
             self._llm_result_callback,
             latched_qos,
         )
+        self.control_subscription = self.create_subscription(
+            String,
+            self.display_control_topic,
+            self._display_control_callback,
+            10,
+        )
         self.events: "queue.Queue[DisplayEvent]" = queue.Queue(maxsize=8)
+        self.display_state = DisplayStateReducer(
+            self.waiting_text, self.analyzing_text, self.failed_text
+        )
 
     def _declare_parameters(self) -> None:
         defaults = {
             "llm_status_topic": "/person_board/llm_status",
             "llm_result_topic": "/person_board/llm_result",
             "display_status_topic": "/person_board/display_status",
+            "display_control_topic": "/person_board/display_control",
             "fullscreen": True,
             "always_on_top": False,
             "hide_cursor": True,
             "allow_keyboard_exit": True,
             "waiting_text": "等待识别",
-            "analyzing_text": "正在分析……",
-            "failed_text": "识别失败",
+            "analyzing_text": "正在识别……",
+            "failed_text": "识别失败，请重试",
             "font_family": "Noto Sans CJK SC",
             "font_size": 56,
             "wrap_length_ratio": 0.80,
@@ -111,6 +115,7 @@ class PersonBoardDisplayNode(Node):
             ("llm_status_topic", self.llm_status_topic),
             ("llm_result_topic", self.llm_result_topic),
             ("display_status_topic", self.display_status_topic),
+            ("display_control_topic", self.display_control_topic),
             ("waiting_text", self.waiting_text),
             ("analyzing_text", self.analyzing_text),
             ("failed_text", self.failed_text),
@@ -142,37 +147,10 @@ class PersonBoardDisplayNode(Node):
             validate_llm_status(payload)
         except ProtocolError as exc:
             self.get_logger().error(f"invalid llm_status: {exc.reason}")
-            self._put_event(
-                DisplayEvent(
-                    "SHOWING_ERROR", self.failed_text, error_reason=exc.reason
-                )
-            )
             return
-        state = str(payload["state"])
-        event_id = str(payload.get("event_id", ""))
-        request_id = str(payload.get("request_id", ""))
-        error_reason = str(payload.get("error_reason", ""))
-        if state in {"RECEIVED", "VALIDATING"}:
-            self._put_event(
-                DisplayEvent(
-                    "WAITING", self.waiting_text, event_id, request_id
-                )
-            )
-        elif state == "ANALYZING":
-            self._put_event(
-                DisplayEvent(
-                    "ANALYZING", self.analyzing_text, event_id, request_id
-                )
-            )
-        elif state in {"FAILED", "REJECTED_DUPLICATE", "REJECTED_BUSY"}:
-            text = self.failed_text
-            if error_reason:
-                text += f"\n{error_reason}"
-            self._put_event(
-                DisplayEvent(
-                    "SHOWING_ERROR", text, event_id, request_id, error_reason
-                )
-            )
+        event = self.display_state.handle_status(payload)
+        if event is not None:
+            self._put_event(event)
 
     def _llm_result_callback(self, message: String) -> None:
         try:
@@ -182,42 +160,21 @@ class PersonBoardDisplayNode(Node):
             validate_llm_result(payload)
         except ProtocolError as exc:
             self.get_logger().error(f"invalid llm_result: {exc.reason}")
-            self._put_event(
-                DisplayEvent(
-                    "SHOWING_ERROR", self.failed_text, error_reason=exc.reason
-                )
+            return
+        event = self.display_state.handle_result(payload)
+        if event is not None:
+            self._put_event(event)
+
+    def _display_control_callback(self, message: String) -> None:
+        event, error_reason = self.display_state.handle_control_text(
+            message.data
+        )
+        if event is None:
+            self.get_logger().warning(
+                f"ignored display_control: {error_reason}"
             )
             return
-        event_id = str(payload.get("event_id", ""))
-        request_id = str(payload.get("request_id", ""))
-        if bool(payload["success"]):
-            text = str(payload.get("result_text", "")).strip()
-            if not text:
-                text = self.failed_text
-                self._put_event(
-                    DisplayEvent(
-                        "SHOWING_ERROR",
-                        text + "\nresult_text_empty",
-                        event_id,
-                        request_id,
-                        "result_text_empty",
-                    )
-                )
-                return
-            self._put_event(
-                DisplayEvent("SHOWING_RESULT", text, event_id, request_id)
-            )
-        else:
-            reason = str(payload.get("error_reason", "unknown_error"))
-            self._put_event(
-                DisplayEvent(
-                    "SHOWING_ERROR",
-                    f"{self.failed_text}\n{reason}",
-                    event_id,
-                    request_id,
-                    reason,
-                )
-            )
+        self._put_event(event)
 
     def publish_display_status(
         self, event: DisplayEvent, display_active: bool, fullscreen: bool
