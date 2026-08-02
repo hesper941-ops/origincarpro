@@ -1020,7 +1020,7 @@ class YellowCorridorPlanner:
         reason = "valid"
         if len(raw) < config.min_valid_samples:
             reason = "yellow_corridor_too_few_samples"
-        elif span < config.min_forward_span_m:
+        elif span + 1.0e-9 < config.min_forward_span_m:
             reason = "yellow_corridor_span_too_short"
         elif boundary_ratio < config.min_boundary_valid_ratio:
             reason = "yellow_corridor_boundary_ratio_low"
@@ -1263,7 +1263,7 @@ class YellowCorridorPlanner:
         if np.any(np.diff(forwards) <= 0):
             return "centerline_forward_not_monotonic", 0.0, 0.0
         span = float(forwards[-1] - forwards[0])
-        if span < config.min_forward_span_m:
+        if span + 1.0e-9 < config.min_forward_span_m:
             return "yellow_corridor_span_too_short", 0.0, span
         max_jump_m = (
             float(getattr(geometry_config, "centerline_max_lateral_jump_m", 0.20))
@@ -7202,8 +7202,8 @@ class LanePerceptionPipelineNode(Node):
             "yellow_corridor_width_min_ratio": 0.65,
             "yellow_corridor_width_max_ratio": 1.40,
             "yellow_corridor_center_jump_max_m": 0.15,
-            "yellow_corridor_min_valid_samples": 6,
-            "yellow_corridor_min_forward_span_m": 0.25,
+            "yellow_corridor_min_valid_samples": 3,
+            "yellow_corridor_min_forward_span_m": 0.10,
             "yellow_corridor_boundary_validation_radius_px": 5,
             "yellow_corridor_min_boundary_valid_ratio": 0.45,
             "yellow_corridor_max_consecutive_invalid_samples": 2,
@@ -7217,8 +7217,8 @@ class LanePerceptionPipelineNode(Node):
             "center_smooth_lambda": 2.0,
             "green_outer_seed_max_gap_px": 8,
             "green_min_outer_run_width_px": 8,
-            "single_green_curve_min_points": 8,
-            "single_green_curve_min_span_m": 0.35,
+            "single_green_curve_min_points": 3,
+            "single_green_curve_min_span_m": 0.10,
             "single_green_curve_max_row_gap": 2,
             "single_green_curve_max_point_jump_m": 0.12,
             "single_green_tangent_window_points": 5,

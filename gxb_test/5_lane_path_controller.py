@@ -213,7 +213,7 @@ class ControllerConfig:
     degraded_max_angular_z: float = 0.35
     recovery_min_path_points: int = 6
     recovery_min_path_span_m: float = 0.25
-    recovery_min_confidence: float = 0.70
+    recovery_min_confidence: float = 0.30
     recovery_required_stable_frames: int = 4
     recovery_suggested_linear_x: float = 0.32
     recovery_max_angular_z: float = 0.30
@@ -2606,7 +2606,7 @@ def run_self_test() -> None:
         level, reason = evaluate_mode_policy(
             analysis,
             _healthy_perception(
-                mode="single_green_width_offset", confidence=0.69
+                mode="single_green_width_offset", confidence=0.29
             ),
             config,
         )
