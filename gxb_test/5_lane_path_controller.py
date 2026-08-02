@@ -175,13 +175,13 @@ class ControllerConfig:
     dry_run: bool = True
     log_rate_hz: float = 2.0
     status_publish_rate_hz: float = 5.0
-    min_path_points: int = 6
-    min_path_span_m: float = 0.25
+    min_path_points: int = 3
+    min_path_span_m: float = 0.10
     path_timeout_sec: float = 0.40
     status_timeout_sec: float = 1.00
     max_point_lateral_jump_m: float = 0.15
-    min_centerline_confidence: float = 0.70
-    min_centerline_span_m: float = 0.25
+    min_centerline_confidence: float = 0.30
+    min_centerline_span_m: float = 0.10
     min_process_fps: float = 4.0
     max_perception_age_ms: float = 350.0
     near_error_distance_m: float = 0.35
@@ -214,6 +214,22 @@ class ControllerConfig:
     recovery_min_path_points: int = 6
     recovery_min_path_span_m: float = 0.25
     recovery_min_confidence: float = 0.30
+
+    # 急弯单绿救车档：只允许 single_green_width_offset 使用。
+    # 目的不是正常巡航，而是极低速继续改变车头姿态，
+    # 直到重新获得 >=6点/0.25m 的普通 recovery 路径。
+    sharp_recovery_min_path_points: int = 3
+    sharp_recovery_min_path_span_m: float = 0.10
+    sharp_recovery_suggested_linear_x: float = 0.08
+    sharp_recovery_max_angular_z: float = 0.30
+
+    # 3~5点急弯路径天然比普通 recovery 抖动更大。
+    # 保留方向一致性和几何一致性，但使用独立稳定窗口。
+    sharp_recovery_required_stable_frames: int = 2
+    sharp_recovery_max_heading_std_deg: float = 8.0
+    sharp_recovery_max_target_y_delta_m: float = 0.05
+    sharp_recovery_max_lateral_delta_m: float = 0.05
+
     recovery_required_stable_frames: int = 4
     recovery_suggested_linear_x: float = 0.32
     recovery_max_angular_z: float = 0.30
@@ -254,6 +270,21 @@ class ControllerConfig:
             "normal_min_path_span_m": self.normal_min_path_span_m,
             "degraded_min_path_span_m": self.degraded_min_path_span_m,
             "recovery_min_path_span_m": self.recovery_min_path_span_m,
+            "sharp_recovery_min_path_span_m": (
+                self.sharp_recovery_min_path_span_m
+            ),
+            "sharp_recovery_max_angular_z": (
+                self.sharp_recovery_max_angular_z
+            ),
+            "sharp_recovery_max_heading_std_deg": (
+                self.sharp_recovery_max_heading_std_deg
+            ),
+            "sharp_recovery_max_target_y_delta_m": (
+                self.sharp_recovery_max_target_y_delta_m
+            ),
+            "sharp_recovery_max_lateral_delta_m": (
+                self.sharp_recovery_max_lateral_delta_m
+            ),
             "normal_max_angular_z": self.normal_max_angular_z,
             "degraded_max_angular_z": self.degraded_max_angular_z,
             "recovery_max_angular_z": self.recovery_max_angular_z,
@@ -286,6 +317,7 @@ class ControllerConfig:
             "normal_min_path_points",
             "degraded_min_path_points",
             "recovery_min_path_points",
+            "sharp_recovery_min_path_points",
         ):
             if int(getattr(self, name)) < self.min_path_points:
                 raise ValueError(
@@ -310,11 +342,18 @@ class ControllerConfig:
         self.recovery_suggested_linear_x = max(
             0.0, finite_float(self.recovery_suggested_linear_x)
         )
+        self.sharp_recovery_suggested_linear_x = max(
+            0.0, finite_float(self.sharp_recovery_suggested_linear_x)
+        )
         self.recovery_required_stable_frames = max(
             1, int(self.recovery_required_stable_frames)
         )
+        self.sharp_recovery_required_stable_frames = max(
+            1, int(self.sharp_recovery_required_stable_frames)
+        )
         self.recovery_history_size = max(
             self.recovery_required_stable_frames,
+            self.sharp_recovery_required_stable_frames,
             int(self.recovery_history_size),
         )
         self.direction_flip_window_size = max(
@@ -950,27 +989,54 @@ def evaluate_mode_policy(
             ),
         )
     elif mode in RECOVERY_MODES:
-        level = "recovery"
-        requirements = (
-            (
-                analysis.point_count >= config.recovery_min_path_points,
-                "recovery_path_points_low",
-            ),
-            (
-                min(
-                    analysis.span_m,
-                    perception.centerline_forward_span_m,
-                )
-                + 1.0e-9
-                >= config.recovery_min_path_span_m,
-                "recovery_path_span_low",
-            ),
-            (
-                perception.centerline_confidence
-                >= config.recovery_min_confidence,
-                "recovery_confidence_low",
-            ),
+        recovery_span = min(
+            analysis.span_m,
+            perception.centerline_forward_span_m,
         )
+
+        standard_points_ok = (
+            analysis.point_count >= config.recovery_min_path_points
+        )
+        standard_span_ok = (
+            recovery_span + 1.0e-9
+            >= config.recovery_min_path_span_m
+        )
+        confidence_ok = (
+            perception.centerline_confidence
+            >= config.recovery_min_confidence
+        )
+
+        # 普通 recovery 的几何条件已经满足时，
+        # 不允许再降级到 sharp recovery 绕过其判据。
+        if standard_points_ok and standard_span_ok:
+            if not confidence_ok:
+                return "blocked", "recovery_confidence_low"
+            return "recovery", "recovery_mode_accepted"
+
+        # sharp recovery 只解决 single-green 急弯中的
+        # 短视野（点数/跨度不足），不用于绕过低置信度。
+        if mode == "single_green_width_offset":
+            if (
+                analysis.point_count
+                < config.sharp_recovery_min_path_points
+            ):
+                return "blocked", "sharp_recovery_path_points_low"
+
+            if (
+                recovery_span + 1.0e-9
+                < config.sharp_recovery_min_path_span_m
+            ):
+                return "blocked", "sharp_recovery_path_span_low"
+
+            if not confidence_ok:
+                return "blocked", "sharp_recovery_confidence_low"
+
+            return "recovery", "sharp_recovery"
+
+        if not standard_points_ok:
+            return "blocked", "recovery_path_points_low"
+
+        return "blocked", "recovery_path_span_low"
     else:
         return "blocked", "centerline_mode_not_allowed"
     for passed, reason in requirements:
@@ -1167,6 +1233,7 @@ def update_recovery_stability(
     state: ControllerRuntimeState,
     config: ControllerConfig,
     advance_state: bool,
+    sharp_recovery: bool = False,
 ) -> Tuple[int, float, float, float, bool]:
     if advance_state:
         state.recovery_heading_history.append(float(heading_raw))
@@ -1190,14 +1257,30 @@ def update_recovery_stability(
     )
     target_delta = max(targets) - min(targets) if targets else 0.0
     lateral_delta = max(laterals) - min(laterals) if laterals else 0.0
+
+    if sharp_recovery:
+        max_heading_std_deg = config.sharp_recovery_max_heading_std_deg
+        max_target_y_delta_m = config.sharp_recovery_max_target_y_delta_m
+        max_lateral_delta_m = config.sharp_recovery_max_lateral_delta_m
+
+        # 急弯短 Path 的 raw heading 抖动较大。
+        # 输出本身仍经过 heading rate limiter，因此不把
+        # “rate limiter 正在工作”直接视为 sharp recovery 失败。
+        heading_rate_ok = True
+    else:
+        max_heading_std_deg = config.recovery_max_heading_std_deg
+        max_target_y_delta_m = config.recovery_max_target_y_delta_m
+        max_lateral_delta_m = config.recovery_max_lateral_delta_m
+        heading_rate_ok = not heading_rate_limited
+
     stable = bool(
         headings
         and math.isfinite(heading_raw)
-        and not heading_rate_limited
+        and heading_rate_ok
         and not analysis.heading_chord_disagreement
-        and heading_std <= config.recovery_max_heading_std_deg
-        and target_delta <= config.recovery_max_target_y_delta_m
-        and lateral_delta <= config.recovery_max_lateral_delta_m
+        and heading_std <= max_heading_std_deg
+        and target_delta <= max_target_y_delta_m
+        and lateral_delta <= max_lateral_delta_m
         and direction_flip_count <= config.recovery_max_direction_flips
     )
     if advance_state:
@@ -1417,8 +1500,12 @@ def compute_preview_command(
             else config.degraded_suggested_linear_x
         )
     else:
-        angular_limit = config.recovery_max_angular_z
-        base_speed = config.recovery_suggested_linear_x
+        if policy_reason == "sharp_recovery":
+            angular_limit = config.sharp_recovery_max_angular_z
+            base_speed = config.sharp_recovery_suggested_linear_x
+        else:
+            angular_limit = config.recovery_max_angular_z
+            base_speed = config.recovery_suggested_linear_x
     preview.suggested_angular_z_mode_limited = clamp(
         preview.suggested_angular_z_unfiltered,
         -angular_limit,
@@ -1480,6 +1567,8 @@ def compute_preview_command(
     )
 
     if level == "recovery":
+        sharp_recovery_active = policy_reason == "sharp_recovery"
+
         (
             preview.recovery_stable_frame_count,
             preview.recovery_heading_std_deg,
@@ -1494,11 +1583,20 @@ def compute_preview_command(
             state,
             config,
             advance_state,
+            sharp_recovery=sharp_recovery_active,
         )
+
+        required_stable_frames = (
+            config.sharp_recovery_required_stable_frames
+            if sharp_recovery_active
+            else config.recovery_required_stable_frames
+        )
+        preview.recovery_required_stable_frames = required_stable_frames
+
         if (
             not recovery_stable
             or preview.recovery_stable_frame_count
-            < config.recovery_required_stable_frames
+            < required_stable_frames
         ):
             reason = "recovery_not_stable"
     elif advance_state:
@@ -1952,15 +2050,15 @@ def run_self_test() -> None:
         result = validate_path("camera", _path_points(), config)
         assert not result.valid and result.reason == "path_frame_mismatch"
 
-    @test("12 too few points blocks")
+    @test("12 below structural point minimum blocks")
     def _() -> None:
-        result = validate_path("base_link", _path_points(count=5), config)
+        result = validate_path("base_link", _path_points(count=2), config)
         assert not result.valid and result.reason == "path_too_few_points"
 
-    @test("13 short span blocks")
+    @test("13 below structural span minimum blocks")
     def _() -> None:
         result = validate_path(
-            "base_link", _path_points(start=0.1, end=0.3), config
+            "base_link", _path_points(start=0.10, end=0.19), config
         )
         assert not result.valid and result.reason == "path_span_too_short"
 
@@ -2580,21 +2678,28 @@ def run_self_test() -> None:
         )
         assert preview.control_block_reason == "centerline_mode_not_allowed"
 
-    @test("74 recovery span below minimum blocks")
+    @test("74 sharp recovery span below minimum blocks")
     def _() -> None:
-        local = ControllerConfig(min_path_span_m=0.20)
+        local = ControllerConfig(
+            min_path_span_m=0.05,
+            min_centerline_span_m=0.05,
+        )
         local.validate()
         analysis = validate_path(
             "base_link",
-            _path_points(start=0.30, end=0.52, count=6),
+            _path_points(start=0.30, end=0.38, count=3),
             local,
         )
+        assert analysis.valid
         level, reason = evaluate_mode_policy(
             analysis,
             _healthy_perception(mode="single_green_width_offset"),
             local,
         )
-        assert level == "blocked" and reason == "recovery_path_span_low"
+        assert (
+            level == "blocked"
+            and reason == "sharp_recovery_path_span_low"
+        )
 
     @test("75 recovery low confidence blocks")
     def _() -> None:

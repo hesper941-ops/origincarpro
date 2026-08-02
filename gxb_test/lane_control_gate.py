@@ -55,6 +55,8 @@ class GateConfig:
     normal_recovery_frames: int = 2
     min_path_points: int = 6
     min_path_span_m: float = 0.25
+    sharp_recovery_min_path_points: int = 3
+    sharp_recovery_min_path_span_m: float = 0.10
     controller_timeout_sec: float = 0.40
     pipeline_timeout_sec: float = 1.20
     feedback_timeout_sec: float = 0.20
@@ -78,12 +80,14 @@ class GateConfig:
         self.ready_frames = max(1, int(self.ready_frames))
         self.normal_recovery_frames = max(1, int(self.normal_recovery_frames))
         self.min_path_points = max(3, int(self.min_path_points))
+        self.sharp_recovery_min_path_points = max(3, int(self.sharp_recovery_min_path_points))
         for name in (
             "controller_timeout_sec",
             "pipeline_timeout_sec",
             "feedback_timeout_sec",
             "path_timeout_sec",
             "min_path_span_m",
+            "sharp_recovery_min_path_span_m",
             "max_linear_normal",
             "max_linear_hybrid",
             "max_linear_degraded",
@@ -236,12 +240,12 @@ class LaneControlGateCore:
             return "path_invalid"
         if (
             int(finite(command.get("path_point_count"), -1.0))
-            < self.config.min_path_points
+            < (self.config.sharp_recovery_min_path_points if str(command.get("mode", "")) == "single_green_width_offset" else self.config.min_path_points)
         ):
             return "path_points_low"
         if (
             finite(command.get("path_span_m"), -1.0) + 1.0e-9
-            < self.config.min_path_span_m
+            < (self.config.sharp_recovery_min_path_span_m if str(command.get("mode", "")) == "single_green_width_offset" else self.config.min_path_span_m)
         ):
             return "path_span_low"
         path_age_ms = finite(command.get("path_age_ms"), math.inf)
@@ -266,12 +270,12 @@ class LaneControlGateCore:
             return "pipeline_invalid"
         if (
             int(finite(pipeline.get("final_centerline_point_count"), -1.0))
-            < self.config.min_path_points
+            < (self.config.sharp_recovery_min_path_points if str(pipeline.get("centerline_mode", "")) == "single_green_width_offset" else self.config.min_path_points)
         ):
             return "pipeline_path_points_low"
         if (
             finite(pipeline.get("centerline_forward_span_m"), -1.0) + 1.0e-9
-            < self.config.min_path_span_m
+            < (self.config.sharp_recovery_min_path_span_m if str(pipeline.get("centerline_mode", "")) == "single_green_width_offset" else self.config.min_path_span_m)
         ):
             return "pipeline_path_span_low"
         mode = str(command.get("mode", ""))
