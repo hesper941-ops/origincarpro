@@ -1,0 +1,12 @@
+roadblock_ground_localizer:
+  ros__parameters:
+    detection_topic: "/hobot_dnn_detection"
+    output_topic: "/roadblock_ground_array"
+    roadblock_label: "roadblock"
+    calibration_file: ""
+    frame_id: "base_link"
+    min_confidence: 0.50
+    min_x_m: 0.20
+    max_x_m: 2.00
+    max_abs_y_m: 1.00
+    debug_log: false
