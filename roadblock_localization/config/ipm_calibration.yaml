@@ -1,21 +1,21 @@
 image_width: 640
 image_height: 400
 camera_matrix:
-- - 417.7791442871094
+- - 418.73333740234375
   - 0.0
-  - 315.5104064941406
+  - 311.87457275390625
 - - 0.0
-  - 418.42498779296875
-  - 187.74124145507812
+  - 419.4958190917969
+  - 184.26998901367188
 - - 0.0
   - 0.0
   - 1.0
 distortion_coefficients:
-- 0.0032731799874454737
-- -0.04043729975819588
-- -1.251760022569215e-05
-- -0.0006097209989093244
-- 0.024157699197530746
+- 0.00564303994178772
+- -0.050810400396585464
+- 0.0003823069855570793
+- -0.0005662399926222861
+- 0.0292642991989851
 distortion_model: plumb_bob
 pattern_cols: 11
 pattern_rows: 8
@@ -24,30 +24,30 @@ vehicle_coordinate:
   origin: base_rotation_center
   x_positive: forward
   y_positive: left
-main_board_near_row_x_m: 0.3
+main_board_near_row_x_m: 0.52
 H_ground_to_image:
-- - 3179.9869545568813
-  - -5015.753750391396
-  - 432.8904087666617
-- - 54.275405736462325
-  - 30.29050835159212
-  - 1503.1567151100155
-- - 10.723801827335604
-  - -0.4244674300428392
+- - -10852.035029176892
+  - 12726.998197864843
+  - 176.0428388981547
+- - -3506.8187610253863
+  - -513.7465527394638
+  - -3732.7007070821105
+- - -31.616845872761747
+  - -2.3354071049910616
   - 1.0
 H_image_to_ground:
-- - 0.0018133811379173468
-  - 0.01311066036294552
-  - -20.492372466130963
-- - 0.04358985201025179
-  - -0.003967500245149514
-  - -12.905854219098998
-- - -0.0009438675017146618
-  - -0.14228019819048388
+- - -0.00018386319539392309
+  - -0.0002616819996687334
+  - -0.9444127863081054
+- - 0.0024204656838181663
+  - -0.00010528753669084066
+  - -0.8191125130877444
+- - -0.00016040155506716181
+  - -0.008519448712457195
   - 1.0
 calibration_metrics:
-  reprojection_rms_px: 0.13957968072498567
-  reprojection_max_px: 0.5097527380185535
+  reprojection_rms_px: 0.08882172476821054
+  reprojection_max_px: 0.18729597479772048
   inlier_count: 87
 thresholds:
   ransac_threshold_px: 2.0
@@ -57,7 +57,7 @@ thresholds:
 validation:
   main:
     status: PASS
-    message: existing H check, 88 corners, RMS=0.135px, max=0.379px
+    message: 88 corners, RMS=0.089px, max=0.187px
     roi_ratio:
     - 0.12
     - 0.32
@@ -75,61 +75,61 @@ validation:
     metrics:
       corner_count: 88
       inlier_count: 87
-      reprojection_rms_px: 0.13460043596743312
-      reprojection_max_px: 0.37937006981852656
-      ground_xy_rms_m: 0.00021851227016171946
-      ground_xy_max_m: 0.0005815058970283293
-      ground_x_rms_m: 0.00019942102980503244
-      ground_y_rms_m: 8.932449318484069e-05
+      reprojection_rms_px: 0.08882172476821054
+      reprojection_max_px: 0.18729597479772048
+      ground_xy_rms_m: 0.00022135816065904575
+      ground_xy_max_m: 0.0005649500798782128
+      ground_x_rms_m: 0.00020834739432351856
+      ground_y_rms_m: 7.477164281300879e-05
       scale:
         horizontal_adjacent:
           count: 80
-          mean_m: 0.029986843188463196
-          median_m: 0.030004659999226895
-          std_m: 0.00010327012919434697
-          median_error_percent: 0.015533330756320926
+          mean_m: 0.03000940665556296
+          median_m: 0.030020140543804162
+          std_m: 0.00010053602490589957
+          median_error_percent: 0.06713514601387749
         vertical_adjacent:
           count: 77
-          mean_m: 0.02997926094205474
-          median_m: 0.029956291664192714
-          std_m: 0.0002325471648674751
-          median_error_percent: 0.145694452690949
+          mean_m: 0.029990861481348236
+          median_m: 0.029975387057859192
+          std_m: 0.00029796218813931205
+          median_error_percent: 0.08204314046935529
         all_adjacent:
           count: 157
-          mean_m: 0.029983124507103626
-          median_m: 0.029984993856710804
-          std_m: 0.000178804476403168
-          median_error_percent: 0.05002047763064815
+          mean_m: 0.03000031125164873
+          median_m: 0.03000735931433687
+          std_m: 0.00022085915476888928
+          median_error_percent: 0.024531047789569847
         horizontal_span:
           square_count: 10
           count: 8
-          mean_m: 0.2998600657974233
-          median_m: 0.29990702399172686
-          std_m: 0.00021618977019208647
-          median_error_percent: 0.030992002757708935
+          mean_m: 0.3000794690065673
+          median_m: 0.30003614267833767
+          std_m: 0.00012438452334324218
+          median_error_percent: 0.01204755944589353
         vertical_span:
           square_count: 7
           count: 11
-          mean_m: 0.20985324243395348
-          median_m: 0.20987945242610542
-          std_m: 0.0002254702476907405
-          median_error_percent: 0.05740360661646161
+          mean_m: 0.2099349211633759
+          median_m: 0.20984345213509548
+          std_m: 0.0003273311006474457
+          median_error_percent: 0.07454660233548381
         span_10_squares:
           count: 8
-          mean_m: 0.2998600657974233
-          median_m: 0.29990702399172686
-          std_m: 0.00021618977019208647
-          median_error_percent: 0.030992002757708935
+          mean_m: 0.3000794690065673
+          median_m: 0.30003614267833767
+          std_m: 0.00012438452334324218
+          median_error_percent: 0.01204755944589353
         span_7_squares:
           count: 11
-          mean_m: 0.20985324243395348
-          median_m: 0.20987945242610542
-          std_m: 0.0002254702476907405
-          median_error_percent: 0.05740360661646161
-      homography_refit: false
+          mean_m: 0.2099349211633759
+          median_m: 0.20984345213509548
+          std_m: 0.0003273311006474457
+          median_error_percent: 0.07454660233548381
   left:
-    status: PASS
-    message: 8x6, 48 corners, median=3.05cm, error=1.68%
+    status: NOT VERIFIED
+    message: 'no local pattern detected; attempts: 2x/9x6=0, 2x/8x6=0, 2x/8x5=0, 2x/7x5=0,
+      2x/7x4=0, 2x/6x5=0, 2x/6x4=0, 2x/5x4=0'
     roi_ratio:
     - 0.0
     - 0.28
@@ -140,9 +140,9 @@ validation:
     - 112
     - 282
     - 220
-    corner_count: 48
-    detected_pattern: 8x6
-    upscale: 2.0
+    corner_count: 0
+    detected_pattern: null
+    upscale: null
     pattern_attempts:
     - scale: 2.0
       pattern: 9x6
@@ -150,8 +150,8 @@ validation:
       corner_count: 0
     - scale: 2.0
       pattern: 8x6
-      success: true
-      corner_count: 48
+      success: false
+      corner_count: 0
     - scale: 2.0
       pattern: 8x5
       success: false
@@ -162,66 +162,21 @@ validation:
       corner_count: 0
     - scale: 2.0
       pattern: 7x4
-      success: true
-      corner_count: 28
+      success: false
+      corner_count: 0
     - scale: 2.0
       pattern: 6x5
       success: false
       corner_count: 0
     - scale: 2.0
       pattern: 6x4
-      success: true
-      corner_count: 24
+      success: false
+      corner_count: 0
     - scale: 2.0
       pattern: 5x4
-      success: true
-      corner_count: 20
-    metrics:
-      horizontal_adjacent:
-        count: 42
-        mean_m: 0.03163347242683236
-        median_m: 0.03164632903457097
-        std_m: 0.0009987216514532157
-        median_error_percent: 5.48776344856991
-      vertical_adjacent:
-        count: 40
-        mean_m: 0.03020119016344503
-        median_m: 0.030209338706481296
-        std_m: 0.00024421382362477246
-        median_error_percent: 0.6977956882709899
-      all_adjacent:
-        count: 82
-        mean_m: 0.030934798152009266
-        median_m: 0.03050523893066319
-        std_m: 0.0010259299852221546
-        median_error_percent: 1.6841297688773016
-      horizontal_span:
-        square_count: 7
-        count: 6
-        mean_m: 0.2214313282475253
-        median_m: 0.22165996757994344
-        std_m: 0.0010101679763981034
-        median_error_percent: 5.552365514258785
-      vertical_span:
-        square_count: 5
-        count: 8
-        mean_m: 0.15093219627346843
-        median_m: 0.1508862149192234
-        std_m: 0.0009056787301718599
-        median_error_percent: 0.590809946148944
-      quality:
-        horizontal_error_percent: 5.48776344856991
-        vertical_error_percent: 0.6977956882709899
-        horizontal_median_over_vertical_median: 1.0475677518813538
-        horizontal_std_over_median: 0.03155884685273277
-        vertical_std_over_median: 0.008084050630753375
-        checks:
-          horizontal_error_pass: true
-          vertical_error_pass: true
-          horizontal_vertical_ratio_pass: true
-          horizontal_cv_pass: true
-          vertical_cv_pass: true
-        valid: true
+      success: false
+      corner_count: 0
+    metrics: null
   right:
     status: NOT VERIFIED
     message: 'no local pattern detected; attempts: 2x/9x6=0, 2x/8x6=0, 2x/8x5=0, 2x/7x5=0,
@@ -274,8 +229,10 @@ validation:
       corner_count: 0
     metrics: null
   far:
-    status: INVALID
-    message: 6x4, 24 corners, median=3.23cm, error=7.66%
+    status: NOT VERIFIED
+    message: 'no local pattern detected; attempts: 2x/9x6=0, 2x/8x6=0, 2x/8x5=0, 2x/7x5=0,
+      2x/7x4=0, 2x/6x5=0, 2x/6x4=0, 2x/5x4=0, 3x/9x6=0, 3x/8x6=0, 3x/8x5=0, 3x/7x5=0,
+      3x/7x4=0, 3x/6x5=0, 3x/6x4=0, 3x/5x4=0'
     roi_ratio:
     - 0.390625
     - 0.195
@@ -286,9 +243,9 @@ validation:
     - 78
     - 420
     - 132
-    corner_count: 24
-    detected_pattern: 6x4
-    upscale: 2.0
+    corner_count: 0
+    detected_pattern: null
+    upscale: null
     pattern_attempts:
     - scale: 2.0
       pattern: 9x6
@@ -316,8 +273,8 @@ validation:
       corner_count: 0
     - scale: 2.0
       pattern: 6x4
-      success: true
-      corner_count: 24
+      success: false
+      corner_count: 0
     - scale: 2.0
       pattern: 5x4
       success: false
@@ -354,60 +311,7 @@ validation:
       pattern: 5x4
       success: false
       corner_count: 0
-    metrics:
-      horizontal_adjacent:
-        count: 20
-        mean_m: 0.032156525760389895
-        median_m: 0.031717063518605156
-        std_m: 0.0023235498849128373
-        median_error_percent: 5.723545062017189
-      vertical_adjacent:
-        count: 18
-        mean_m: 0.03322689699191157
-        median_m: 0.03474304651657878
-        std_m: 0.016670272591476805
-        median_error_percent: 15.810155055262603
-      all_adjacent:
-        count: 38
-        mean_m: 0.032663543712163325
-        median_m: 0.032297333057793136
-        std_m: 0.01160874831060044
-        median_error_percent: 7.657776859310457
-      horizontal_span:
-        square_count: 5
-        count: 4
-        mean_m: 0.16075373196470613
-        median_m: 0.161146365832943
-        std_m: 0.0027200931064975805
-        median_error_percent: 7.430910555295342
-      vertical_span:
-        square_count: 3
-        count: 6
-        mean_m: 0.09470082932587175
-        median_m: 0.09444307123791329
-        std_m: 0.0022165823106054965
-        median_error_percent: 4.936745819903659
-      quality:
-        horizontal_error_percent: 5.723545062017189
-        vertical_error_percent: 15.810155055262603
-        horizontal_median_over_vertical_median: 0.9129039246305105
-        horizontal_std_over_median: 0.07325866984974344
-        vertical_std_over_median: 0.47981608588993596
-        checks:
-          horizontal_error_pass: true
-          vertical_error_pass: false
-          horizontal_vertical_ratio_pass: true
-          horizontal_cv_pass: true
-          vertical_cv_pass: false
-        valid: false
-validation_run:
-  mode: existing_homography
-  homography_refit: false
-  validation_pass_percent: 10.0
-  horizontal_vertical_ratio_range:
-  - 0.9
-  - 1.1
-  maximum_directional_std_over_median: 0.15
+    metrics: null
 metric_bev:
   x_range_m:
   - 0.25
