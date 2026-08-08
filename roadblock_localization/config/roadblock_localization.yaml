@@ -1,12 +1,39 @@
 roadblock_ground_localizer:
   ros__parameters:
     detection_topic: "/hobot_dnn_detection"
+    odom_topic: "/odom"
     output_topic: "/roadblock_ground_array"
     roadblock_label: "roadblock"
     calibration_file: ""
     frame_id: "base_link"
     min_confidence: 0.50
+    image_width: 640
+    image_height: 400
+    # Engineering initial value; bbox edge margin is pending real-car validation.
+    edge_margin_px: 2.0
+    camera_ground_x_m: 0.05
+    camera_ground_y_m: 0.00
+    camera_height_m: 0.28
+    cone_height_m: 0.30
+    cone_base_width_m: 0.20
+    cone_base_length_m: 0.20
+    ipm_center_offset_m: 0.10
+    height_model_a: 99.488
+    height_model_b: 0.22381
+    fusion_alpha_ipm: 0.70
+    min_ipm_radius_m: 0.01
     min_x_m: 0.20
     max_x_m: 2.00
-    max_abs_y_m: 1.00
+    # Geometric initial values; wedge/FOV edges require real-car validation.
+    # Disabled by default until full-view edge testing is complete.
+    enable_fov_gate: false
+    # A center is accepted when slope*X-|Y| >= radius*sqrt(1+slope^2).
+    fov_boundary_slope_y_per_x: 0.713
+    fov_footprint_radius_m: 0.1414213562373095
+    # Engineering initial values; association/TTL require real-car validation.
+    association_max_distance_m: 0.30
+    track_ttl_sec: 2.0
+    track_min_x_m: -0.30
+    track_max_distance_m: 3.00
+    publish_rate_hz: 10.0
     debug_log: false

@@ -1,36 +1,64 @@
 # roadblock_localization
 
-Independent ROS2 package that converts YOLO `roadblock` bounding boxes into
-metric vehicle-ground coordinates. It does not make avoidance decisions and
-never publishes motion commands.
+This ROS2 package reports cone positions only. It never publishes motion
+commands and contains no avoidance or driving policy.
 
-## Interface
+## Team interface
 
-- Input: `/hobot_dnn_detection` (`ai_msgs/msg/PerceptionTargets`)
-- Output: `/roadblock_ground_array` (`roadblock_interfaces/msg/RoadblockArray`)
-- Output frame: `base_link`
-- Coordinate convention: origin at chassis rotation center, `+X` forward,
-  `+Y` left, ground `Z=0`, unit meter
+- Inputs: `/hobot_dnn_detection` (`ai_msgs/msg/PerceptionTargets`) and `/odom`
+  (`nav_msgs/msg/Odometry`)
+- Output: `/roadblock_ground_array`
+  (`roadblock_interfaces/msg/RoadblockArray`)
+- Frame: `base_link`; origin is the chassis rotation center
+- Coordinates: `x` forward-positive, `y` left-positive, unit metre
 
-The X5 YOLO output was verified against `/image_out/compressed`: ROI values are
-already in the original 640x400 image coordinate system. For each ROI, V1 uses
-only its bottom-center pixel:
+Each obstacle has exactly three fields: `id`, `x`, and `y`. `id` is a stable
+local track ID for the lifetime of the running node; it is not a distance rank.
+No valid track is represented by `obstacles: []`.
 
-```text
-u = x_offset + width / 2
-v = y_offset + height
+Minimal Python subscriber:
+
+```python
+from roadblock_interfaces.msg import RoadblockArray
+
+def callback(msg):
+    for obs in msg.obstacles:
+        print(f"id={obs.id} x={obs.x:.3f}m y={obs.y:.3f}m")
+
+subscription = node.create_subscription(
+    RoadblockArray, "/roadblock_ground_array", callback, 10
+)
 ```
 
-The pixel is undistorted with the installed calibration K/D and projected by
-the installed `H_image_to_ground`. The node does not subscribe to an image.
+## Internal method
 
-Each output array represents only the current detection frame. Obstacles are
-sorted by `sqrt(x^2 + y^2)` and then numbered from 1. Therefore `id=1` is the
-nearest current-frame obstacle, `id=2` is the second-nearest, and so on. These
-IDs are recomputed every frame and are **not persistent tracking IDs**.
+For each complete, reliable YOLO `roadblock` bbox, its bottom-centre pixel is
+undistorted and projected with the installed point IPM. The resulting ground
+ray supplies direction. Range is fused from:
 
-When no valid roadblock is present, the node publishes `obstacles: []`; it does
-not retain a previous frame.
+```text
+d_A = distance(camera_ground_projection, IPM_bottom_center) + 0.10 m
+d_B = 99.488 / bbox_height_px + 0.22381
+d   = 0.70 * d_A + 0.30 * d_B
+```
+
+This fixed scheme C was selected from nine real-car measurements:
+
+| Method | Mean | Median | RMSE | Max |
+|---|---:|---:|---:|---:|
+| A: IPM + 10 cm | 3.68 cm | 4.02 cm | 3.82 cm | 5.05 cm |
+| B: IPM direction + bbox-height range | 4.06 cm | 4.39 cm | 4.15 cm | 5.04 cm |
+| C: 0.70/0.30 fusion | 3.61 cm | 3.93 cm | 3.72 cm | 4.96 cm |
+
+The measured accuracy coverage was mainly `X=0.6..1.0 m` and lateral
+`Y=+-0.20 m`. This documents the tested region; it is not an algorithmic range
+limit. Wider lateral coverage still requires real-car validation.
+
+The fused centre is stored in the odom frame. Existing tracks are transformed
+back into the current `base_link` frame for every publication, so a temporarily
+unreliable/cropped bbox cannot freeze or overwrite the last reliable position.
+Reliable observations use one-to-one ground-XY nearest-neighbour association.
+IDs increase monotonically and are not reused during a node run.
 
 ## Start
 
@@ -39,43 +67,58 @@ cd /root/intelligent_car_ws
 source /opt/tros/humble/setup.bash
 source install/setup.bash
 ros2 launch roadblock_localization roadblock_localization.launch.py
-```
-
-Or run the executable directly:
-
-```bash
-ros2 run roadblock_localization roadblock_ground_localizer
-```
-
-Inspect output:
-
-```bash
 ros2 topic echo /roadblock_ground_array
 ```
 
-The launch file starts only `roadblock_ground_localizer`; Aurora, YOLO, base,
-lane, avoidance, and control nodes are deliberately outside this package.
+The launch starts only the localizer; camera, YOLO, odometry, lane, avoidance,
+and control nodes remain outside this package.
 
 ## Parameters
 
-| Name | Default | Meaning |
-|---|---:|---|
-| `detection_topic` | `/hobot_dnn_detection` | YOLO detections |
-| `output_topic` | `/roadblock_ground_array` | Ground-position array |
-| `roadblock_label` | `roadblock` | Exact target label after case normalization |
-| `calibration_file` | installed package calibration | Fixed IPM YAML |
-| `frame_id` | `base_link` | Verified vehicle-ground frame |
-| `min_confidence` | `0.50` | Reject lower-confidence detections |
-| `min_x_m` | `0.20` | Reject X at or behind this limit |
-| `max_x_m` | `2.00` | Maximum validated forward range |
-| `max_abs_y_m` | `1.00` | Maximum absolute lateral range |
-| `debug_log` | `false` | Throttled localization log, at most 1 Hz |
+The runtime values are in `config/roadblock_localization.yaml`. Fixed physical
+and calibrated values are:
 
-Formal runtime calibration:
+- camera ground projection `(0.05, 0.00)` m; camera height `0.28` m
+- cone height `0.30` m; base width/length `0.20/0.20` m
+- IPM centre offset `0.10` m
+- height model `99.488 / h_px + 0.22381`
+- fusion IPM weight `0.70`
+
+The following are engineering initial values and **are pending real-car
+validation**, not calibrated constants:
+
+- `edge_margin_px: 2.0`
+- `enable_fov_gate: false`
+- `fov_boundary_slope_y_per_x: 0.713`
+- `fov_footprint_radius_m: 0.1414213562`
+- `association_max_distance_m: 0.30`
+- `track_ttl_sec: 2.0`
+- `track_min_x_m: -0.30`
+- `track_max_distance_m: 3.00`
+
+Any bbox touching the configured edge margin, extending outside `640x400`, or
+having invalid geometry is unreliable. It cannot create or update an absolute
+track position. Tracks survive such frames only within TTL using odom
+propagation.
+
+The optional ground FOV is modelled as the wedge `|Y| <= 0.713*X`. For a cone
+base conservatively represented by radius `R=sqrt(0.10^2+0.10^2)=0.1414 m`, a
+new visual update must satisfy, when `enable_fov_gate` is true:
 
 ```text
-share/roadblock_localization/config/ipm_calibration.yaml
+0.713*X - |Y| >= R*sqrt(1 + 0.713^2)
 ```
 
-It is a direct copy of the verified development calibration. Debug JPG/CSV
-artifacts are intentionally not installed with this package.
+This uses perpendicular distance to each sloped boundary, not a rectangular
+`max_abs_y` check. The FOV gate is a geometric initial model pending full-view
+real-car edge validation and is therefore **disabled by default**. When false,
+it never rejects an otherwise valid visual measurement. When true, it gates
+only new visual measurements; it does not delete a reliable historical Track.
+TTL, odom propagation, behind-vehicle threshold, and maximum radial range
+govern Track maintenance.
+
+No Track is created or updated before the first finite `/odom` pose arrives.
+The node remains alive and continues publishing `obstacles: []` while waiting.
+
+The verified IPM is installed at
+`share/roadblock_localization/config/ipm_calibration.yaml`.
