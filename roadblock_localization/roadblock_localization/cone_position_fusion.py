@@ -14,6 +14,45 @@ class FusionResult:
     fused_distance: float
 
 
+@dataclass(frozen=True)
+class AdaptiveIPMParameters:
+    c0_m: float
+    cr: float
+    cw_m: float
+    ca_m: float
+    cu_m: float
+    raw_distance_center_m: float
+    width_range_center: float
+    width_range_scale: float
+    aspect_center: float
+    aspect_scale: float
+    offset_min_m: float
+    offset_max_m: float
+
+
+@dataclass(frozen=True)
+class AdaptiveOffsetResult:
+    offset_m: float
+    unclamped_offset_m: float
+    u_norm: float
+    aspect: float
+    width_times_raw: float
+    was_clamped: bool
+
+
+@dataclass(frozen=True)
+class AdaptiveIPMResult:
+    x: float
+    y: float
+    ipm_raw_distance: float
+    adaptive_center_offset: float
+    final_distance: float
+    u_norm: float
+    aspect: float
+    width_times_raw: float
+    offset_was_clamped: bool
+
+
 def bbox_is_reliable(
     xmin: float,
     ymin: float,
@@ -147,3 +186,173 @@ def fuse_cone_position(
         height_distance=height_distance,
         fused_distance=fused_distance,
     )
+
+
+def compute_adaptive_center_offset(
+    ipm_raw_distance_m: float,
+    bbox_width_px: float,
+    bbox_height_px: float,
+    bbox_center_u_px: float,
+    image_width_px: float,
+    parameters: AdaptiveIPMParameters,
+) -> AdaptiveOffsetResult:
+    """Compute the data-fitted radial cone-centre offset from observable bbox geometry."""
+    values = (
+        ipm_raw_distance_m,
+        bbox_width_px,
+        bbox_height_px,
+        bbox_center_u_px,
+        image_width_px,
+        parameters.c0_m,
+        parameters.cr,
+        parameters.cw_m,
+        parameters.ca_m,
+        parameters.cu_m,
+        parameters.raw_distance_center_m,
+        parameters.width_range_center,
+        parameters.width_range_scale,
+        parameters.aspect_center,
+        parameters.aspect_scale,
+        parameters.offset_min_m,
+        parameters.offset_max_m,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("adaptive IPM inputs and parameters must be finite")
+    if ipm_raw_distance_m <= 0.0 or bbox_width_px <= 0.0 or bbox_height_px <= 0.0:
+        raise ValueError("adaptive IPM distances and bbox dimensions must be positive")
+    if image_width_px <= 0.0:
+        raise ValueError("image width must be positive")
+    if parameters.width_range_scale <= 0.0 or parameters.aspect_scale <= 0.0:
+        raise ValueError("adaptive feature scales must be positive")
+    if parameters.offset_max_m < parameters.offset_min_m:
+        raise ValueError("adaptive offset limits are reversed")
+
+    u_norm = (bbox_center_u_px - image_width_px / 2.0) / (image_width_px / 2.0)
+    aspect = bbox_width_px / bbox_height_px
+    width_times_raw = bbox_width_px * ipm_raw_distance_m
+    raw_offset = (
+        parameters.c0_m
+        + parameters.cr * (ipm_raw_distance_m - parameters.raw_distance_center_m)
+        + parameters.cw_m
+        * (
+            (width_times_raw - parameters.width_range_center)
+            / parameters.width_range_scale
+        )
+        + parameters.ca_m
+        * ((aspect - parameters.aspect_center) / parameters.aspect_scale)
+        + parameters.cu_m * u_norm * u_norm
+    )
+    if not math.isfinite(raw_offset):
+        raise ValueError("adaptive offset is not finite")
+    offset = min(max(raw_offset, parameters.offset_min_m), parameters.offset_max_m)
+    return AdaptiveOffsetResult(
+        offset_m=offset,
+        unclamped_offset_m=raw_offset,
+        u_norm=u_norm,
+        aspect=aspect,
+        width_times_raw=width_times_raw,
+        was_clamped=offset != raw_offset,
+    )
+
+
+def adaptive_ipm_position(
+    point_x: float,
+    point_y: float,
+    bbox_width_px: float,
+    bbox_height_px: float,
+    bbox_center_u_px: float,
+    image_width_px: float,
+    camera_ground_x_m: float,
+    camera_ground_y_m: float,
+    parameters: AdaptiveIPMParameters,
+    min_ipm_radius_m: float = 1.0e-6,
+) -> AdaptiveIPMResult:
+    """Move only radially along the calibrated IPM ray to the cone base centre."""
+    values = (
+        point_x,
+        point_y,
+        camera_ground_x_m,
+        camera_ground_y_m,
+        min_ipm_radius_m,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("adaptive IPM ground inputs must be finite")
+    if min_ipm_radius_m <= 0.0:
+        raise ValueError("min_ipm_radius_m must be positive")
+
+    dx = point_x - camera_ground_x_m
+    dy = point_y - camera_ground_y_m
+    ipm_raw_distance = math.hypot(dx, dy)
+    if ipm_raw_distance <= min_ipm_radius_m:
+        raise ValueError("IPM point is too close to the camera ground projection")
+    offset = compute_adaptive_center_offset(
+        ipm_raw_distance,
+        bbox_width_px,
+        bbox_height_px,
+        bbox_center_u_px,
+        image_width_px,
+        parameters,
+    )
+    final_distance = ipm_raw_distance + offset.offset_m
+    if final_distance <= 0.0 or not math.isfinite(final_distance):
+        raise ValueError("adaptive final distance must be positive and finite")
+    unit_x = dx / ipm_raw_distance
+    unit_y = dy / ipm_raw_distance
+    return AdaptiveIPMResult(
+        x=camera_ground_x_m + final_distance * unit_x,
+        y=camera_ground_y_m + final_distance * unit_y,
+        ipm_raw_distance=ipm_raw_distance,
+        adaptive_center_offset=offset.offset_m,
+        final_distance=final_distance,
+        u_norm=offset.u_norm,
+        aspect=offset.aspect,
+        width_times_raw=offset.width_times_raw,
+        offset_was_clamped=offset.was_clamped,
+    )
+
+
+def cone_position_for_model(
+    distance_model: str,
+    point_x: float,
+    point_y: float,
+    bbox_width_px: float,
+    bbox_height_px: float,
+    bbox_center_u_px: float,
+    image_width_px: float,
+    camera_ground_x_m: float,
+    camera_ground_y_m: float,
+    adaptive_parameters: AdaptiveIPMParameters,
+    legacy_ipm_center_offset_m: float,
+    legacy_height_model_a: float,
+    legacy_height_model_b: float,
+    legacy_fusion_alpha_ipm: float,
+    min_ipm_radius_m: float,
+):
+    """Select the formal adaptive model or the unchanged legacy rollback path."""
+    if distance_model == "adaptive_ipm":
+        return adaptive_ipm_position(
+            point_x,
+            point_y,
+            bbox_width_px,
+            bbox_height_px,
+            bbox_center_u_px,
+            image_width_px,
+            camera_ground_x_m,
+            camera_ground_y_m,
+            adaptive_parameters,
+            min_ipm_radius_m,
+        )
+    if distance_model == "legacy_fusion":
+        return fuse_cone_position(
+            point_x,
+            point_y,
+            bbox_height_px,
+            camera_ground_x_m,
+            camera_ground_y_m,
+            legacy_ipm_center_offset_m,
+            legacy_height_model_a,
+            legacy_height_model_b,
+            legacy_fusion_alpha_ipm,
+            min_ipm_radius_m,
+        )
+    raise ValueError("unknown distance model")

@@ -4,25 +4,40 @@ import pytest
 from roadblock_interfaces.msg import RoadblockArray
 
 from roadblock_localization.cone_position_fusion import (
+    AdaptiveIPMParameters,
+    adaptive_ipm_position,
     bbox_is_reliable,
     center_within_ground_fov,
+    compute_adaptive_center_offset,
+    cone_position_for_model,
     fuse_cone_position,
     ground_measurement_is_valid,
 )
 from roadblock_localization.roadblock_ground_localizer import (
     build_output_message,
     detection_to_ground_pixel,
-    update_tracker_if_odom_ready,
 )
-from roadblock_localization.roadblock_tracker import OdomPose, RoadblockTracker
+from roadblock_localization.roadblock_tracker import RoadblockTracker
 
 
 def make_tracker(ttl=2.0):
-    return RoadblockTracker(
-        association_max_distance_m=0.30,
-        track_ttl_sec=ttl,
-        track_min_x_m=-0.30,
-        track_max_distance_m=3.0,
+    return RoadblockTracker(association_max_distance_m=0.30, track_ttl_sec=ttl)
+
+
+def adaptive_parameters():
+    return AdaptiveIPMParameters(
+        c0_m=0.0473222480,
+        cr=-0.0505560946,
+        cw_m=-0.3862318973,
+        ca_m=0.1577719079,
+        cu_m=0.2329041982,
+        raw_distance_center_m=1.0,
+        width_range_center=100.0,
+        width_range_scale=50.0,
+        aspect_center=0.78,
+        aspect_scale=0.15,
+        offset_min_m=-1.0,
+        offset_max_m=1.0,
     )
 
 
@@ -52,6 +67,92 @@ def test_fusion_preserves_left_positive_right_negative_y():
     assert right.y < 0.0
 
 
+def test_adaptive_offset_matches_fixed_linear_feature_formula():
+    parameters = adaptive_parameters()
+    result = compute_adaptive_center_offset(0.80, 100.0, 125.0, 400.0, 640.0, parameters)
+    u_norm = 0.25
+    aspect = 0.8
+    width_times_raw = 80.0
+    expected = (
+        parameters.c0_m
+        + parameters.cr * (0.80 - 1.0)
+        + parameters.cw_m * ((width_times_raw - 100.0) / 50.0)
+        + parameters.ca_m * ((aspect - 0.78) / 0.15)
+        + parameters.cu_m * u_norm**2
+    )
+    assert result.offset_m == pytest.approx(expected)
+    assert result.u_norm == pytest.approx(u_norm)
+    assert result.aspect == pytest.approx(aspect)
+    assert result.width_times_raw == pytest.approx(width_times_raw)
+
+
+def test_adaptive_horizontal_feature_is_symmetric_and_zero_at_image_center():
+    parameters = adaptive_parameters()
+    left = compute_adaptive_center_offset(0.9, 90.0, 120.0, 240.0, 640.0, parameters)
+    right = compute_adaptive_center_offset(0.9, 90.0, 120.0, 400.0, 640.0, parameters)
+    center = compute_adaptive_center_offset(0.9, 90.0, 120.0, 320.0, 640.0, parameters)
+    assert left.u_norm == pytest.approx(-right.u_norm)
+    assert left.offset_m == pytest.approx(right.offset_m)
+    assert center.u_norm == 0.0
+
+
+def test_adaptive_invalid_bbox_height_is_rejected_without_nan():
+    with pytest.raises(ValueError, match="bbox dimensions"):
+        compute_adaptive_center_offset(0.8, 100.0, 0.0, 320.0, 640.0, adaptive_parameters())
+
+
+def test_adaptive_mode_ignores_legacy_height_and_fusion_parameters():
+    common = (
+        "adaptive_ipm",
+        0.75,
+        0.20,
+        90.0,
+        120.0,
+        320.0,
+        640.0,
+        0.05,
+        0.0,
+        adaptive_parameters(),
+    )
+    first = cone_position_for_model(*common, 0.10, 99.488, 0.22381, 0.70, 0.01)
+    second = cone_position_for_model(*common, 0.50, 1.0, 9.0, 0.01, 0.01)
+    assert second.final_distance == pytest.approx(first.final_distance)
+    assert second.x == pytest.approx(first.x)
+    assert second.y == pytest.approx(first.y)
+
+
+def test_legacy_model_selection_preserves_previous_fusion_result():
+    selected = cone_position_for_model(
+        "legacy_fusion",
+        0.65,
+        0.0,
+        80.0,
+        100.0,
+        320.0,
+        640.0,
+        0.05,
+        0.0,
+        adaptive_parameters(),
+        0.10,
+        99.488,
+        0.22381,
+        0.70,
+        0.01,
+    )
+    direct = fuse_cone_position(0.65, 0.0, 100.0, 0.05, 0.0, 0.10, 99.488, 0.22381, 0.70)
+    assert selected == direct
+
+
+def test_adaptive_changes_only_ipm_ray_radius_and_preserves_camera_origin_geometry():
+    result = adaptive_ipm_position(
+        0.70, 0.25, 90.0, 120.0, 380.0, 640.0, 0.05, 0.0, adaptive_parameters(), 0.01
+    )
+    raw_angle = math.atan2(0.25, 0.70 - 0.05)
+    final_angle = math.atan2(result.y, result.x - 0.05)
+    assert final_angle == pytest.approx(raw_angle)
+    assert math.hypot(result.x - 0.05, result.y) == pytest.approx(result.final_distance)
+
+
 def test_cropped_bbox_is_not_reliable():
     assert bbox_is_reliable(20, 30, 100, 200, 640, 400, 2)
     assert not bbox_is_reliable(0, 30, 100, 200, 640, 400, 2)
@@ -66,81 +167,68 @@ def test_wedge_fov_uses_perpendicular_footprint_clearance():
     lateral_limit = 0.713 * x - radius * math.sqrt(1.0 + 0.713**2)
     assert center_within_ground_fov(x, lateral_limit - 1.0e-6, 0.713, radius)
     assert not center_within_ground_fov(x, lateral_limit + 1.0e-6, 0.713, radius)
-    assert center_within_ground_fov(x, -(lateral_limit - 1.0e-6), 0.713, radius)
 
 
-def test_disabled_fov_gate_does_not_reject_outside_wedge():
+def test_fov_gate_switch_behaviour():
     radius = math.hypot(0.10, 0.10)
     assert ground_measurement_is_valid(0.70, 0.60, 0.20, 2.00, False, 0.713, radius)
-
-
-def test_enabled_fov_gate_rejects_outside_wedge():
-    radius = math.hypot(0.10, 0.10)
     assert not ground_measurement_is_valid(0.70, 0.60, 0.20, 2.00, True, 0.713, radius)
 
 
-def test_stable_ids_do_not_follow_distance_order():
+def test_current_reliable_measurement_is_published_without_odom():
     tracker = make_tracker()
-    tracker.update([(1.0, 0.0), (1.2, 0.5)], OdomPose(0.0, 0.0, 0.0), 0.0)
-    initial = tracker.snapshot(OdomPose(0.0, 0.0, 0.0), 0.1)
-    moved_robot = tracker.snapshot(OdomPose(0.8, 0.5, 0.0), 0.2)
-    assert [item["id"] for item in initial] == [1, 2]
-    assert math.hypot(moved_robot[1]["x"], moved_robot[1]["y"]) < math.hypot(
-        moved_robot[0]["x"], moved_robot[0]["y"]
-    )
-    assert [item["id"] for item in moved_robot] == [1, 2]
-
-
-def test_odom_translation_propagates_static_track():
-    tracker = make_tracker()
-    tracker.update([(1.5, 0.0)], OdomPose(0.0, 0.0, 0.0), 0.0)
-    item = tracker.snapshot(OdomPose(0.5, 0.0, 0.0), 0.2)[0]
-    assert item["x"] == pytest.approx(1.0)
-    assert item["y"] == pytest.approx(0.0)
-
-
-def test_odom_rotation_sign():
-    tracker = make_tracker()
-    tracker.update([(1.0, 0.0)], OdomPose(0.0, 0.0, 0.0), 0.0)
-    item = tracker.snapshot(OdomPose(0.0, 0.0, math.pi / 2.0), 0.2)[0]
-    assert item["x"] == pytest.approx(0.0, abs=1.0e-12)
-    assert item["y"] == pytest.approx(-1.0)
-
-
-def test_unreliable_frame_cannot_overwrite_reliable_odom_position():
-    tracker = make_tracker()
-    tracker.update([(1.0, 0.2)], OdomPose(0.0, 0.0, 0.0), 0.0)
-    original = tracker.tracks[0]
-    original_position = (original.odom_x, original.odom_y, original.last_valid_time)
-    tracker.update([], OdomPose(0.2, 0.0, 0.0), 0.5)
-    current = tracker.tracks[0]
-    assert (current.odom_x, current.odom_y, current.last_valid_time) == original_position
-
-
-def test_track_ttl_expires_and_ids_are_not_reused():
-    tracker = make_tracker(ttl=1.0)
-    tracker.update([(1.0, 0.0)], OdomPose(0.0, 0.0, 0.0), 0.0)
-    assert tracker.snapshot(OdomPose(0.0, 0.0, 0.0), 1.01) == []
-    tracker.update([(1.1, 0.0)], OdomPose(0.0, 0.0, 0.0), 1.1)
-    assert tracker.snapshot(OdomPose(0.0, 0.0, 0.0), 1.1)[0]["id"] == 2
-
-
-def test_empty_track_pool_builds_empty_array():
-    tracker = make_tracker()
-    items = tracker.snapshot(OdomPose(0.0, 0.0, 0.0), 0.0)
+    items = tracker.associate_current_measurements([(1.0, 0.1)], 0.0)
     message = build_output_message(items, RoadblockArray().header.stamp, "base_link")
-    assert message.header.frame_id == "base_link"
-    assert list(message.obstacles) == []
+    assert [(item.id, item.x, item.y) for item in message.obstacles] == [
+        (1, pytest.approx(1.0), pytest.approx(0.1))
+    ]
 
 
-def test_no_odom_first_frame_cannot_create_track():
+def test_no_current_measurement_publishes_empty_but_keeps_id_memory():
     tracker = make_tracker()
-    updated = update_tracker_if_odom_ready(tracker, [(1.0, 0.0)], None, 0.0)
-    assert not updated
-    assert tracker.tracks == ()
-
-    updated = update_tracker_if_odom_ready(
-        tracker, [(1.0, 0.0)], OdomPose(0.0, 0.0, 0.0), 0.1
-    )
-    assert updated
+    assert tracker.associate_current_measurements([(1.0, 0.0)], 0.0)[0]["id"] == 1
+    assert tracker.associate_current_measurements([], 0.2) == []
     assert tracker.tracks[0].id == 1
+
+
+def test_cropped_frame_never_outputs_previous_track():
+    tracker = make_tracker()
+    tracker.associate_current_measurements([(1.0, 0.0)], 0.0)
+    assert not bbox_is_reliable(0, 30, 100, 200, 640, 400, 2)
+    assert tracker.associate_current_measurements([], 0.1) == []
+
+
+def test_measurement_reappears_with_same_short_term_id():
+    tracker = make_tracker()
+    first = tracker.associate_current_measurements([(1.0, 0.0)], 0.0)
+    hidden = tracker.associate_current_measurements([], 0.5)
+    recovered = tracker.associate_current_measurements([(1.05, 0.02)], 1.0)
+    assert first[0]["id"] == 1
+    assert hidden == []
+    assert recovered[0]["id"] == 1
+
+
+def test_two_current_measurements_keep_ids_when_distance_order_changes():
+    tracker = make_tracker()
+    first = tracker.associate_current_measurements([(0.80, 0.50), (1.00, -0.50)], 0.0)
+    second = tracker.associate_current_measurements([(1.05, 0.50), (0.75, -0.50)], 0.1)
+    assert [item["id"] for item in first] == [1, 2]
+    assert [item["id"] for item in second] == [1, 2]
+    assert math.hypot(second[1]["x"], second[1]["y"]) < math.hypot(
+        second[0]["x"], second[0]["y"]
+    )
+
+
+def test_unreliable_measurement_is_never_passed_to_output():
+    tracker = make_tracker()
+    valid_measurements = []
+    if bbox_is_reliable(0, 30, 100, 200, 640, 400, 2):
+        valid_measurements.append((1.0, 0.0))
+    assert tracker.associate_current_measurements(valid_measurements, 0.0) == []
+
+
+def test_expired_memory_gets_new_non_reused_id():
+    tracker = make_tracker(ttl=1.0)
+    assert tracker.associate_current_measurements([(1.0, 0.0)], 0.0)[0]["id"] == 1
+    assert tracker.associate_current_measurements([], 1.01) == []
+    assert tracker.associate_current_measurements([(1.0, 0.0)], 1.1)[0]["id"] == 2

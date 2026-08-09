@@ -1,7 +1,6 @@
 roadblock_ground_localizer:
   ros__parameters:
     detection_topic: "/hobot_dnn_detection"
-    odom_topic: "/odom"
     output_topic: "/roadblock_ground_array"
     roadblock_label: "roadblock"
     calibration_file: ""
@@ -17,6 +16,22 @@ roadblock_ground_localizer:
     cone_height_m: 0.30
     cone_base_width_m: 0.20
     cone_base_length_m: 0.20
+    # Formal model: radial correction fitted from two real stop-level datasets.
+    distance_model: "adaptive_ipm"
+    adaptive_c0_m: 0.0473222480
+    adaptive_cr: -0.0505560946
+    adaptive_cw_m: -0.3862318973
+    adaptive_ca_m: 0.1577719079
+    adaptive_cu_m: 0.2329041982
+    adaptive_raw_distance_center_m: 1.0
+    adaptive_width_range_center: 100.0
+    adaptive_width_range_scale: 50.0
+    adaptive_aspect_center: 0.78
+    adaptive_aspect_scale: 0.15
+    # Fit range was 0.01055..0.15031 m; add a 5 mm data-derived guard band.
+    adaptive_offset_min_m: 0.005
+    adaptive_offset_max_m: 0.156
+    # Legacy parameters are retained only for distance_model=legacy_fusion rollback.
     ipm_center_offset_m: 0.10
     height_model_a: 99.488
     height_model_b: 0.22381
@@ -30,10 +45,8 @@ roadblock_ground_localizer:
     # A center is accepted when slope*X-|Y| >= radius*sqrt(1+slope^2).
     fov_boundary_slope_y_per_x: 0.713
     fov_footprint_radius_m: 0.1414213562373095
-    # Engineering initial values; association/TTL require real-car validation.
+    # Engineering initial values for short-term visual ID memory only.
+    # TTL never causes an unobserved historical obstacle to be published.
     association_max_distance_m: 0.30
     track_ttl_sec: 2.0
-    track_min_x_m: -0.30
-    track_max_distance_m: 3.00
-    publish_rate_hz: 10.0
     debug_log: false

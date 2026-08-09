@@ -1,25 +1,26 @@
-"""ROS2 cone localization using fused range and stable odom-frame tracks."""
+"""Publish fresh, reliable cone measurements in the current base_link frame."""
 
 import math
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import rclpy
 from ai_msgs.msg import PerceptionTargets
 from ament_index_python.packages import get_package_share_directory
-from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from roadblock_interfaces.msg import Roadblock, RoadblockArray
 
 from .cone_position_fusion import (
+    AdaptiveIPMParameters,
+    AdaptiveIPMResult,
     bbox_is_reliable,
-    fuse_cone_position,
+    cone_position_for_model,
     ground_measurement_is_valid,
 )
 from .ipm_ground_projector import IPMGroundProjector
-from .roadblock_tracker import OdomPose, RoadblockTracker
+from .roadblock_tracker import RoadblockTracker
 
 
 def detection_to_ground_pixel(x_offset, y_offset, width, height) -> Tuple[float, float]:
@@ -31,13 +32,6 @@ def detection_to_ground_pixel(x_offset, y_offset, width, height) -> Tuple[float,
     if w <= 0.0 or h <= 0.0:
         raise ValueError("bbox width and height must be positive")
     return x + w * 0.5, y + h
-
-
-def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
-    values = (x, y, z, w)
-    if not all(math.isfinite(float(value)) for value in values):
-        raise ValueError("odom quaternion must be finite")
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def build_output_message(items: List[dict], stamp, frame_id: str) -> RoadblockArray:
@@ -53,26 +47,12 @@ def build_output_message(items: List[dict], stamp, frame_id: str) -> RoadblockAr
     return output
 
 
-def update_tracker_if_odom_ready(
-    tracker: RoadblockTracker,
-    reliable_positions: List[Tuple[float, float]],
-    odom_pose: Optional[OdomPose],
-    now_sec: float,
-) -> bool:
-    """Update tracks only after a real, validated odom pose has arrived."""
-    if odom_pose is None:
-        return False
-    tracker.update(reliable_positions, odom_pose, now_sec)
-    return True
-
-
 class RoadblockGroundLocalizer(Node):
     def __init__(self):
         super().__init__("roadblock_ground_localizer")
 
         defaults = {
             "detection_topic": "/hobot_dnn_detection",
-            "odom_topic": "/odom",
             "output_topic": "/roadblock_ground_array",
             "roadblock_label": "roadblock",
             "calibration_file": "",
@@ -87,6 +67,19 @@ class RoadblockGroundLocalizer(Node):
             "cone_height_m": 0.30,
             "cone_base_width_m": 0.20,
             "cone_base_length_m": 0.20,
+            "distance_model": "adaptive_ipm",
+            "adaptive_c0_m": 0.0473222480,
+            "adaptive_cr": -0.0505560946,
+            "adaptive_cw_m": -0.3862318973,
+            "adaptive_ca_m": 0.1577719079,
+            "adaptive_cu_m": 0.2329041982,
+            "adaptive_raw_distance_center_m": 1.0,
+            "adaptive_width_range_center": 100.0,
+            "adaptive_width_range_scale": 50.0,
+            "adaptive_aspect_center": 0.78,
+            "adaptive_aspect_scale": 0.15,
+            "adaptive_offset_min_m": 0.005,
+            "adaptive_offset_max_m": 0.156,
             "ipm_center_offset_m": 0.10,
             "height_model_a": 99.488,
             "height_model_b": 0.22381,
@@ -99,16 +92,12 @@ class RoadblockGroundLocalizer(Node):
             "fov_footprint_radius_m": 0.1414213562373095,
             "association_max_distance_m": 0.30,
             "track_ttl_sec": 2.0,
-            "track_min_x_m": -0.30,
-            "track_max_distance_m": 3.00,
-            "publish_rate_hz": 10.0,
             "debug_log": False,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
 
         self.detection_topic = str(self.get_parameter("detection_topic").value)
-        self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
         self.roadblock_label = str(self.get_parameter("roadblock_label").value).strip().casefold()
         calibration_file = str(self.get_parameter("calibration_file").value).strip()
@@ -123,6 +112,27 @@ class RoadblockGroundLocalizer(Node):
         self.cone_height_m = float(self.get_parameter("cone_height_m").value)
         self.cone_base_width_m = float(self.get_parameter("cone_base_width_m").value)
         self.cone_base_length_m = float(self.get_parameter("cone_base_length_m").value)
+        self.distance_model = str(self.get_parameter("distance_model").value).strip()
+        self.adaptive_parameters = AdaptiveIPMParameters(
+            c0_m=float(self.get_parameter("adaptive_c0_m").value),
+            cr=float(self.get_parameter("adaptive_cr").value),
+            cw_m=float(self.get_parameter("adaptive_cw_m").value),
+            ca_m=float(self.get_parameter("adaptive_ca_m").value),
+            cu_m=float(self.get_parameter("adaptive_cu_m").value),
+            raw_distance_center_m=float(
+                self.get_parameter("adaptive_raw_distance_center_m").value
+            ),
+            width_range_center=float(
+                self.get_parameter("adaptive_width_range_center").value
+            ),
+            width_range_scale=float(
+                self.get_parameter("adaptive_width_range_scale").value
+            ),
+            aspect_center=float(self.get_parameter("adaptive_aspect_center").value),
+            aspect_scale=float(self.get_parameter("adaptive_aspect_scale").value),
+            offset_min_m=float(self.get_parameter("adaptive_offset_min_m").value),
+            offset_max_m=float(self.get_parameter("adaptive_offset_max_m").value),
+        )
         self.ipm_center_offset_m = float(self.get_parameter("ipm_center_offset_m").value)
         self.height_model_a = float(self.get_parameter("height_model_a").value)
         self.height_model_b = float(self.get_parameter("height_model_b").value)
@@ -141,12 +151,8 @@ class RoadblockGroundLocalizer(Node):
             self.get_parameter("association_max_distance_m").value
         )
         track_ttl_sec = float(self.get_parameter("track_ttl_sec").value)
-        track_min_x_m = float(self.get_parameter("track_min_x_m").value)
-        track_max_distance_m = float(self.get_parameter("track_max_distance_m").value)
-        publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self.debug_log = bool(self.get_parameter("debug_log").value)
         self._last_debug_time = 0.0
-        self._latest_odom: Optional[OdomPose] = None
 
         if not calibration_file:
             calibration_file = str(
@@ -156,6 +162,8 @@ class RoadblockGroundLocalizer(Node):
             )
         if not self.roadblock_label or self.frame_id != "base_link":
             raise ValueError("roadblock_label must be set and frame_id must be base_link")
+        if self.distance_model not in ("adaptive_ipm", "legacy_fusion"):
+            raise ValueError("distance_model must be adaptive_ipm or legacy_fusion")
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ValueError("min_confidence must be within [0,1]")
         if self.image_width <= 0 or self.image_height <= 0 or self.edge_margin_px < 0.0:
@@ -167,14 +175,23 @@ class RoadblockGroundLocalizer(Node):
                 self.cone_height_m,
                 self.cone_base_width_m,
                 self.cone_base_length_m,
-                publish_rate_hz,
             )
         ):
-            raise ValueError("physical dimensions and publish_rate_hz must be positive")
+            raise ValueError("physical dimensions must be positive")
         if self.min_x_m < 0.0 or self.max_x_m <= self.min_x_m:
             raise ValueError("invalid ground-coordinate filter limits")
         if self.fov_boundary_slope_y_per_x <= 0.0 or self.fov_footprint_radius_m < 0.0:
             raise ValueError("invalid ground FOV parameters")
+        adaptive_values = tuple(self.adaptive_parameters.__dict__.values())
+        if not all(math.isfinite(float(value)) for value in adaptive_values):
+            raise ValueError("adaptive IPM parameters must be finite")
+        if (
+            self.adaptive_parameters.width_range_scale <= 0.0
+            or self.adaptive_parameters.aspect_scale <= 0.0
+            or self.adaptive_parameters.offset_max_m
+            < self.adaptive_parameters.offset_min_m
+        ):
+            raise ValueError("invalid adaptive IPM feature scales or offset limits")
 
         self.projector = IPMGroundProjector(calibration_file)
         if (
@@ -182,56 +199,28 @@ class RoadblockGroundLocalizer(Node):
             or self.projector.image_height != self.image_height
         ):
             raise ValueError("configured image dimensions do not match IPM calibration")
-        self.tracker = RoadblockTracker(
-            association_max_distance_m,
-            track_ttl_sec,
-            track_min_x_m,
-            track_max_distance_m,
-        )
+        self.tracker = RoadblockTracker(association_max_distance_m, track_ttl_sec)
         self.publisher = self.create_publisher(RoadblockArray, self.output_topic, 10)
         self.detection_subscription = self.create_subscription(
             PerceptionTargets, self.detection_topic, self._detection_callback, 10
         )
-        self.odom_subscription = self.create_subscription(
-            Odometry, self.odom_topic, self._odom_callback, 20
-        )
-        self.publish_timer = self.create_timer(1.0 / publish_rate_hz, self._publish_tracks)
 
         self.get_logger().info(
-            f"roadblock localization ready: detections={self.detection_topic}, "
-            f"odom={self.odom_topic}, output={self.output_topic}; frame={self.frame_id}; "
+            f"roadblock fresh-measurement localization ready: "
+            f"{self.detection_topic} -> {self.output_topic}; frame={self.frame_id}; "
             f"calibration={self.projector.calibration_file}"
         )
         self.get_logger().info(
-            f"fusion={self.fusion_alpha_ipm:.2f}*(IPM+{self.ipm_center_offset_m:.2f}m)"
-            f"+{1.0 - self.fusion_alpha_ipm:.2f}*height-model; stable IDs in odom frame"
+            f"distance_model={self.distance_model}; "
+            "ID memory is internal and never published without a current measurement"
         )
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
 
-    def _odom_callback(self, msg: Odometry) -> None:
-        position = msg.pose.pose.position
-        orientation = msg.pose.pose.orientation
-        try:
-            yaw = quaternion_to_yaw(
-                orientation.x, orientation.y, orientation.z, orientation.w
-            )
-        except ValueError:
-            self.get_logger().warning("ignoring odom with non-finite quaternion")
-            return
-        values = (float(position.x), float(position.y), yaw)
-        if not all(math.isfinite(value) for value in values):
-            self.get_logger().warning("ignoring odom with non-finite pose")
-            return
-        self._latest_odom = OdomPose(*values)
-
     def _detection_callback(self, msg: PerceptionTargets) -> None:
-        if self._latest_odom is None:
-            self._debug_report([], 0, "waiting for /odom")
-            return
-
         reliable_positions: List[Tuple[float, float]] = []
+        debug_details: List[str] = []
         rejected = 0
         for target in msg.targets:
             if str(target.type).strip().casefold() != self.roadblock_label:
@@ -261,12 +250,17 @@ class RoadblockGroundLocalizer(Node):
                 try:
                     u, v = detection_to_ground_pixel(xmin, ymin, xmax - xmin, height)
                     point_x, point_y = self.projector.pixel_to_ground(u, v)
-                    fusion = fuse_cone_position(
+                    position = cone_position_for_model(
+                        self.distance_model,
                         point_x,
                         point_y,
+                        xmax - xmin,
                         height,
+                        u,
+                        self.image_width,
                         self.camera_ground_x_m,
                         self.camera_ground_y_m,
+                        self.adaptive_parameters,
                         self.ipm_center_offset_m,
                         self.height_model_a,
                         self.height_model_b,
@@ -277,8 +271,8 @@ class RoadblockGroundLocalizer(Node):
                     rejected += 1
                     continue
                 if not ground_measurement_is_valid(
-                    fusion.x,
-                    fusion.y,
+                    position.x,
+                    position.y,
                     self.min_x_m,
                     self.max_x_m,
                     self.enable_fov_gate,
@@ -287,33 +281,49 @@ class RoadblockGroundLocalizer(Node):
                 ):
                     rejected += 1
                     continue
-                reliable_positions.append((fusion.x, fusion.y))
+                reliable_positions.append((position.x, position.y))
+                if self.debug_log:
+                    if isinstance(position, AdaptiveIPMResult):
+                        debug_details.append(
+                            f"adaptive bbox_u={u:.1f} bbox_w={xmax-xmin:.1f} "
+                            f"bbox_h={height:.1f} u_norm={position.u_norm:.4f} "
+                            f"aspect={position.aspect:.4f} "
+                            f"width_times_raw={position.width_times_raw:.4f} "
+                            f"ipm_raw={position.ipm_raw_distance:.4f} "
+                            f"offset={position.adaptive_center_offset:.4f} "
+                            f"clamped={position.offset_was_clamped} "
+                            f"final_distance={position.final_distance:.4f} "
+                            f"x={position.x:.4f} y={position.y:.4f}"
+                        )
+                    else:
+                        debug_details.append(
+                            f"legacy bbox_u={u:.1f} bbox_w={xmax-xmin:.1f} "
+                            f"bbox_h={height:.1f} ipm_raw={position.ipm_raw_distance:.4f} "
+                            f"height_distance={position.height_distance:.4f} "
+                            f"final_distance={position.fused_distance:.4f} "
+                            f"x={position.x:.4f} y={position.y:.4f}"
+                        )
 
-        now_sec = self._now_sec()
-        update_tracker_if_odom_ready(
-            self.tracker, reliable_positions, self._latest_odom, now_sec
+        current_outputs = self.tracker.associate_current_measurements(
+            reliable_positions, self._now_sec()
         )
-        self._debug_report(self.tracker.snapshot(self._latest_odom, now_sec), rejected, "")
-
-    def _publish_tracks(self) -> None:
-        items = []
-        if self._latest_odom is not None:
-            items = self.tracker.snapshot(self._latest_odom, self._now_sec())
-        output = build_output_message(
-            items, self.get_clock().now().to_msg(), self.frame_id
-        )
+        output = build_output_message(current_outputs, msg.header.stamp, self.frame_id)
         self.publisher.publish(output)
+        self._debug_report(current_outputs, rejected, debug_details)
 
-    def _debug_report(self, tracks: List[dict], rejected: int, note: str) -> None:
+    def _debug_report(
+        self, outputs: List[dict], rejected: int, debug_details: List[str]
+    ) -> None:
         if not self.debug_log:
             return
         now = time.monotonic()
         if now - self._last_debug_time < 1.0:
             return
         self._last_debug_time = now
-        lines = [f"ROADBLOCKS tracks={len(tracks)} rejected={rejected} {note}".rstrip()]
+        lines = [f"CURRENT_MEASUREMENTS count={len(outputs)} rejected={rejected}"]
+        lines.extend(debug_details)
         lines.extend(
-            f"id={item['id']} x={item['x']:.3f} y={item['y']:.3f}" for item in tracks
+            f"id={item['id']} x={item['x']:.3f} y={item['y']:.3f}" for item in outputs
         )
         self.get_logger().info("\n".join(lines))
 
