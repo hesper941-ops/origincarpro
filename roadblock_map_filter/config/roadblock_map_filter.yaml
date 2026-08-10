@@ -1,0 +1,15 @@
+roadblock_map_filter:
+  ros__parameters:
+    association_gate_m: 0.15
+    update_gate_m: 0.07
+    candidate_confirm_gate_m: 0.08
+    new_track_suppression_gate_m: 0.18
+    reacquire_gate_m: 0.25
+    history_size: 5
+    tentative_window_frames: 5
+    tentative_required_hits: 3
+    publish_rate_hz: 2.0
+    input_topic: /navigation/roadblock_measurements_map
+    output_topic: /navigation/roadblock_map_filtered
+    enable_csv_log: true
+    csv_log_dir: /root/intelligent_car_ws/test_logs/roadblock_map_filter
