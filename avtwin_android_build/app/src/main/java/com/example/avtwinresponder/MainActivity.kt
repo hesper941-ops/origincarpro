@@ -40,12 +40,12 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(20), dp(20), dp(20))
         }
 
-        val title = TextView(this).apply {
+        val titleView = TextView(this).apply {
             text = "AV-Twin Acoustic Responder v0.2"
             textSize = 22f
             gravity = Gravity.CENTER_HORIZONTAL
         }
-        root.addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val hintView = TextView(this).apply {
             text = "Android responder (B)\nWait for C1 -> record t2 -> play C2 -> self-detect t3 -> UDP to Linux\nAudioTrack compatibility mode: STREAM"
