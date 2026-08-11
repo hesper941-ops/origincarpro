@@ -121,7 +121,7 @@ class AcousticResponder(
         var coarseT3 = -1
         var lastUiAt = 0L
 
-        post("ARMED\n48 kHz mono PCM16\nsource=${if (unprocessed) "UNPROCESSED" else "VOICE_RECOGNITION"}\nwaiting for C1 ${C1_F0.toInt()}-${C1_F1.toInt()} Hz")
+        post("ARMED\n48 kHz mono PCM16\nsource=${if (unprocessed) "UNPROCESSED" else "VOICE_RECOGNITION"}\noutput=MODE_STREAM\nwaiting for C1 ${C1_F0.toInt()}-${C1_F1.toInt()} Hz")
         record!!.startRecording()
 
         while (running.get() && state != State.DONE) {
@@ -198,7 +198,14 @@ class AcousticResponder(
     }
 
     private fun prepareC2Track() {
-        val bytes = c2Full.size * 2
+        val minOut = AudioTrack.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        require(minOut > 0) { "48 kHz mono PCM16 AudioTrack streaming is not supported on this device: $minOut" }
+
+        val bufferBytes = maxOf(minOut * 2, c2Full.size * 2)
         track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -213,19 +220,21 @@ class AcousticResponder(
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(bytes)
-            .setTransferMode(AudioTrack.MODE_STATIC)
+            .setBufferSizeInBytes(bufferBytes)
+            .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-        require(track?.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack initialization failed" }
-        val written = track!!.write(c2Full, 0, c2Full.size, AudioTrack.WRITE_BLOCKING)
-        require(written == c2Full.size) { "Could not preload C2 into AudioTrack: $written/${c2Full.size}" }
+
+        require(track?.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack streaming initialization failed" }
         track!!.setVolume(1.0f)
     }
 
     private fun playC2() {
         val t = track ?: return
-        try { t.reloadStaticData() } catch (_: Throwable) {}
+        try { t.pause() } catch (_: Throwable) {}
+        try { t.flush() } catch (_: Throwable) {}
         t.play()
+        val written = t.write(c2Full, 0, c2Full.size, AudioTrack.WRITE_BLOCKING)
+        require(written == c2Full.size) { "Could not stream C2 to AudioTrack: $written/${c2Full.size}" }
     }
 
     private fun disablePreprocessing(sessionId: Int) {
