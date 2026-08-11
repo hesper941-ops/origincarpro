@@ -40,40 +40,46 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(20), dp(20), dp(20))
         }
 
-        val titleView = TextView(this)
-        titleView.text = "AV-Twin Acoustic Responder v0.1"
-        titleView.textSize = 22f
-        titleView.gravity = Gravity.CENTER_HORIZONTAL
-        root.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val title = TextView(this).apply {
+            text = "AV-Twin Acoustic Responder v0.2"
+            textSize = 22f
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        root.addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        val hintView = TextView(this)
-        hintView.text = "Android responder (B)\nWait for C1 -> record t2 -> play C2 -> self-detect t3 -> UDP to Linux"
-        hintView.textSize = 14f
-        hintView.setPadding(0, dp(10), 0, dp(10))
+        val hintView = TextView(this).apply {
+            text = "Android responder (B)\nWait for C1 -> record t2 -> play C2 -> self-detect t3 -> UDP to Linux\nAudioTrack compatibility mode: STREAM"
+            textSize = 14f
+            setPadding(0, dp(10), 0, dp(10))
+        }
         root.addView(hintView)
 
-        host = EditText(this)
-        host.hint = "Linux IP, e.g. 192.168.1.100"
-        host.setText("192.168.1.100")
-        host.inputType = InputType.TYPE_CLASS_TEXT
+        host = EditText(this).apply {
+            hint = "Linux IP, e.g. 192.168.1.100"
+            setText("192.168.1.100")
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
         root.addView(host, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        port = EditText(this)
-        port.hint = "UDP port"
-        port.setText("5005")
-        port.inputType = InputType.TYPE_CLASS_NUMBER
+        port = EditText(this).apply {
+            hint = "UDP port"
+            setText("5005")
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
         root.addView(port, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        startStop = Button(this)
-        startStop.text = "ARM / START LISTENING"
-        startStop.setOnClickListener { toggle() }
+        startStop = Button(this).apply {
+            text = "ARM / START LISTENING"
+            setOnClickListener { toggle() }
+        }
         root.addView(startStop, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        status = TextView(this)
-        status.text = "Idle"
-        status.textSize = 16f
-        status.setTextIsSelectable(true)
-        status.setPadding(0, dp(16), 0, dp(16))
+        status = TextView(this).apply {
+            text = "Idle"
+            textSize = 16f
+            setTextIsSelectable(true)
+            setPadding(0, dp(16), 0, dp(16))
+        }
         val scroll = ScrollView(this).apply { addView(status) }
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
@@ -92,8 +98,8 @@ class MainActivity : Activity() {
             return
         }
 
-        val p = port.text.toString().toIntOrNull() ?: 5005
-        val h = host.text.toString().trim()
+        val udpPort = port.text.toString().toIntOrNull() ?: 5005
+        val linuxHost = host.text.toString().trim()
         responder = AcousticResponder(
             context = this,
             onStatus = { s -> runOnUiThread { status.text = s } },
@@ -105,7 +111,7 @@ class MainActivity : Activity() {
             }
         )
         startStop.text = "STOP"
-        responder!!.start(h, p)
+        responder!!.start(linuxHost, udpPort)
     }
 
     private fun ensureAudioPermission() {
