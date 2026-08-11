@@ -40,46 +40,40 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(20), dp(20), dp(20))
         }
 
-        val title = TextView(this).apply {
-            text = "AV-Twin Acoustic Responder v0.1"
-            textSize = 22f
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        root.addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val titleView = TextView(this)
+        titleView.text = "AV-Twin Acoustic Responder v0.1"
+        titleView.textSize = 22f
+        titleView.gravity = Gravity.CENTER_HORIZONTAL
+        root.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        val hint = TextView(this).apply {
-            text = "Android responder (B)\nWait for C1 -> record t2 -> play C2 -> self-detect t3 -> UDP to Linux"
-            textSize = 14f
-            setPadding(0, dp(10), 0, dp(10))
-        }
-        root.addView(hint)
+        val hintView = TextView(this)
+        hintView.text = "Android responder (B)\nWait for C1 -> record t2 -> play C2 -> self-detect t3 -> UDP to Linux"
+        hintView.textSize = 14f
+        hintView.setPadding(0, dp(10), 0, dp(10))
+        root.addView(hintView)
 
-        host = EditText(this).apply {
-            hint = "Linux IP, e.g. 192.168.1.100"
-            setText("192.168.1.100")
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
+        host = EditText(this)
+        host.hint = "Linux IP, e.g. 192.168.1.100"
+        host.setText("192.168.1.100")
+        host.inputType = InputType.TYPE_CLASS_TEXT
         root.addView(host, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        port = EditText(this).apply {
-            hint = "UDP port"
-            setText("5005")
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
+        port = EditText(this)
+        port.hint = "UDP port"
+        port.setText("5005")
+        port.inputType = InputType.TYPE_CLASS_NUMBER
         root.addView(port, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        startStop = Button(this).apply {
-            text = "ARM / START LISTENING"
-            setOnClickListener { toggle() }
-        }
+        startStop = Button(this)
+        startStop.text = "ARM / START LISTENING"
+        startStop.setOnClickListener { toggle() }
         root.addView(startStop, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        status = TextView(this).apply {
-            text = "Idle"
-            textSize = 16f
-            setTextIsSelectable(true)
-            setPadding(0, dp(16), 0, dp(16))
-        }
+        status = TextView(this)
+        status.text = "Idle"
+        status.textSize = 16f
+        status.setTextIsSelectable(true)
+        status.setPadding(0, dp(16), 0, dp(16))
         val scroll = ScrollView(this).apply { addView(status) }
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
