@@ -23,6 +23,7 @@ class MainActivity : Activity() {
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var startStop: Button
+    private lateinit var testC2: Button
     private var responder: AcousticResponder? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -41,14 +42,14 @@ class MainActivity : Activity() {
         }
 
         val titleView = TextView(this).apply {
-            text = "AV-Twin Acoustic Responder v0.2"
+            text = "AV-Twin Acoustic Responder v0.3"
             textSize = 22f
             gravity = Gravity.CENTER_HORIZONTAL
         }
         root.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val hintView = TextView(this).apply {
-            text = "Android responder (B)\nWait for C1 -> record t2 -> play C2 -> self-detect t3 -> UDP to Linux\nAudioTrack compatibility mode: STREAM"
+            text = "Android responder (B)\nFull 200 ms C1 matched-filter + HF/LF gate\nC1 -> t2 -> C2 -> self-detect t3 -> UDP to Linux\nXiaomi/HyperOS AudioTrack mode: STREAM"
             textSize = 14f
             setPadding(0, dp(10), 0, dp(10))
         }
@@ -70,12 +71,18 @@ class MainActivity : Activity() {
 
         startStop = Button(this).apply {
             text = "ARM / START LISTENING"
-            setOnClickListener { toggle() }
+            setOnClickListener { toggleListening() }
         }
         root.addView(startStop, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
+        testC2 = Button(this).apply {
+            text = "TEST C2 SPEAKER + SELF-DETECTION"
+            setOnClickListener { runC2SelfTest() }
+        }
+        root.addView(testC2, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
         status = TextView(this).apply {
-            text = "Idle"
+            text = "Idle\nTip: run TEST C2 first. PASS means the tablet can play and hear its own reply chirp."
             textSize = 16f
             setTextIsSelectable(true)
             setPadding(0, dp(16), 0, dp(16))
@@ -86,32 +93,69 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun toggle() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            ensureAudioPermission()
-            return
-        }
+    private fun makeResponder(): AcousticResponder {
+        return AcousticResponder(
+            context = this,
+            onStatus = { s ->
+                runOnUiThread {
+                    status.text = s
+                    if (s.startsWith("DONE") || s.startsWith("SELF TEST DONE") || s.startsWith("SELF TEST ERROR") || s.startsWith("ERROR")) {
+                        startStop.text = "ARM / START LISTENING"
+                        testC2.isEnabled = true
+                    }
+                }
+            },
+            onResult = { r ->
+                runOnUiThread {
+                    startStop.text = "ARM AGAIN"
+                    testC2.isEnabled = true
+                    status.append(
+                        "\n\nrefined t2=${r.t2Sample}, t3=${r.t3Sample}" +
+                            "\nreply=${"%.3f".format(r.replyDelayMs)} ms" +
+                            "\nscore=${"%.3f".format(r.t2Score)}/${"%.3f".format(r.t3Score)}"
+                    )
+                }
+            }
+        )
+    }
+
+    private fun toggleListening() {
+        if (!ensurePermissionForAction()) return
+
         if (responder?.isRunning() == true) {
             responder?.stop()
             startStop.text = "ARM / START LISTENING"
+            testC2.isEnabled = true
             status.text = "Stopping..."
             return
         }
 
         val udpPort = port.text.toString().toIntOrNull() ?: 5005
         val linuxHost = host.text.toString().trim()
-        responder = AcousticResponder(
-            context = this,
-            onStatus = { s -> runOnUiThread { status.text = s } },
-            onResult = { r ->
-                runOnUiThread {
-                    startStop.text = "ARM AGAIN"
-                    status.append("\n\nrefined t2=${r.t2Sample}, t3=${r.t3Sample}\nreply=${"%.3f".format(r.replyDelayMs)} ms\nscore=${"%.3f".format(r.t2Score)}/${"%.3f".format(r.t3Score)}")
-                }
-            }
-        )
+        responder = makeResponder()
         startStop.text = "STOP"
+        testC2.isEnabled = false
         responder!!.start(linuxHost, udpPort)
+    }
+
+    private fun runC2SelfTest() {
+        if (!ensurePermissionForAction()) return
+        if (responder?.isRunning() == true) {
+            Toast.makeText(this, "Stop the current audio test first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        responder = makeResponder()
+        startStop.text = "STOP"
+        testC2.isEnabled = false
+        responder!!.startC2SelfTest()
+    }
+
+    private fun ensurePermissionForAction(): Boolean {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            ensureAudioPermission()
+            return false
+        }
+        return true
     }
 
     private fun ensureAudioPermission() {
