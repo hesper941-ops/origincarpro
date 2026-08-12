@@ -36,6 +36,7 @@ class MainActivity : Activity() {
 
     private lateinit var c1Info: TextView
     private lateinit var c2Info: TextView
+    private lateinit var networkInfo: TextView
     private lateinit var folderInfo: TextView
     private lateinit var status: TextView
     private lateinit var metrics: TextView
@@ -67,8 +68,14 @@ class MainActivity : Activity() {
         ensureAudioPermission()
         restoreSettings()
         updateProbeInfo()
+        updateNetworkInfo()
         updateFolderInfo()
         showIdleMetrics()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::networkInfo.isInitialized) updateNetworkInfo()
     }
 
     private fun buildUi() {
@@ -79,12 +86,12 @@ class MainActivity : Activity() {
             setPadding(dp(18), dp(14), dp(18), dp(14))
         }
         root.addView(TextView(this).apply {
-            text = "AV-Twin Continuous Acoustic Responder v0.8"
+            text = "AV-Twin Continuous Acoustic Responder v0.8.2 STRICT ARM"
             textSize = 21f
             gravity = Gravity.CENTER_HORIZONTAL
         })
         root.addView(TextView(this).apply {
-            text = "Android Tx: persistent 48 kHz capture -> C1 -> C2 -> audio-frame timing -> UDP -> cooldown -> listen again"
+            text = "STRICT ARM 强制开启：1 个有效 ARM 最多触发 1 次 C2。网络只授权轮次，不参与 t2/t3 声学计时。"
             textSize = 13f
             setPadding(0, dp(5), 0, dp(8))
         })
@@ -107,11 +114,21 @@ class MainActivity : Activity() {
         c2Row.addView(defaultC2, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(c2Row)
 
-        host = EditText(this).apply { hint = "Linux IP"; inputType = InputType.TYPE_CLASS_TEXT }
+        networkInfo = TextView(this).apply {
+            textSize = 12f
+            setTextIsSelectable(true)
+            setPadding(0, dp(7), 0, dp(3))
+        }
+        root.addView(networkInfo)
+
+        host = EditText(this).apply {
+            hint = "Linux IPv4（结果UDP目标 + 允许ARM的来源IP）"
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
         root.addView(host)
         val portRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        controlPort = EditText(this).apply { hint = "ARM/control port"; inputType = InputType.TYPE_CLASS_NUMBER }
-        resultPort = EditText(this).apply { hint = "result port"; inputType = InputType.TYPE_CLASS_NUMBER }
+        controlPort = EditText(this).apply { hint = "Android ARM listen port"; inputType = InputType.TYPE_CLASS_NUMBER }
+        resultPort = EditText(this).apply { hint = "Linux result port"; inputType = InputType.TYPE_CLASS_NUMBER }
         portRow.addView(controlPort, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         portRow.addView(resultPort, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(portRow)
@@ -123,7 +140,7 @@ class MainActivity : Activity() {
         debugAudio = CheckBox(this).apply { text = "保存调试音频（默认关闭）" }
         root.addView(debugAudio)
 
-        startSession = Button(this).apply { text = "开始会话"; setOnClickListener { startContinuousSession() } }
+        startSession = Button(this).apply { text = "开始 STRICT ARM 会话"; setOnClickListener { startContinuousSession() } }
         root.addView(startSession)
         val sessionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         pauseResume = Button(this).apply { text = "暂停监听"; isEnabled = false; setOnClickListener { togglePause() } }
@@ -167,13 +184,17 @@ class MainActivity : Activity() {
             Toast.makeText(this, "检查 Linux IP / 端口", Toast.LENGTH_LONG).show()
             return
         }
+
+        StrictArmNetworkPolicy.setExpectedLinuxHost(ip)
         saveSettings()
+        updateNetworkInfo()
         responder = makeResponder()
         setSessionControls(true)
         paused = false
         pauseResume.text = "暂停监听"
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        appendLog("START requested; validating storage and preparing persistent C2 before LISTENING")
+        appendLog("STRICT ARM ON: expected Linux source=$ip; Android listens ARM on 0.0.0.0:$cp")
+        appendLog("IMPORTANT: Linux must send ARM to Android Wi-Fi IP shown above, then send C1. Network timestamps are never used as t2/t3.")
         responder!!.startSession(
             AcousticResponder.SessionConfig(
                 linuxHost = ip,
@@ -238,7 +259,7 @@ class MainActivity : Activity() {
 
     private fun updateSnapshot(s: AcousticResponder.SessionSnapshot) {
         metrics.text =
-            "state=${s.state}\n" +
+            "STRICT ARM=ON | state=${s.state}\n" +
                 "session_id=${s.sessionId ?: "--"}\n" +
                 "measurement_id=${s.measurementId ?: "--"} | pending ARM=${s.pendingArmMeasurementId ?: "--"}\n" +
                 "成功响应=${s.successResponses} | C1未通过=${s.c1Rejected} | C2失败=${s.c2Failures} | UDP失败=${s.udpFailures}\n" +
@@ -255,7 +276,16 @@ class MainActivity : Activity() {
     }
 
     private fun showIdleMetrics() {
-        metrics.text = "state=STOPPED\nsession_id=--\nmeasurement_id=--\n成功响应=0 | C1未通过=0 | C2失败=0 | UDP失败=0\nt3_precise=false"
+        metrics.text = "STRICT ARM=ON | state=STOPPED\nsession_id=--\nmeasurement_id=--\n成功响应=0 | C1未通过=0 | C2失败=0 | UDP失败=0\nt3_precise=false"
+    }
+
+    private fun updateNetworkInfo() {
+        val cp = if (::controlPort.isInitialized) controlPort.text.toString().toIntOrNull() ?: 5006 else 5006
+        val preferred = LocalNetworkInfo.preferredLanIpv4() ?: "unavailable"
+        networkInfo.text =
+            "Android 自己的 LAN/Wi-Fi IPv4（Linux 的 ARM 要发到这里）: $preferred:$cp\n" +
+                "interfaces: ${LocalNetworkInfo.display()}\n" +
+                "注意：下面可编辑的是 Linux IP，不是在修改 Android 自己的 IP。"
     }
 
     private fun chooseProbeFile(requestCode: Int) {
