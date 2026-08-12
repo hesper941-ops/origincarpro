@@ -38,7 +38,6 @@ internal class PersistentC2Player(
         val playbackHeadAdvanced: Boolean,
         val audioTimestampValid: Boolean,
         val firstValidAudioTimestampNs: Long?,
-        // Frame offset from THIS C2 round's playback start, not AudioTrack lifetime zero.
         val firstValidAudioFramePosition: Long?,
         val playbackVerified: Boolean,
         val actualOutputRoute: String,
@@ -50,6 +49,7 @@ internal class PersistentC2Player(
     private val stateMachine = C2ReplayStateMachine()
     private var track: AudioTrack? = null
     private var routeListener: AudioRouting.OnRoutingChangedListener? = null
+    private var lastRouteDescription: String? = null
     private var outputSamples = ShortArray(0)
     private var outputFrames = 0
     private var lastWrittenSamples = 0
@@ -64,12 +64,22 @@ internal class PersistentC2Player(
         val t = track ?: error("AudioTrack creation failed")
         if (preferredOutput != null) {
             val preferred = try { t.setPreferredDevice(preferredOutput) } catch (_: Throwable) { false }
+            lastRouteDescription = if (preferred) describeDevice(preferredOutput) else null
             onLog("C2 preferred output=${describeDevice(preferredOutput)} accepted=$preferred")
         }
         routeListener = AudioRouting.OnRoutingChangedListener { router ->
             val route = describeDevice(router.routedDevice)
-            onLog("output route changed: $route")
-            onRouteChanged(route)
+            val old = lastRouteDescription
+            lastRouteDescription = route
+            if (old == null || old == "unavailable") {
+                // First activation of a previously inactive track is expected and is not a mid-measurement reroute.
+                onLog("output route activated: $route")
+            } else if (route == old) {
+                onLog("output route confirmed: $route")
+            } else {
+                onLog("output route changed: $old -> $route")
+                onRouteChanged(route)
+            }
         }.also { t.addOnRoutingChangedListener(it, null) }
         stateMachine.trackInitialized()
         onLog("C2 AudioTrack initialized")
@@ -119,18 +129,13 @@ internal class PersistentC2Player(
             }
             val ts = AudioTimestamp()
             val ok = try { t.getTimestamp(ts) } catch (_: Throwable) { false }
-            // Some devices reset framePosition after stop/flush. Freshness is therefore judged by
-            // the AUDIO timestamp's own monotonic nanoTime, not by requiring an ever-growing frame.
             val fresh = ok && ts.framePosition >= 0L && ts.nanoTime > 0L &&
                 (!baselineTimestampValid || ts.nanoTime > baselineTimestampNs)
             if (fresh && !timestampValid) {
                 timestampValid = true
                 firstTimestampNs = ts.nanoTime
-                firstTimestampFrame = if (ts.framePosition >= headBefore) {
-                    ts.framePosition - headBefore
-                } else {
-                    ts.framePosition
-                }
+                // Normalize both cumulative and reset-after-flush implementations to this C2 round.
+                firstTimestampFrame = if (ts.framePosition >= headBefore) ts.framePosition - headBefore else ts.framePosition
             }
             if (headAdvanced && timestampValid) break
             Thread.sleep(2)
@@ -142,6 +147,8 @@ internal class PersistentC2Player(
         else onLog("PLAY() CALLED — HARDWARE PLAYBACK NOT VERIFIED")
 
         val routed = try { t.routedDevice } catch (_: Throwable) { null }
+        val routedDescription = describeDevice(routed)
+        lastRouteDescription = routedDescription.takeUnless { it == "unavailable" } ?: lastRouteDescription
         return PlaybackVerification(
             playCallTimeNs = lastPlayCallNs,
             trackState = t.state,
@@ -156,7 +163,7 @@ internal class PersistentC2Player(
             firstValidAudioTimestampNs = firstTimestampNs,
             firstValidAudioFramePosition = firstTimestampFrame,
             playbackVerified = verified,
-            actualOutputRoute = describeDevice(routed),
+            actualOutputRoute = routedDescription,
             actualOutputRouteType = routed?.type,
             outputSampleRate = t.sampleRate,
             underrunCount = try { t.underrunCount } catch (_: Throwable) { -1 }
@@ -203,6 +210,7 @@ internal class PersistentC2Player(
         }
         routeListener = null
         track = null
+        lastRouteDescription = null
         stateMachine.release()
     }
 
