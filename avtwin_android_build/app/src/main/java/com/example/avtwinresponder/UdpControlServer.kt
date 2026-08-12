@@ -29,7 +29,17 @@ class UdpControlServer(
                             val packet = DatagramPacket(buf, buf.size)
                             s.receive(packet)
                             val raw = String(packet.data, packet.offset, packet.length, Charsets.UTF_8)
-                            val source = "${packet.address.hostAddress}:${packet.port}"
+                            val sourceHost = packet.address.hostAddress ?: ""
+                            val source = "$sourceHost:${packet.port}"
+
+                            // Strict formal-experiment mode: only the configured Linux host may ARM
+                            // the responder. This policy is orchestration only; it is never used as
+                            // an acoustic timing source.
+                            if (!StrictArmNetworkPolicy.sourceAllowed(sourceHost)) {
+                                onMalformed(raw, "$source [STRICT_ARM_SOURCE_REJECTED expected=${StrictArmNetworkPolicy.expectedHost()}]")
+                                continue
+                            }
+
                             val arm = ArmCommand.parse(raw)
                             if (arm != null) onArm(arm, source) else onMalformed(raw, source)
                         } catch (_: SocketTimeoutException) {
