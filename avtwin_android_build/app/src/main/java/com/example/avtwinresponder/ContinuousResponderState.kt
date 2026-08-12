@@ -21,24 +21,47 @@ class ContinuousResponderStateMachine(
         private set
 
     private var pauseRequested = false
+    private var pausedRequiresCooldown = false
+    private var latestCaptureSample = 0L
 
     @Synchronized
     fun start() {
         require(state == State.STOPPED) { "start from $state" }
         pauseRequested = false
+        pausedRequiresCooldown = false
         state = State.LISTENING
     }
 
     @Synchronized
     fun requestPause() {
         pauseRequested = true
-        if (state == State.LISTENING || state == State.COOLDOWN) state = State.PAUSED
+        when (state) {
+            State.LISTENING -> {
+                pausedRequiresCooldown = false
+                state = State.PAUSED
+            }
+            State.COOLDOWN -> {
+                pausedRequiresCooldown = true
+                state = State.PAUSED
+            }
+            else -> {
+                // If a measurement is in flight, remain in that state. enterCooldown() will
+                // transition to PAUSED while retaining the cooldown deadline.
+            }
+        }
     }
 
     @Synchronized
     fun resume() {
         pauseRequested = false
-        if (state == State.PAUSED) state = State.LISTENING
+        if (state == State.PAUSED) {
+            state = if (pausedRequiresCooldown && latestCaptureSample < cooldownUntilSample) {
+                State.COOLDOWN
+            } else {
+                pausedRequiresCooldown = false
+                State.LISTENING
+            }
+        }
     }
 
     @Synchronized
@@ -69,13 +92,22 @@ class ContinuousResponderStateMachine(
     @Synchronized
     fun enterCooldown(currentCaptureSample: Long) {
         require(state == State.REPORTING) { "enterCooldown from $state" }
+        latestCaptureSample = currentCaptureSample
         cooldownUntilSample = currentCaptureSample + cooldownSamples
-        state = if (pauseRequested) State.PAUSED else State.COOLDOWN
+        if (pauseRequested) {
+            pausedRequiresCooldown = true
+            state = State.PAUSED
+        } else {
+            pausedRequiresCooldown = false
+            state = State.COOLDOWN
+        }
     }
 
     @Synchronized
     fun updateCaptureSample(currentCaptureSample: Long): Boolean {
+        latestCaptureSample = currentCaptureSample
         if (state == State.COOLDOWN && currentCaptureSample >= cooldownUntilSample) {
+            pausedRequiresCooldown = false
             state = if (pauseRequested) State.PAUSED else State.LISTENING
             return state == State.LISTENING
         }
@@ -85,6 +117,7 @@ class ContinuousResponderStateMachine(
     @Synchronized
     fun stop() {
         pauseRequested = false
+        pausedRequiresCooldown = false
         state = State.STOPPED
     }
 
