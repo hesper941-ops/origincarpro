@@ -10,7 +10,7 @@ import org.junit.Test
 class ContinuousSessionLogicTest {
     @Test
     fun multipleC1Cycles_doNotRetriggerUntilCooldownEnds() {
-        val sm = ContinuousResponderStateMachine(cooldownSamples = 4800, minimumRearmSamples = 0)
+        val sm = ContinuousResponderStateMachine(cooldownSamples = 4800)
         sm.start()
         assertTrue(sm.acceptC1())
         assertFalse("same C1 cannot trigger twice", sm.acceptC1())
@@ -23,29 +23,12 @@ class ContinuousSessionLogicTest {
         assertFalse(sm.updateCaptureSample(14_799))
         assertTrue(sm.updateCaptureSample(14_800))
         assertEquals(ContinuousResponderStateMachine.State.LISTENING, sm.state)
-        assertTrue("next C1 after cooldown is legal", sm.acceptC1())
-    }
-
-    @Test
-    fun defaultAcousticRearmGuard_blocksSamePhysicalC1TailFor800ms() {
-        val sm = ContinuousResponderStateMachine(cooldownSamples = 4_800)
-        sm.start()
-        assertTrue(sm.acceptC1())
-        sm.c2Scheduled()
-        sm.c2Playing()
-        sm.reporting()
-        sm.enterCooldown(100_000)
-
-        assertEquals(138_400L, sm.cooldownUntilSample)
-        assertFalse(sm.updateCaptureSample(138_399))
-        assertFalse(sm.acceptC1())
-        assertTrue(sm.updateCaptureSample(138_400))
-        assertTrue(sm.acceptC1())
+        assertTrue("next C1 after cooldown is legal at state-machine level", sm.acceptC1())
     }
 
     @Test
     fun pauseResumeAndSafeStop_areDeterministic() {
-        val sm = ContinuousResponderStateMachine(100, minimumRearmSamples = 0)
+        val sm = ContinuousResponderStateMachine(100)
         sm.start()
         sm.requestPause()
         assertEquals(ContinuousResponderStateMachine.State.PAUSED, sm.state)
@@ -57,37 +40,43 @@ class ContinuousSessionLogicTest {
     }
 
     @Test
-    fun armPairing_matchesOnlyCurrentFreshMeasurement() {
+    fun armPairing_matchesOnlyCurrentFreshMeasurement_andConsumesItOnce() {
         val p = ArmPairingManager("s1", maxArmAgeMs = 1000)
         assertFalse(p.accept(ArmCommand(1, "wrong", 1), 10).accepted)
         assertTrue(p.accept(ArmCommand(1, "s1", 12), 100).accepted)
+        assertTrue(StrictArmGate.isArmed())
         assertFalse("duplicate pending ARM rejected", p.accept(ArmCommand(1, "s1", 12), 110).accepted)
         val claim = p.claimNext(200)
-        assertEquals("armed", claim.pairingMode)
+        assertEquals("strict_armed", claim.pairingMode)
         assertEquals(12L, claim.measurementId)
+        assertFalse("claim consumes the one-shot detection gate", StrictArmGate.isArmed())
         assertFalse("old ARM cannot be reused", p.accept(ArmCommand(1, "s1", 12), 210).accepted)
         assertTrue(p.accept(ArmCommand(1, "s1", 13), 300).accepted)
         val next = p.claimNext(301)
         assertEquals(13L, next.measurementId)
     }
 
-    @Test
-    fun unarmedMode_usesChronologicalLocalSequence() {
+    @Test(expected = IllegalStateException::class)
+    fun strictMode_refusesClaimWithoutArm() {
         val p = ArmPairingManager("s")
-        val a = p.claimNext(1)
-        val b = p.claimNext(2)
-        assertEquals("chronological_unarmed", a.pairingMode)
-        assertEquals(1L, a.measurementId)
-        assertEquals(2L, b.measurementId)
+        p.claimNext(1)
+    }
+
+    @Test(expected = IllegalStateException::class)
+    fun expiredArm_isFailClosedInsteadOfChronologicalFallback() {
+        val p = ArmPairingManager("s", maxArmAgeMs = 50)
+        assertTrue(p.accept(ArmCommand(1, "s", 99), 100).accepted)
+        p.claimNext(200)
     }
 
     @Test
-    fun expiredArm_isNotAttachedToLaterC1() {
-        val p = ArmPairingManager("s", maxArmAgeMs = 50)
-        assertTrue(p.accept(ArmCommand(1, "s", 99), 100).accepted)
-        val claim = p.claimNext(200)
-        assertEquals("chronological_unarmed", claim.pairingMode)
-        assertEquals(1L, claim.measurementId)
+    fun clearPendingDisarmsStrictGate() {
+        val p = ArmPairingManager("s")
+        assertTrue(p.accept(ArmCommand(1, "s", 1), 100).accepted)
+        assertTrue(StrictArmGate.isArmed())
+        p.clearPending()
+        assertFalse(StrictArmGate.isArmed())
+        assertNull(p.pendingMeasurementId())
     }
 
     @Test
@@ -97,6 +86,14 @@ class ContinuousSessionLogicTest {
         assertEquals("abc", a!!.sessionId)
         assertEquals(12L, a.measurementId)
         assertNull(ArmCommand.parse("""{"type":"other"}"""))
+    }
+
+    @Test
+    fun strictArmNetworkPolicy_acceptsOnlyConfiguredLinuxIp() {
+        StrictArmNetworkPolicy.setExpectedLinuxHost("192.168.1.42")
+        assertTrue(StrictArmNetworkPolicy.sourceAllowed("192.168.1.42"))
+        assertFalse(StrictArmNetworkPolicy.sourceAllowed("192.168.1.43"))
+        assertFalse(StrictArmNetworkPolicy.sourceAllowed(""))
     }
 
     @Test
