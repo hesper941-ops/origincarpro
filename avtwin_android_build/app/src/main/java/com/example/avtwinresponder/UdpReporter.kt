@@ -24,9 +24,15 @@ object UdpReporter {
         val success: Boolean get() = attempts.any { it.success }
     }
 
+    fun interface Transport {
+        fun send(host: String, port: Int, json: String)
+    }
+
+    private val datagramTransport = Transport { host, port, json -> sendOnce(host, port, json) }
+
     fun send(host: String, port: Int, json: String) {
         if (host.isBlank()) return
-        sendOnce(host, port, json)
+        datagramTransport.send(host, port, json)
     }
 
     fun sendRepeated(
@@ -35,6 +41,16 @@ object UdpReporter {
         json: String,
         repeats: Int = 3,
         spacingMs: Long = 35L
+    ): SendReport = sendRepeatedWithTransport(host, port, json, repeats, spacingMs, datagramTransport)
+
+    internal fun sendRepeatedWithTransport(
+        host: String,
+        port: Int,
+        json: String,
+        repeats: Int,
+        spacingMs: Long,
+        transport: Transport,
+        sleeper: (Long) -> Unit = { Thread.sleep(it) }
     ): SendReport {
         val attempts = ArrayList<Attempt>()
         if (host.isBlank()) {
@@ -42,14 +58,16 @@ object UdpReporter {
             return SendReport(host, port, attempts)
         }
         for (i in 1..repeats.coerceAtLeast(1)) {
-            val diagNs = System.nanoTime()
+            val diagNs = System.nanoTime() // diagnostic only, not acoustic timing
             try {
-                sendOnce(host, port, json)
+                // The exact same JSON payload is used for every retry. Therefore the
+                // android_event_id embedded by the caller remains stable for Linux de-duplication.
+                transport.send(host, port, json)
                 attempts += Attempt(i, wallNow(), diagNs, true, null)
             } catch (t: Throwable) {
                 attempts += Attempt(i, wallNow(), diagNs, false, "${t.javaClass.simpleName}: ${t.message}")
             }
-            if (i < repeats) Thread.sleep(spacingMs)
+            if (i < repeats && spacingMs > 0L) sleeper(spacingMs)
         }
         return SendReport(host, port, attempts)
     }
