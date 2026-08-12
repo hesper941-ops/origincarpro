@@ -1,7 +1,8 @@
 package com.example.avtwinresponder
 
 class ContinuousResponderStateMachine(
-    private val cooldownSamples: Long
+    private val cooldownSamples: Long,
+    private val minimumRearmSamples: Long = DEFAULT_MINIMUM_REARM_SAMPLES
 ) {
     enum class State {
         STOPPED,
@@ -12,6 +13,14 @@ class ContinuousResponderStateMachine(
         REPORTING,
         COOLDOWN,
         PAUSED
+    }
+
+    companion object {
+        // This AV-Twin responder runs a fixed 48 kHz capture timeline.
+        // 38,400 samples = 800 ms. This is deliberately longer than the 200 ms C1 probe
+        // plus a normal reverberation tail, so one physical C1 cannot re-trigger C2 when the
+        // detector is re-armed. Normal measurement rounds are much farther apart than this.
+        const val DEFAULT_MINIMUM_REARM_SAMPLES = 38_400L
     }
 
     var state: State = State.STOPPED
@@ -93,7 +102,8 @@ class ContinuousResponderStateMachine(
     fun enterCooldown(currentCaptureSample: Long) {
         require(state == State.REPORTING) { "enterCooldown from $state" }
         latestCaptureSample = currentCaptureSample
-        cooldownUntilSample = currentCaptureSample + cooldownSamples
+        val effectiveCooldown = maxOf(cooldownSamples, minimumRearmSamples)
+        cooldownUntilSample = currentCaptureSample + effectiveCooldown
         if (pauseRequested) {
             pausedRequiresCooldown = true
             state = State.PAUSED
