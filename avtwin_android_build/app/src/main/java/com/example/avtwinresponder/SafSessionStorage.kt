@@ -8,6 +8,7 @@ import android.provider.OpenableColumns
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 class SafSessionStorage(
     private val context: Context,
@@ -32,9 +33,8 @@ class SafSessionStorage(
     private val logsCache = StringBuilder()
 
     fun start(initialSessionJson: String): Handles {
-        require(hasPersistedWritePermission(context, treeUri)) {
-            "Selected result directory is not persistently writable; please select it again"
-        }
+        val validation = validateTree(context, treeUri)
+        require(validation.first) { "Selected result directory is not writable: ${validation.second}; select it again" }
         val root = documentUriForTree(treeUri)
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val safeSession = sessionId.replace(Regex("[^A-Za-z0-9._-]"), "_")
@@ -60,7 +60,8 @@ class SafSessionStorage(
                 "c2_source_sha256" to c2.sourceSha256,
                 "c2_internal_pcm_sha256" to c2.internalPcmSha256,
                 "c2_source_channel" to c2.sourceChannel,
-                "sample_rate" to ProbeSignal.SAMPLE_RATE
+                "sample_rate" to ProbeSignal.SAMPLE_RATE,
+                "note" to "c1_used.wav/c2_used.wav are the exact internal 48 kHz mono PCM templates; source SHA256 refers to the user-selected source WAV bytes"
             )
         )
         appendLog("session storage created: $sessionDir")
@@ -70,7 +71,7 @@ class SafSessionStorage(
     @Synchronized
     fun appendEvent(json: String) {
         val h = handles ?: return
-        appendText(h.events, eventsCache, json + "\n")
+        appendText(h.events, eventsCache, SessionJournal.encodeLine(json))
     }
 
     @Synchronized
@@ -130,6 +131,8 @@ class SafSessionStorage(
                 out.flush()
             } ?: error("append stream unavailable")
         } catch (_: Throwable) {
+            // Some document providers do not implement append mode. Rewriting the cached JSONL/log
+            // preserves already completed records and keeps a truncated last line recoverable.
             writeText(uri, cache.toString())
         }
     }
@@ -137,7 +140,11 @@ class SafSessionStorage(
     companion object {
         fun hasPersistedWritePermission(context: Context, treeUri: Uri): Boolean =
             context.contentResolver.persistedUriPermissions.any {
-                it.uri == treeUri && it.isReadPermission && it.isWritePermission
+                PersistedTreePermissionPolicy.restorable(
+                    uriMatches = it.uri == treeUri,
+                    hasRead = it.isReadPermission,
+                    hasWrite = it.isWritePermission
+                )
             }
 
         fun validateTree(context: Context, treeUri: Uri): Pair<Boolean, String> {
@@ -145,16 +152,30 @@ class SafSessionStorage(
                 return false to "Persistent read/write permission is missing"
             }
             return try {
+                val resolver = context.contentResolver
                 val root = documentUriForTree(treeUri)
-                context.contentResolver.query(
+                val readable = resolver.query(
                     root,
                     arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
                     null,
                     null,
                     null
-                )?.use { cursor ->
-                    if (cursor.moveToFirst()) true to "OK" else false to "Selected directory is not readable"
-                } ?: (false to "Selected directory cannot be queried")
+                )?.use { it.moveToFirst() } == true
+                if (!readable) return false to "Selected directory is not readable"
+
+                // Requirement: verify actual create/write/delete ability before a session starts.
+                val probeName = ".avtwin_write_test_${UUID.randomUUID()}.tmp"
+                val probe = DocumentsContract.createDocument(resolver, root, "application/octet-stream", probeName)
+                    ?: return false to "Cannot create a test file in selected directory"
+                try {
+                    resolver.openOutputStream(probe, "wt")?.use { out ->
+                        out.write(byteArrayOf(0x41))
+                        out.flush()
+                    } ?: return false to "Cannot write a test file in selected directory"
+                } finally {
+                    try { DocumentsContract.deleteDocument(resolver, probe) } catch (_: Throwable) {}
+                }
+                true to "OK (read/write/create verified)"
             } catch (t: Throwable) {
                 false to (t.message ?: t.javaClass.simpleName)
             }
