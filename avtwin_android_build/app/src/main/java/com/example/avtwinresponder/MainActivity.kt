@@ -59,16 +59,16 @@ class MainActivity : Activity() {
         }
 
         val titleView = TextView(this).apply {
-            text = "AV-Twin Acoustic Responder v0.6"
+            text = "AV-Twin Acoustic Responder v0.7"
             textSize = 22f
             gravity = Gravity.CENTER_HORIZONTAL
         }
         root.addView(titleView)
 
         val hintView = TextView(this).apply {
-            text = "PRIMARY GOAL: receive known C1 -> immediately return known C2\n" +
-                "Choose the SAME C1 file that Linux will transmit. Choose the SAME C2 file that Linux will later detect.\n" +
-                "Supported probe files: RIFF/WAV PCM or 32-bit float; automatically converted to 48 kHz mono."
+            text = "PRIMARY GOAL: receive known C1 -> reliably return known C2\n" +
+                "Stereo probe WAV convention: LEFT silent, RIGHT contains chirp. RIGHT is used explicitly; L/R are never averaged.\n" +
+                "C2 is converted to 48 kHz mono PCM16 and preloaded into a persistent AudioTrack before WAIT_C1."
             textSize = 14f
             setPadding(0, dp(8), 0, dp(8))
         }
@@ -142,13 +142,13 @@ class MainActivity : Activity() {
         root.addView(startStop, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         testReply = Button(this).apply {
-            text = "TEST: PLAY SELECTED C2 NOW"
+            text = "TEST PLAY SELECTED C2 x20"
             setOnClickListener { runReplyTest() }
         }
         root.addView(testReply, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         status = TextView(this).apply {
-            text = "Idle\n1) Select C1/C2 WAV, or keep defaults.\n2) TEST C2 if desired.\n3) ARM.\n4) Linux transmits the exact same C1 waveform.\n5) Tablet detects it and immediately plays selected C2."
+            text = "Idle\n1) Select C1/C2 WAV, or keep defaults.\n2) Run C2 x20 hardware verification.\n3) ARM.\n4) Linux transmits the exact same C1 waveform.\n5) Tablet verifies that the selected C2 actually entered the playback path."
             textSize = 15f
             setTextIsSelectable(true)
             setPadding(0, dp(10), 0, dp(10))
@@ -187,19 +187,17 @@ class MainActivity : Activity() {
         try {
             try {
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (_: Throwable) {
-                // Some document providers do not expose persistable grants; current session can still use the file.
-            }
+            } catch (_: Throwable) {}
 
             val loaded = WavProbeLoader.load(this, uri)
             if (requestCode == REQ_C1_FILE) {
                 c1Signal = loaded
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_C1_URI, uri.toString()).apply()
-                status.text = "C1 loaded successfully:\n${loaded.summary()}\n\nLinux must transmit this exact waveform for matched-filter detection."
+                status.text = "C1 loaded successfully:\n${loaded.summary()}\n${loaded.channelDiagnostics()}\n\nLinux must transmit this exact RIGHT-channel-derived waveform."
             } else {
                 c2Signal = loaded
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_C2_URI, uri.toString()).apply()
-                status.text = "C2 loaded successfully:\n${loaded.summary()}\n\nTablet will play this waveform after detecting C1. Linux should use the same C2 as its receive template."
+                status.text = "C2 loaded successfully:\n${loaded.summary()}\n${loaded.channelDiagnostics()}\n\nThis RIGHT-channel-derived waveform will be preloaded before WAIT_C1."
             }
             updateProbeInfo()
         } catch (t: Throwable) {
@@ -228,23 +226,22 @@ class MainActivity : Activity() {
     }
 
     private fun updateProbeInfo() {
-        c1Info.text = "C1 template: ${c1Signal.summary()}"
-        c2Info.text = "C2 reply: ${c2Signal.summary()}"
+        c1Info.text = "C1 template: ${c1Signal.summary()}\n${c1Signal.channelDiagnostics()}"
+        c2Info.text = "C2 reply: ${c2Signal.summary()}\n${c2Signal.channelDiagnostics()}"
     }
 
     private fun makeResponder(): AcousticResponder {
-        val c1Snapshot = c1Signal
-        val c2Snapshot = c2Signal
         return AcousticResponder(
             context = this,
-            c1Signal = c1Snapshot,
-            c2Signal = c2Snapshot,
+            c1Signal = c1Signal,
+            c2Signal = c2Signal,
             onStatus = { s ->
                 runOnUiThread {
                     status.text = s
                     if (
                         s.startsWith("DONE") ||
-                        s.startsWith("C2 PLAYBACK TEST: DONE") ||
+                        s.startsWith("C2 PLAYBACK TEST: PASS") ||
+                        s.startsWith("C2 PLAYBACK TEST: FAIL") ||
                         s.startsWith("C2 PLAYBACK TEST ERROR") ||
                         s.startsWith("ERROR")
                     ) {
@@ -260,7 +257,10 @@ class MainActivity : Activity() {
                             "\nC1 t2 sample=${r.t2Sample}" +
                             "\nC1 score=${"%.3f".format(r.t2Score)}" +
                             "\nsoftware decision->play=${"%.3f".format(r.softwareDecisionToPlayUs)} us" +
-                            "\nC2 reply issued=YES"
+                            "\nplayback_verified=${r.playbackVerified}" +
+                            "\nfirst_valid_audio_timestamp_ns=${r.firstValidAudioTimestampNs ?: "NONE"}" +
+                            "\nfirst_valid_audio_frame_position=${r.firstValidAudioFramePosition ?: "NONE"}" +
+                            "\nt3_precise=false"
                     )
                 }
             }
@@ -269,7 +269,6 @@ class MainActivity : Activity() {
 
     private fun toggleListening() {
         if (!ensurePermissionForAction()) return
-
         if (responder?.isRunning() == true) {
             responder?.stop()
             setIdleButtons()
