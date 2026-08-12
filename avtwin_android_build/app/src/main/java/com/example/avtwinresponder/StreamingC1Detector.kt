@@ -32,6 +32,7 @@ class StreamingC1Detector(
     private val segment = fullTemplate.copyOfRange(activeStart, activeStart + segmentLength)
     private val ring = RollingShortBuffer(maxOf(segmentLength * 3, sampleRate / 2))
     private var lastRejectReportedAtSample = Long.MIN_VALUE
+    private var seenArmGeneration = StrictArmGate.generation()
 
     init {
         require(fullTemplate.isNotEmpty()) { "C1 template is empty" }
@@ -41,6 +42,7 @@ class StreamingC1Detector(
     fun reset(nextAbsoluteSample: Long) {
         ring.clear(nextAbsoluteSample)
         lastRejectReportedAtSample = Long.MIN_VALUE
+        seenArmGeneration = StrictArmGate.generation()
     }
 
     @Synchronized
@@ -50,6 +52,27 @@ class StreamingC1Detector(
 
     @Synchronized
     fun process(samples: ShortArray, length: Int, absoluteStartSample: Long): Detection? {
+        val armGeneration = StrictArmGate.generation()
+
+        // Formal experiment mode is fail-closed: without a fresh Linux ARM we do not even run
+        // C1 correlation. This guarantees that ambient/echo detections cannot autonomously play C2.
+        if (!StrictArmGate.isArmed()) {
+            ring.clear(absoluteStartSample + length)
+            lastRejectReportedAtSample = Long.MIN_VALUE
+            seenArmGeneration = armGeneration
+            return null
+        }
+
+        // A newly accepted/superseding ARM defines a new measurement. Drop every sample buffered
+        // before it so an old C1 cannot be attached to the new measurement merely because its
+        // correlation peak is discovered later. This gate is protocol-only; t2 remains an audio
+        // sample index from the AudioRecord stream once post-ARM samples are processed.
+        if (armGeneration != seenArmGeneration) {
+            ring.clear(absoluteStartSample)
+            lastRejectReportedAtSample = Long.MIN_VALUE
+            seenArmGeneration = armGeneration
+        }
+
         ring.append(samples, length, absoluteStartSample)
         if (ring.size < segment.size) return null
 
