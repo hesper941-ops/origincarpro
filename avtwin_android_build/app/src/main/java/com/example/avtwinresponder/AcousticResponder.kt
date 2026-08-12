@@ -22,19 +22,17 @@ import kotlin.math.cos
 
 class AcousticResponder(
     private val context: Context,
+    private val c1Signal: ProbeSignal,
+    private val c2Signal: ProbeSignal,
     private val onStatus: (String) -> Unit,
     private val onResult: (Result) -> Unit
 ) {
     companion object {
-        const val SAMPLE_RATE = 48_000
-        const val C1_F0 = 11_000.0
-        const val C1_F1 = 19_000.0
-        const val C2_F0 = 300.0
-        const val C2_F1 = 9_000.0
-        const val CHIRP_SEC = 0.200
+        const val SAMPLE_RATE = ProbeSignal.SAMPLE_RATE
         const val HOP_SAMPLES = 240
 
-        // Robust first-stage settings. v0.5 prioritizes reliable acoustic reply.
+        // Normalized matched-filter thresholds. The spectral HF/LF gate is used only
+        // for the built-in 11-19 kHz C1. Custom C1 files are matched by waveform.
         const val C1_PRETRIGGER = 0.18
         const val C1_THRESHOLD = 0.28
         const val C1_MIN_BAND_RATIO = 0.80
@@ -57,8 +55,13 @@ class AcousticResponder(
     private var agc: AutomaticGainControl? = null
     private var replyQueued = false
 
-    private val c1Full = Chirp.linearPcm16(SAMPLE_RATE, CHIRP_SEC, C1_F0, C1_F1)
-    private val c2Full = Chirp.linearPcm16(SAMPLE_RATE, CHIRP_SEC, C2_F0, C2_F1)
+    private val c1Full = c1Signal.samples
+    private val c2Full = c2Signal.samples
+
+    init {
+        require(c1Full.isNotEmpty()) { "C1 template is empty" }
+        require(c2Full.isNotEmpty()) { "C2 reply is empty" }
+    }
 
     fun start(linuxHost: String, linuxPort: Int) {
         if (!running.compareAndSet(false, true)) return
@@ -85,16 +88,19 @@ class AcousticResponder(
                     "C2 PLAYBACK TEST\n" +
                         "source=$source\n" +
                         "output=${outputDescription()}\n" +
-                        "playing ${C2_F0.toInt()}-${C2_F1.toInt()} Hz for 200 ms..."
+                        "C2=${c2Signal.name}\n" +
+                        "duration=${fmt(c2Signal.durationMs, 1)} ms\n" +
+                        "playing selected C2 now..."
                 )
                 val callNs = System.nanoTime()
                 playQueuedReply()
-                Thread.sleep(350)
+                Thread.sleep((c2Signal.durationMs + 180.0).toLong().coerceAtLeast(250L))
                 post(
                     "C2 PLAYBACK TEST: DONE\n" +
+                        "C2=${c2Signal.name}\n" +
                         "play() called at $callNs ns\n" +
                         "No hardware timestamp required.\n" +
-                        "This only verifies that the tablet can issue the acoustic reply."
+                        "This verifies that the tablet can issue the selected acoustic reply."
                 )
             } catch (t: Throwable) {
                 post("C2 PLAYBACK TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
@@ -114,7 +120,7 @@ class AcousticResponder(
 
     private fun runResponder(linuxHost: String, linuxPort: Int) {
         val sourceName = prepareAudio()
-        val accumulator = ShortAccumulator(SAMPLE_RATE * 12)
+        val accumulator = ShortAccumulator(maxOf(SAMPLE_RATE * 12, c1Full.size * 3))
         val hop = ShortArray(HOP_SAMPLES)
         var lastUiAt = 0L
         var lastC1Score = 0.0
@@ -122,13 +128,14 @@ class AcousticResponder(
         var coarseT2 = -1
 
         post(
-            "ARMED v0.5 - RESPONDER MODE\n" +
-                "Goal: hear C1 -> immediately play C2\n" +
+            "ARMED v0.6 - RESPONDER MODE\n" +
+                "Goal: hear known C1 -> immediately play known C2\n" +
                 "48 kHz mono PCM16 | source=$sourceName\n" +
-                "C1=${C1_F0.toInt()}-${C1_F1.toInt()} Hz / 200 ms\n" +
-                "C2=${C2_F0.toInt()}-${C2_F1.toInt()} Hz / 200 ms\n" +
+                "C1=${c1Signal.summary()}\n" +
+                "C2=${c2Signal.summary()}\n" +
+                "C1 gate=${if (c1Signal.isBuiltIn) "matched filter + HF/LF" else "matched filter against selected WAV"}\n" +
                 "output=${outputDescription()}\n" +
-                "C2 is PRE-QUEUED; hardware timestamp is NOT required"
+                "C2 is PRE-QUEUED; reply status=READY"
         )
 
         record!!.startRecording()
@@ -149,13 +156,19 @@ class AcousticResponder(
                     decimation = 8
                 )
                 lastC1Score = score
-                lastBandRatio = if (score >= C1_PRETRIGGER) {
-                    highToLowBandRatio(accumulator, candidate, c1Full.size)
+
+                val gateOk = if (c1Signal.isBuiltIn) {
+                    lastBandRatio = if (score >= C1_PRETRIGGER) {
+                        highToLowBandRatio(accumulator, candidate, c1Full.size)
+                    } else {
+                        0.0
+                    }
+                    lastBandRatio >= C1_MIN_BAND_RATIO
                 } else {
-                    0.0
+                    true
                 }
 
-                if (score >= C1_THRESHOLD && lastBandRatio >= C1_MIN_BAND_RATIO) {
+                if (score >= C1_THRESHOLD && gateOk) {
                     coarseT2 = candidate
                 }
             }
@@ -163,20 +176,24 @@ class AcousticResponder(
             val now = System.currentTimeMillis()
             if (now - lastUiAt >= 250 && coarseT2 < 0) {
                 lastUiAt = now
+                val gateText = if (c1Signal.isBuiltIn) {
+                    "HF/LF=${if (lastBandRatio > 0.0) fmt(lastBandRatio) else "--"} / ${fmt(C1_MIN_BAND_RATIO)}"
+                } else {
+                    "custom C1: waveform correlation only"
+                }
                 post(
                     "WAIT_C1\n" +
+                        "template=${c1Signal.name}\n" +
                         "time=${fmt(accumulator.size.toDouble() / SAMPLE_RATE, 2)} s\n" +
                         "C1 score=${fmt(lastC1Score)} / ${fmt(C1_THRESHOLD)}\n" +
-                        "HF/LF=${if (lastBandRatio > 0.0) fmt(lastBandRatio) else "--"} / ${fmt(C1_MIN_BAND_RATIO)}\n" +
-                        "reply status=READY"
+                        "$gateText\n" +
+                        "reply status=READY (${c2Signal.name})"
                 )
             }
         }
 
         if (!running.get() || coarseT2 < 0) return
 
-        // Refine the arrival sample from audio already captured. This is useful for logging,
-        // but v0.5 does NOT wait for any AudioTrack timestamp before replying.
         val preReplyAudio = accumulator.copy()
         val (t2, t2Score) = MatchedFilter.refineStrongest(
             preReplyAudio,
@@ -188,55 +205,57 @@ class AcousticResponder(
         val decisionNs = System.nanoTime()
         post(
             "C1 DETECTED\n" +
+                "template=${c1Signal.name}\n" +
                 "t2 sample=$t2\n" +
                 "score=${fmt(t2Score)}\n" +
-                "REPLYING C2 NOW..."
+                "REPLYING SELECTED C2 NOW..."
         )
 
         val playCallNs = System.nanoTime()
         playQueuedReply()
         val softwareDecisionToPlayUs = (playCallNs - decisionNs) / 1000.0
 
-        // Tell Linux immediately that the Android responder has issued C2.
-        val earlyJson = """{"type":"avtwin_android_reply","version":"0.5","status":"c2_play_issued","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)}}"""
+        val earlyJson = """{"type":"avtwin_android_reply","version":"0.6","status":"c2_play_issued","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)}}"""
         try {
             UdpReporter.send(linuxHost, linuxPort, earlyJson)
         } catch (_: Throwable) {
-            // UDP is informational only; acoustic reply must never depend on Wi-Fi.
+            // Wi-Fi reporting must never block the acoustic response.
         }
 
         post(
             "REPLIED C2 ✓\n" +
+                "C1=${c1Signal.name}\n" +
+                "C2=${c2Signal.name}\n" +
                 "C1 t2 sample=$t2 score=${fmt(t2Score)}\n" +
                 "C2 play() issued\n" +
                 "software decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
-                "NOTE: this is not a precise acoustic t3\n" +
                 "capturing a short tail..."
         )
 
-        val tailTarget = accumulator.size + (0.55 * SAMPLE_RATE).toInt()
+        val tailSamples = maxOf((0.55 * SAMPLE_RATE).toInt(), c2Full.size + (0.25 * SAMPLE_RATE).toInt())
+        val tailTarget = accumulator.size + tailSamples
         while (running.get() && accumulator.size < tailTarget) {
             val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
             if (n > 0) accumulator.append(hop, n)
         }
         try { record!!.stop() } catch (_: Throwable) {}
 
-        val wav = saveWav(accumulator.copy(), "responder_v05")
-        val finalJson = """{"type":"avtwin_android_reply","version":"0.5","status":"done","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)},"wav":"${escapeJson(wav.absolutePath)}"}"""
+        val wav = saveWav(accumulator.copy(), "responder_v06")
+        val finalJson = """{"type":"avtwin_android_reply","version":"0.6","status":"done","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)},"wav":"${escapeJson(wav.absolutePath)}"}"""
 
         try {
             UdpReporter.send(linuxHost, linuxPort, finalJson)
         } catch (_: Throwable) {}
 
         post(
-            "DONE v0.5\n" +
-                "C1 detected ✓\n" +
-                "C2 acoustic reply issued ✓\n" +
+            "DONE v0.6\n" +
+                "C1 detected ✓ (${c1Signal.name})\n" +
+                "C2 acoustic reply issued ✓ (${c2Signal.name})\n" +
                 "t2=$t2 score=${fmt(t2Score)}\n" +
                 "decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
                 "UDP target=$linuxHost:$linuxPort\n" +
                 "WAV=${wav.absolutePath}\n\n" +
-                "Next: Linux listens for the returned C2."
+                "Linux should listen for the exact same selected C2 waveform."
         )
 
         onResult(
@@ -331,7 +350,6 @@ class AcousticResponder(
         }
         track!!.setVolume(1.0f)
 
-        // Pre-queue the fixed C2 while the track is stopped. Detection then only needs play().
         queueReplySamples(track!!)
         replyQueued = true
     }
@@ -443,7 +461,12 @@ class AcousticResponder(
         replyQueued = false
     }
 
-    private fun escapeJson(value: String): String = value.replace("\\", "\\\\").replace("\"", "\\\"")
+    private fun escapeJson(value: String): String = value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+
     private fun fmt(v: Double, digits: Int = 3): String = "% .${digits}f".format(Locale.US, v).trim()
     private fun post(s: String) = onStatus(s)
 }
