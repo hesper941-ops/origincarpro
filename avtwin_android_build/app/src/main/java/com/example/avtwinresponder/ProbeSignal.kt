@@ -11,7 +11,10 @@ data class ProbeSignal(
     val sourceChannel: String = if (isBuiltIn) "BUILT_IN_MONO" else "MONO",
     val leftPeak: Double = 0.0,
     val rightPeak: Double = 0.0,
-    val internalPeak: Double = peakOf(samples)
+    val internalPeak: Double = peakOf(samples),
+    val sourceSha256: String = Sha256.pcm16Hex(samples),
+    val internalPcmSha256: String = Sha256.pcm16Hex(samples),
+    val sourceUri: String? = null
 ) {
     val durationMs: Double
         get() = samples.size * 1000.0 / SAMPLE_RATE
@@ -30,7 +33,9 @@ data class ProbeSignal(
         "source channel = $sourceChannel\n" +
             "left peak = ${"%.6f".format(leftPeak)}\n" +
             "right peak = ${"%.6f".format(rightPeak)}\n" +
-            "internal peak = ${"%.6f".format(internalPeak)}"
+            "internal peak = ${"%.6f".format(internalPeak)}\n" +
+            "source SHA256 = $sourceSha256\n" +
+            "internal PCM SHA256 = $internalPcmSha256"
 
     companion object {
         const val SAMPLE_RATE = 48_000
@@ -55,18 +60,22 @@ object ProbeDefaults {
             name = "Default C1 11-19 kHz chirp",
             isBuiltIn = true,
             sourceChannel = "BUILT_IN_MONO",
-            internalPeak = ProbeSignal.peakOf(samples)
+            internalPeak = ProbeSignal.peakOf(samples),
+            sourceSha256 = Sha256.pcm16Hex(samples),
+            internalPcmSha256 = Sha256.pcm16Hex(samples)
         )
     }
 
     fun c2(): ProbeSignal {
-        val samples = Chirp.linearPcm16(ProbeSignal.SAMPLE_RATE, 0.200, 300.0, 9_000.0)
+        val samples = Chirp.linearPcm16(ProbeSignal.SAMPLE_RATE, 0.200, 50.0, 9_000.0)
         return ProbeSignal(
             samples = samples,
-            name = "Default C2 0.3-9 kHz chirp",
+            name = "Default C2 50 Hz-9 kHz chirp",
             isBuiltIn = true,
             sourceChannel = "BUILT_IN_MONO",
-            internalPeak = ProbeSignal.peakOf(samples)
+            internalPeak = ProbeSignal.peakOf(samples),
+            sourceSha256 = Sha256.pcm16Hex(samples),
+            internalPcmSha256 = Sha256.pcm16Hex(samples)
         )
     }
 }
