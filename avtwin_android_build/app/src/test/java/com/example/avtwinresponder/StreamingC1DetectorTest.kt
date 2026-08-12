@@ -1,13 +1,41 @@
 package com.example.avtwinresponder
 
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.random.Random
 
 class StreamingC1DetectorTest {
     @Test
-    fun detectsKnownC1AcrossStreamingChunksWithinOneHundredMs() {
+    fun unarmedC1CannotProduceDetection() {
+        ArmPairingManager("session") // resets strict gate to unarmed
+        val detector = StreamingC1Detector(
+            fullTemplate = ProbeDefaults.c1().samples,
+            threshold = 0.25,
+            pretrigger = 0.15,
+            useHighFrequencyGate = false,
+            detectionMs = 60
+        )
+        val c1 = ProbeDefaults.c1().samples
+        detector.reset(0L)
+        var absolute = 0L
+        var found: StreamingC1Detector.Detection? = null
+        var offset = 0
+        while (offset < c1.size) {
+            val n = minOf(240, c1.size - offset)
+            val chunk = c1.copyOfRange(offset, offset + n)
+            val d = detector.process(chunk, n, absolute)
+            if (d?.detected == true) found = d
+            offset += n
+            absolute += n
+        }
+        assertNull(found)
+    }
+
+    @Test
+    fun detectsKnownC1AcrossStreamingChunksWithinOneHundredMs_afterArm() {
+        val pairing = ArmPairingManager("session")
         val c1 = ProbeDefaults.c1().samples
         val detector = StreamingC1Detector(
             fullTemplate = c1,
@@ -26,6 +54,7 @@ class StreamingC1DetectorTest {
         }
 
         detector.reset(0L)
+        assertTrue(pairing.accept(ArmCommand(1, "session", 1), 100).accepted)
         var absolute = 0L
         var found: StreamingC1Detector.Detection? = null
         val hop = 240
@@ -45,5 +74,10 @@ class StreamingC1DetectorTest {
         val latency = d.detectionCompletedAtSample - (d.t2Sample ?: 0L)
         assertTrue("streaming detector should complete under 100 ms", latency <= 4_800L)
         assertTrue(d.score >= 0.25)
+
+        // Claim consumes this ARM. A second physical/correlation event cannot be authorized by it.
+        val claim = pairing.claimNext(200)
+        assertTrue(claim.measurementId == 1L)
+        assertTrue(!StrictArmGate.isArmed())
     }
 }
