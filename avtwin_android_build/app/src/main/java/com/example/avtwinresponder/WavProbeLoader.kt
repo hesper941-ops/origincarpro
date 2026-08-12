@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import java.nio.charset.StandardCharsets
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
@@ -19,7 +20,10 @@ object WavProbeLoader {
             require(data.size <= MAX_FILE_BYTES) { "WAV is too large (>16 MB)" }
             data
         } ?: error("Cannot open selected file")
+        return decodeBytes(name, bytes)
+    }
 
+    internal fun decodeBytes(name: String, bytes: ByteArray): ProbeSignal {
         require(bytes.size >= 44) { "File is too small to be a WAV" }
         require(ascii(bytes, 0, 4) == "RIFF" && ascii(bytes, 8, 4) == "WAVE") {
             "Only RIFF/WAVE files are supported"
@@ -80,11 +84,18 @@ object WavProbeLoader {
         val frameBytes = bytesPerSample * channels
         require(frameBytes > 0 && dataSize >= frameBytes) { "Invalid WAV data size" }
         val frameCount = dataSize / frameBytes
-        val mono = ShortArray(frameCount)
+
+        // AV-Twin experiment convention: stereo probe WAVs have LEFT silent and RIGHT chirp.
+        // Never average L/R: use RIGHT (channel index 1) explicitly when available.
+        val selectedChannel = if (channels >= 2) 1 else 0
+        val sourceChannel = if (channels >= 2) "RIGHT" else "MONO"
+        val selected = ShortArray(frameCount)
+        var leftPeak = 0.0
+        var rightPeak = 0.0
 
         var frameBase = dataOffset
         for (i in 0 until frameCount) {
-            var sum = 0.0
+            var selectedUnit = 0.0
             for (ch in 0 until channels) {
                 val o = frameBase + ch * bytesPerSample
                 val value = when (audioFormat) {
@@ -92,17 +103,20 @@ object WavProbeLoader {
                     3 -> float32ToUnit(bytes, o)
                     else -> 0.0
                 }
-                sum += value
+                if (ch == 0) leftPeak = maxOf(leftPeak, abs(value))
+                if (ch == 1) rightPeak = maxOf(rightPeak, abs(value))
+                if (ch == selectedChannel) selectedUnit = value
             }
-            val avg = (sum / channels).coerceIn(-1.0, 1.0)
-            mono[i] = (avg * 32767.0).roundToInt().coerceIn(-32768, 32767).toShort()
+            selected[i] = (selectedUnit.coerceIn(-1.0, 1.0) * 32767.0)
+                .roundToInt().coerceIn(-32768, 32767).toShort()
             frameBase += frameBytes
         }
+        if (channels == 1) rightPeak = 0.0
 
         val target = if (sampleRate == ProbeSignal.SAMPLE_RATE) {
-            mono
+            selected
         } else {
-            resampleLinear(mono, sampleRate, ProbeSignal.SAMPLE_RATE)
+            resampleLinear(selected, sampleRate, ProbeSignal.SAMPLE_RATE)
         }
 
         val durationSec = target.size.toDouble() / ProbeSignal.SAMPLE_RATE
@@ -118,7 +132,11 @@ object WavProbeLoader {
             name = name,
             isBuiltIn = false,
             originalSampleRate = sampleRate,
-            originalChannels = channels
+            originalChannels = channels,
+            sourceChannel = sourceChannel,
+            leftPeak = leftPeak,
+            rightPeak = rightPeak,
+            internalPeak = ProbeSignal.peakOf(target)
         )
     }
 
