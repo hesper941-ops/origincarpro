@@ -38,6 +38,8 @@ internal class PersistentC2Player(
         val playbackHeadAdvanced: Boolean,
         val audioTimestampValid: Boolean,
         val firstValidAudioTimestampNs: Long?,
+        // Frame offset from THIS C2 round's playback start, not AudioTrack lifetime zero.
+        // audio_track_head_before is also reported so raw/cumulative diagnostics remain visible.
         val firstValidAudioFramePosition: Long?,
         val playbackVerified: Boolean,
         val actualOutputRoute: String,
@@ -122,7 +124,13 @@ internal class PersistentC2Player(
             if (advanced && !timestampValid) {
                 timestampValid = true
                 firstTimestampNs = ts.nanoTime
-                firstTimestampFrame = ts.framePosition
+                // stop()/flush() may reset a track's frame counter on some devices, while others
+                // expose a cumulative coordinate. Normalize either behavior to this round's start.
+                firstTimestampFrame = if (ts.framePosition >= headBefore) {
+                    ts.framePosition - headBefore
+                } else {
+                    ts.framePosition
+                }
             }
             if (headAdvanced && timestampValid) break
             Thread.sleep(2)
