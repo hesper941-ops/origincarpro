@@ -20,6 +20,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
@@ -45,7 +50,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # Separate package ID: cannot overwrite the user's acoustic/ARCore test apps.
           p = Path('app/build.gradle.kts')
           s = p.read_text()
           s = s.replace('applicationId = "ai.deepmost.odyx"', 'applicationId = "com.rirresearch.vioxyztest"')
@@ -58,7 +62,6 @@ jobs:
           s = s.replace('android:screenOrientation="portrait"', 'android:screenOrientation="unspecified"')
           p.write_text(s)
 
-          # Indoor test: local VIO is the requested coordinate source, GNSS is not used for pose.
           p = Path('app/src/main/kotlin/ai/deepmost/odyx/config/SettingsStore.kt')
           s = p.read_text()
           s = s.replace('val gnssMode: GnssCoupling = GnssCoupling.LOOSE,', 'val gnssMode: GnssCoupling = GnssCoupling.OFF,')
@@ -147,7 +150,7 @@ jobs:
 
                       if (p != null) {
                           val xyz = p.localPosition
-                          val q = p.localRotation  // w,x,y,z
+                          val q = p.localRotation
                           Text(
                               String.format(Locale.US,
                                   "LOCAL XYZ (m)\nX = %+.4f\nY = %+.4f\nZ = %+.4f",
@@ -203,7 +206,7 @@ jobs:
       - name: Fetch native dependencies
         working-directory: ODYX
         run: |
-          chmod +x scripts/*.sh gradlew
+          chmod +x scripts/*.sh
           ./scripts/fetch_deps.sh --all
 
       - name: Install Eigen CMake package
@@ -223,7 +226,7 @@ jobs:
         env:
           ODYX_OPENCV_SDK: ${{ github.workspace }}/ODYX/third_party_download/OpenCV-android-sdk/sdk/native/jni
         run: |
-          ./gradlew :app:assembleDebug --no-daemon -Podyx.native.jobs=2
+          gradle :app:assembleDebug --no-daemon -Podyx.native.jobs=2
           ls -lh app/build/outputs/apk/debug/app-debug.apk
           cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/VIO-XYZ-Test-debug.apk"
           sha256sum "$GITHUB_WORKSPACE/VIO-XYZ-Test-debug.apk"
