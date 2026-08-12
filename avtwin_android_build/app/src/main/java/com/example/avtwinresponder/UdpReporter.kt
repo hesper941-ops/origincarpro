@@ -35,6 +35,8 @@ object UdpReporter {
         datagramTransport.send(host, port, json)
     }
 
+    internal fun productionAttemptCount(requestedRepeats: Int): Int = 1
+
     /**
      * Production result reporting is deliberately single-shot.
      *
@@ -57,7 +59,7 @@ object UdpReporter {
         host = host,
         port = port,
         json = json,
-        repeats = 1,
+        repeats = productionAttemptCount(repeats),
         spacingMs = 0L,
         transport = datagramTransport
     )
