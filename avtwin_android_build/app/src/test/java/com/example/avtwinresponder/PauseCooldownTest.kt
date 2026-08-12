@@ -8,7 +8,7 @@ import org.junit.Test
 class PauseCooldownTest {
     @Test
     fun pauseDuringMeasurement_doesNotBypassCooldownOnResume() {
-        val sm = ContinuousResponderStateMachine(cooldownSamples = 4_800)
+        val sm = ContinuousResponderStateMachine(cooldownSamples = 4_800, minimumRearmSamples = 0)
         sm.start()
         assertTrue(sm.acceptC1())
         sm.c2Scheduled()
