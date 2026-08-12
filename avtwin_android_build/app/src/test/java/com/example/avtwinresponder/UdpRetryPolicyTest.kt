@@ -6,7 +6,14 @@ import org.junit.Test
 
 class UdpRetryPolicyTest {
     @Test
-    fun transientSendFailures_retryThreeTimesWithIdenticalEventPayload() {
+    fun productionReplyTiming_isAlwaysSingleShot() {
+        assertEquals(1, UdpReporter.productionAttemptCount(1))
+        assertEquals(1, UdpReporter.productionAttemptCount(3))
+        assertEquals(1, UdpReporter.productionAttemptCount(99))
+    }
+
+    @Test
+    fun retryPrimitive_canStillReuseIdenticalEventPayloadForFutureAckProtocol() {
         val eventId = "event-123"
         val payload = JsonWire.obj(
             "type" to "reply_timing",
