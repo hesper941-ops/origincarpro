@@ -11,7 +11,7 @@ data class CaptureAudioTimestamp(
 data class PlaybackAudioTimestamp(
     val framePosition: Long,
     val nanoTime: Long,
-    val roundStartFramePosition: Long
+    val roundStartFramePosition: Long = 0L
 )
 
 data class ReplyTimingResult(
@@ -20,7 +20,12 @@ data class ReplyTimingResult(
     val replyDelaySamples: Long?,
     val playbackRoundStartNanoTime: Long?,
     val reason: String?
-)
+) {
+    // Backward-compatible diagnostic alias; this is the current C2 round start,
+    // not necessarily AudioTrack lifetime frame zero.
+    val playbackFrameZeroNanoTime: Long?
+        get() = playbackRoundStartNanoTime
+}
 
 object ReplyTimingMapper {
     fun mapToCaptureTimeline(
@@ -50,10 +55,8 @@ object ReplyTimingMapper {
         val framesSinceRoundStart = playback.framePosition - playback.roundStartFramePosition
         if (framesSinceRoundStart < 0L) return fail("playback_timestamp_precedes_round_start")
 
-        // Both Android audio timestamps are in a monotonic timebase. We use the AudioTrack
-        // timestamp only to infer the presentation time of THIS ROUND's first C2 frame, then
-        // project that instant onto the persistent AudioRecord frame axis. Diagnostic Kotlin
-        // clocks are intentionally absent from this calculation.
+        // This calculation contains only audio-frame timestamps. System.nanoTime/play() times
+        // are diagnostics and never enter the t3 calculation.
         val nsPerFrame = 1_000_000_000.0 / sampleRate.toDouble()
         val playbackRoundStartNs = playback.nanoTime - (framesSinceRoundStart * nsPerFrame).roundToLong()
         val deltaNs = playbackRoundStartNs - capture.nanoTime
