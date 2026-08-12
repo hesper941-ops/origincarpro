@@ -1,7 +1,6 @@
 package com.example.avtwinresponder
 
 import android.content.Context
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -11,6 +10,7 @@ import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Process
+import android.util.Log
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -30,12 +30,11 @@ class AcousticResponder(
     companion object {
         const val SAMPLE_RATE = ProbeSignal.SAMPLE_RATE
         const val HOP_SAMPLES = 240
-
-        // Normalized matched-filter thresholds. The spectral HF/LF gate is used only
-        // for the built-in 11-19 kHz C1. Custom C1 files are matched by waveform.
         const val C1_PRETRIGGER = 0.18
         const val C1_THRESHOLD = 0.28
         const val C1_MIN_BAND_RATIO = 0.80
+        private const val TAG = "AVTwinResponder"
+        private const val TEST_CYCLES = 20
     }
 
     data class Result(
@@ -43,17 +42,19 @@ class AcousticResponder(
         val t2Score: Double,
         val replyPlayCallNs: Long,
         val softwareDecisionToPlayUs: Double,
+        val playbackVerified: Boolean,
+        val firstValidAudioTimestampNs: Long?,
+        val firstValidAudioFramePosition: Long?,
         val wavPath: String,
         val udpJson: String
     )
 
     private val running = AtomicBoolean(false)
     private var record: AudioRecord? = null
-    private var track: AudioTrack? = null
+    private var c2Player: PersistentC2Player? = null
     private var aec: AcousticEchoCanceler? = null
     private var ns: NoiseSuppressor? = null
     private var agc: AutomaticGainControl? = null
-    private var replyQueued = false
 
     private val c1Full = c1Signal.samples
     private val c2Full = c2Signal.samples
@@ -71,6 +72,7 @@ class AcousticResponder(
                 runResponder(linuxHost, linuxPort)
             } catch (t: Throwable) {
                 post("ERROR: ${t.javaClass.simpleName}: ${t.message}")
+                log("ERROR: ${t.javaClass.simpleName}: ${t.message}")
             } finally {
                 cleanupAudio()
                 running.set(false)
@@ -80,30 +82,44 @@ class AcousticResponder(
 
     fun startReplyPlaybackTest() {
         if (!running.compareAndSet(false, true)) return
-        thread(name = "AVTwin-ReplyTest") {
+        thread(name = "AVTwin-C2-x20") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             try {
                 val source = prepareAudio()
-                post(
-                    "C2 PLAYBACK TEST\n" +
-                        "source=$source\n" +
-                        "output=${outputDescription()}\n" +
-                        "C2=${c2Signal.name}\n" +
-                        "duration=${fmt(c2Signal.durationMs, 1)} ms\n" +
-                        "playing selected C2 now..."
+                val prep = c2Player!!.preparationSnapshot()
+                val report = StringBuilder()
+                report.append("C2 REPEAT PLAYBACK TEST x$TEST_CYCLES\n")
+                report.append("source=$source\n")
+                report.append("C2=${c2Signal.name}\n")
+                report.append(c2Signal.channelDiagnostics()).append('\n')
+                report.append(preparationText(prep)).append("\n\n")
+                var passCount = 0
+
+                for (i in 1..TEST_CYCLES) {
+                    if (!running.get()) return@thread
+                    if (i > 1) c2Player!!.rearmForNextPlayback()
+                    val verification = c2Player!!.playAndVerify()
+                    if (verification.playbackVerified) passCount++
+                    report.append("[$i/$TEST_CYCLES] ")
+                    report.append(if (verification.playbackVerified) "PASS" else "FAIL")
+                    report.append('\n')
+                    report.append(verificationText(verification)).append("\n\n")
+                    post(report.toString())
+                }
+
+                c2Player!!.awaitPlaybackCompletion()
+                val overall = passCount == TEST_CYCLES
+                report.append(
+                    if (overall) {
+                        "C2 PLAYBACK TEST: PASS $passCount/$TEST_CYCLES\nC2 HARDWARE PLAYBACK VERIFIED on every cycle"
+                    } else {
+                        "C2 PLAYBACK TEST: FAIL $passCount/$TEST_CYCLES\nOne or more cycles were not hardware-verified"
+                    }
                 )
-                val callNs = System.nanoTime()
-                playQueuedReply()
-                Thread.sleep((c2Signal.durationMs + 180.0).toLong().coerceAtLeast(250L))
-                post(
-                    "C2 PLAYBACK TEST: DONE\n" +
-                        "C2=${c2Signal.name}\n" +
-                        "play() called at $callNs ns\n" +
-                        "No hardware timestamp required.\n" +
-                        "This verifies that the tablet can issue the selected acoustic reply."
-                )
+                post(report.toString())
             } catch (t: Throwable) {
                 post("C2 PLAYBACK TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
+                log("C2 PLAYBACK TEST ERROR: ${t.message}")
             } finally {
                 cleanupAudio()
                 running.set(false)
@@ -120,6 +136,7 @@ class AcousticResponder(
 
     private fun runResponder(linuxHost: String, linuxPort: Int) {
         val sourceName = prepareAudio()
+        val prep = c2Player!!.preparationSnapshot()
         val accumulator = ShortAccumulator(maxOf(SAMPLE_RATE * 12, c1Full.size * 3))
         val hop = ShortArray(HOP_SAMPLES)
         var lastUiAt = 0L
@@ -128,14 +145,15 @@ class AcousticResponder(
         var coarseT2 = -1
 
         post(
-            "ARMED v0.6 - RESPONDER MODE\n" +
-                "Goal: hear known C1 -> immediately play known C2\n" +
+            "ARMED v0.7 - RESPONDER MODE\n" +
+                "Goal: hear known C1 -> immediately return selected C2\n" +
                 "48 kHz mono PCM16 | source=$sourceName\n" +
-                "C1=${c1Signal.summary()}\n" +
-                "C2=${c2Signal.summary()}\n" +
+                "C1=${c1Signal.summary()}\n${c1Signal.channelDiagnostics()}\n" +
+                "C2=${c2Signal.summary()}\n${c2Signal.channelDiagnostics()}\n" +
                 "C1 gate=${if (c1Signal.isBuiltIn) "matched filter + HF/LF" else "matched filter against selected WAV"}\n" +
-                "output=${outputDescription()}\n" +
-                "C2 is PRE-QUEUED; reply status=READY"
+                preparationText(prep) + "\n" +
+                "C2 prepared / AudioTrack initialized / buffer loaded\n" +
+                "reply status=READY"
         )
 
         record!!.startRecording()
@@ -160,17 +178,13 @@ class AcousticResponder(
                 val gateOk = if (c1Signal.isBuiltIn) {
                     lastBandRatio = if (score >= C1_PRETRIGGER) {
                         highToLowBandRatio(accumulator, candidate, c1Full.size)
-                    } else {
-                        0.0
-                    }
+                    } else 0.0
                     lastBandRatio >= C1_MIN_BAND_RATIO
                 } else {
                     true
                 }
 
-                if (score >= C1_THRESHOLD && gateOk) {
-                    coarseT2 = candidate
-                }
+                if (score >= C1_THRESHOLD && gateOk) coarseT2 = candidate
             }
 
             val now = System.currentTimeMillis()
@@ -187,7 +201,7 @@ class AcousticResponder(
                         "time=${fmt(accumulator.size.toDouble() / SAMPLE_RATE, 2)} s\n" +
                         "C1 score=${fmt(lastC1Score)} / ${fmt(C1_THRESHOLD)}\n" +
                         "$gateText\n" +
-                        "reply status=READY (${c2Signal.name})"
+                        "C2 buffer=PRELOADED / reply status=READY"
                 )
             }
         }
@@ -201,35 +215,43 @@ class AcousticResponder(
             coarseT2,
             marginSamples = 96
         )
+        log("C1 detected")
 
         val decisionNs = System.nanoTime()
         post(
             "C1 DETECTED\n" +
-                "template=${c1Signal.name}\n" +
-                "t2 sample=$t2\n" +
+                "c1_detect_sample=$t2\n" +
                 "score=${fmt(t2Score)}\n" +
-                "REPLYING SELECTED C2 NOW..."
+                "decision_time_ns=$decisionNs\n" +
+                "REPLYING PRELOADED C2 NOW..."
         )
 
-        val playCallNs = System.nanoTime()
-        playQueuedReply()
-        val softwareDecisionToPlayUs = (playCallNs - decisionNs) / 1000.0
+        var playCallNsFromCallback = 0L
+        val verification = c2Player!!.playAndVerify(onPlayIssued = { playNs ->
+            playCallNsFromCallback = playNs
+            val decisionToPlayUs = (playNs - decisionNs) / 1000.0
+            val earlyJson = """{"type":"avtwin_android_reply","version":"0.6","status":"c2_play_issued","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playNs,"decision_to_play_us":${fmt(decisionToPlayUs, 3)}}"""
+            try { UdpReporter.send(linuxHost, linuxPort, earlyJson) } catch (_: Throwable) {}
+        })
 
-        val earlyJson = """{"type":"avtwin_android_reply","version":"0.6","status":"c2_play_issued","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)}}"""
-        try {
-            UdpReporter.send(linuxHost, linuxPort, earlyJson)
-        } catch (_: Throwable) {
-            // Wi-Fi reporting must never block the acoustic response.
+        val playCallNs = if (playCallNsFromCallback != 0L) playCallNsFromCallback else verification.playCallTimeNs
+        val softwareDecisionToPlayUs = (playCallNs - decisionNs) / 1000.0
+        val playbackStatus = if (verification.playbackVerified) {
+            "C2 HARDWARE PLAYBACK VERIFIED"
+        } else {
+            "PLAY() CALLED — HARDWARE PLAYBACK NOT VERIFIED"
         }
 
         post(
-            "REPLIED C2 ✓\n" +
-                "C1=${c1Signal.name}\n" +
-                "C2=${c2Signal.name}\n" +
-                "C1 t2 sample=$t2 score=${fmt(t2Score)}\n" +
-                "C2 play() issued\n" +
-                "software decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
-                "capturing a short tail..."
+            "$playbackStatus\n" +
+                "c1_detect_sample=$t2\n" +
+                "decision_time_ns=$decisionNs\n" +
+                "play_call_time_ns=$playCallNs\n" +
+                "first_valid_audio_timestamp_ns=${verification.firstValidAudioTimestampNs ?: "NONE"}\n" +
+                "first_valid_audio_frame_position=${verification.firstValidAudioFramePosition ?: "NONE"}\n" +
+                "playback_verified=${verification.playbackVerified}\n" +
+                verificationText(verification) + "\n" +
+                "t3_precise=false"
         )
 
         val tailSamples = maxOf((0.55 * SAMPLE_RATE).toInt(), c2Full.size + (0.25 * SAMPLE_RATE).toInt())
@@ -239,23 +261,21 @@ class AcousticResponder(
             if (n > 0) accumulator.append(hop, n)
         }
         try { record!!.stop() } catch (_: Throwable) {}
+        c2Player!!.awaitPlaybackCompletion()
 
-        val wav = saveWav(accumulator.copy(), "responder_v06")
-        val finalJson = """{"type":"avtwin_android_reply","version":"0.6","status":"done","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)},"wav":"${escapeJson(wav.absolutePath)}"}"""
-
-        try {
-            UdpReporter.send(linuxHost, linuxPort, finalJson)
-        } catch (_: Throwable) {}
+        val wav = saveWav(accumulator.copy(), "responder_v07")
+        val finalJson = """{"type":"avtwin_android_reply","version":"0.6","status":"done","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)},"playback_verified":${verification.playbackVerified},"first_valid_audio_timestamp_ns":${verification.firstValidAudioTimestampNs ?: "null"},"first_valid_audio_frame_position":${verification.firstValidAudioFramePosition ?: "null"},"playback_head_before":${verification.playbackHeadBefore},"playback_head_after":${verification.playbackHeadAfter},"wav":"${escapeJson(wav.absolutePath)}"}"""
+        try { UdpReporter.send(linuxHost, linuxPort, finalJson) } catch (_: Throwable) {}
 
         post(
-            "DONE v0.6\n" +
+            "DONE v0.7\n" +
                 "C1 detected ✓ (${c1Signal.name})\n" +
-                "C2 acoustic reply issued ✓ (${c2Signal.name})\n" +
+                "$playbackStatus\n" +
                 "t2=$t2 score=${fmt(t2Score)}\n" +
                 "decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
+                "t3_precise=false\n" +
                 "UDP target=$linuxHost:$linuxPort\n" +
-                "WAV=${wav.absolutePath}\n\n" +
-                "Linux should listen for the exact same selected C2 waveform."
+                "WAV=${wav.absolutePath}"
         )
 
         onResult(
@@ -264,6 +284,9 @@ class AcousticResponder(
                 t2Score = t2Score,
                 replyPlayCallNs = playCallNs,
                 softwareDecisionToPlayUs = softwareDecisionToPlayUs,
+                playbackVerified = verification.playbackVerified,
+                firstValidAudioTimestampNs = verification.firstValidAudioTimestampNs,
+                firstValidAudioFramePosition = verification.firstValidAudioFramePosition,
                 wavPath = wav.absolutePath,
                 udpJson = finalJson
             )
@@ -273,11 +296,7 @@ class AcousticResponder(
     private fun prepareAudio(): String {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val unprocessed = audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
-        val source = if (unprocessed) {
-            MediaRecorder.AudioSource.UNPROCESSED
-        } else {
-            MediaRecorder.AudioSource.VOICE_RECOGNITION
-        }
+        val source = if (unprocessed) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.VOICE_RECOGNITION
         val sourceName = if (unprocessed) "UNPROCESSED" else "VOICE_RECOGNITION"
 
         val minBuffer = AudioRecord.getMinBufferSize(
@@ -286,7 +305,6 @@ class AcousticResponder(
             AudioFormat.ENCODING_PCM_16BIT
         )
         require(minBuffer > 0) { "48 kHz mono PCM16 AudioRecord is not supported on this device" }
-
         record = AudioRecord.Builder()
             .setAudioSource(source)
             .setAudioFormat(
@@ -301,86 +319,47 @@ class AcousticResponder(
         require(record?.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
         disablePreprocessing(record!!.audioSessionId)
 
-        prepareReplyTrackAndQueueC2()
+        c2Player = PersistentC2Player(c2Full, SAMPLE_RATE, ::log)
+        c2Player!!.prepare()
         return sourceName
     }
 
-    private fun prepareReplyTrackAndQueueC2() {
-        fun makeTrack(mask: Int): AudioTrack {
-            val minOut = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE,
-                mask,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            require(minOut > 0) { "48 kHz PCM16 AudioTrack not supported for channel mask $mask: $minOut" }
+    private fun preparationText(p: PersistentC2Player.Preparation): String =
+        "AudioTrack state=${trackStateName(p.trackState)} (${p.trackState})\n" +
+            "playState=${playStateName(p.playState)} (${p.playState})\n" +
+            "channels=${p.channelCount}\n" +
+            "performanceMode=${performanceModeName(p.performanceMode)} (${p.performanceMode})\n" +
+            "write=${p.writtenSamples} samples / ${p.writtenFrames} frames / ${p.writtenBytes} bytes\n" +
+            "playbackHeadPosition=${p.playbackHeadPosition}"
 
-            val requiredSamples = if (mask == AudioFormat.CHANNEL_OUT_MONO) {
-                c2Full.size
-            } else {
-                c2Full.size * 2
-            }
-            val requiredBytes = requiredSamples * 2
+    private fun verificationText(v: PersistentC2Player.PlaybackVerification): String =
+        "AudioTrack state=${trackStateName(v.trackState)} (${v.trackState})\n" +
+            "playState=${playStateName(v.playState)} (${v.playState})\n" +
+            "write=${v.writeSamples} samples / ${v.writeFrames} frames / ${v.writeBytes} bytes\n" +
+            "playbackHeadPosition=${v.playbackHeadBefore} -> ${v.playbackHeadAfter}\n" +
+            "playbackHeadAdvanced=${v.playbackHeadAdvanced}\n" +
+            "AudioTimestamp valid=${v.audioTimestampValid}\n" +
+            "timestamp framePosition=${v.firstValidAudioFramePosition ?: "NONE"}\n" +
+            "timestamp nanoTime=${v.firstValidAudioTimestampNs ?: "NONE"}"
 
-            return AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(mask)
-                        .build()
-                )
-                .setBufferSizeInBytes(maxOf(minOut * 2, requiredBytes + 4096))
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-        }
-
-        track = try {
-            makeTrack(AudioFormat.CHANNEL_OUT_MONO)
-        } catch (_: Throwable) {
-            makeTrack(AudioFormat.CHANNEL_OUT_STEREO)
-        }
-        require(track?.state == AudioTrack.STATE_INITIALIZED) {
-            "AudioTrack streaming initialization failed"
-        }
-        track!!.setVolume(1.0f)
-
-        queueReplySamples(track!!)
-        replyQueued = true
+    private fun trackStateName(state: Int): String = when (state) {
+        AudioTrack.STATE_INITIALIZED -> "INITIALIZED"
+        AudioTrack.STATE_UNINITIALIZED -> "UNINITIALIZED"
+        else -> "UNKNOWN"
     }
 
-    private fun queueReplySamples(t: AudioTrack) {
-        try { t.pause() } catch (_: Throwable) {}
-        try { t.flush() } catch (_: Throwable) {}
-
-        if (t.channelCount == 1) {
-            val written = t.write(c2Full, 0, c2Full.size, AudioTrack.WRITE_BLOCKING)
-            require(written == c2Full.size) {
-                "Could not pre-queue mono C2: $written/${c2Full.size}"
-            }
-        } else {
-            val stereo = ShortArray(c2Full.size * 2)
-            for (i in c2Full.indices) {
-                stereo[2 * i] = c2Full[i]
-                stereo[2 * i + 1] = c2Full[i]
-            }
-            val written = t.write(stereo, 0, stereo.size, AudioTrack.WRITE_BLOCKING)
-            require(written == stereo.size) {
-                "Could not pre-queue stereo C2: $written/${stereo.size}"
-            }
-        }
+    private fun playStateName(state: Int): String = when (state) {
+        AudioTrack.PLAYSTATE_STOPPED -> "STOPPED"
+        AudioTrack.PLAYSTATE_PAUSED -> "PAUSED"
+        AudioTrack.PLAYSTATE_PLAYING -> "PLAYING"
+        else -> "UNKNOWN"
     }
 
-    private fun playQueuedReply() {
-        val t = track ?: error("AudioTrack not prepared")
-        require(replyQueued) { "C2 reply was not pre-queued" }
-        t.play()
-        replyQueued = false
+    private fun performanceModeName(mode: Int): String = when (mode) {
+        AudioTrack.PERFORMANCE_MODE_LOW_LATENCY -> "LOW_LATENCY"
+        AudioTrack.PERFORMANCE_MODE_POWER_SAVING -> "POWER_SAVING"
+        AudioTrack.PERFORMANCE_MODE_NONE -> "NONE"
+        else -> "UNKNOWN"
     }
 
     private fun highToLowBandRatio(audio: ShortAccumulator, start: Int, length: Int): Double {
@@ -408,11 +387,6 @@ class AcousticResponder(
             i++
         }
         return s1 * s1 + s2 * s2 - coeff * s1 * s2
-    }
-
-    private fun outputDescription(): String {
-        val channels = track?.channelCount ?: 0
-        return "STREAM/${if (channels == 1) "MONO" else if (channels == 2) "STEREO" else "${channels}ch"}"
     }
 
     private fun saveWav(audio: ShortArray, prefix: String): File {
@@ -448,17 +422,15 @@ class AcousticResponder(
     private fun cleanupAudio() {
         try { record?.stop() } catch (_: Throwable) {}
         try { record?.release() } catch (_: Throwable) {}
-        try { track?.stop() } catch (_: Throwable) {}
-        try { track?.release() } catch (_: Throwable) {}
+        try { c2Player?.release() } catch (_: Throwable) {}
         try { aec?.release() } catch (_: Throwable) {}
         try { ns?.release() } catch (_: Throwable) {}
         try { agc?.release() } catch (_: Throwable) {}
         record = null
-        track = null
+        c2Player = null
         aec = null
         ns = null
         agc = null
-        replyQueued = false
     }
 
     private fun escapeJson(value: String): String = value
@@ -469,4 +441,5 @@ class AcousticResponder(
 
     private fun fmt(v: Double, digits: Int = 3): String = "% .${digits}f".format(Locale.US, v).trim()
     private fun post(s: String) = onStatus(s)
+    private fun log(s: String) = Log.i(TAG, s)
 }
