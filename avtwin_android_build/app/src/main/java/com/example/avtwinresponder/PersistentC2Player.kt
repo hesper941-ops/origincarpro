@@ -1,14 +1,18 @@
 package com.example.avtwinresponder
 
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioRouting
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 
 internal class PersistentC2Player(
     private val samples: ShortArray,
     private val sampleRate: Int = ProbeSignal.SAMPLE_RATE,
-    private val onLog: (String) -> Unit = {}
+    private val preferredOutput: AudioDeviceInfo? = null,
+    private val onLog: (String) -> Unit = {},
+    private val onRouteChanged: (String) -> Unit = {}
 ) {
     data class Preparation(
         val trackState: Int,
@@ -18,7 +22,8 @@ internal class PersistentC2Player(
         val writtenSamples: Int,
         val writtenFrames: Int,
         val writtenBytes: Int,
-        val playbackHeadPosition: Long
+        val playbackHeadPosition: Long,
+        val preferredRoute: String
     )
 
     data class PlaybackVerification(
@@ -34,11 +39,16 @@ internal class PersistentC2Player(
         val audioTimestampValid: Boolean,
         val firstValidAudioTimestampNs: Long?,
         val firstValidAudioFramePosition: Long?,
-        val playbackVerified: Boolean
+        val playbackVerified: Boolean,
+        val actualOutputRoute: String,
+        val actualOutputRouteType: Int?,
+        val outputSampleRate: Int,
+        val underrunCount: Int
     )
 
     private val stateMachine = C2ReplayStateMachine()
     private var track: AudioTrack? = null
+    private var routeListener: AudioRouting.OnRoutingChangedListener? = null
     private var outputSamples = ShortArray(0)
     private var outputFrames = 0
     private var lastWrittenSamples = 0
@@ -51,15 +61,18 @@ internal class PersistentC2Player(
         onLog("C2 prepared")
         track = createPersistentTrack()
         val t = track ?: error("AudioTrack creation failed")
+        if (preferredOutput != null) {
+            val preferred = try { t.setPreferredDevice(preferredOutput) } catch (_: Throwable) { false }
+            onLog("C2 preferred output=${describeDevice(preferredOutput)} accepted=$preferred")
+        }
+        routeListener = AudioRouting.OnRoutingChangedListener { router ->
+            onRouteChanged("output route changed: ${describeDevice(router.routedDevice)}")
+        }.also { t.addOnRoutingChangedListener(it, null) }
         stateMachine.trackInitialized()
         onLog("C2 AudioTrack initialized")
 
-        outputSamples = if (t.channelCount == 1) {
-            samples.copyOf()
-        } else {
+        outputSamples = if (t.channelCount == 1) samples.copyOf() else {
             ShortArray(samples.size * 2).also { stereo ->
-                // Internal C2 is mono (RIGHT channel extracted from source WAV).
-                // Duplicate it only when the device requires a stereo AudioTrack.
                 for (i in samples.indices) {
                     stereo[2 * i] = samples[i]
                     stereo[2 * i + 1] = samples[i]
@@ -71,10 +84,7 @@ internal class PersistentC2Player(
         return preparationSnapshot()
     }
 
-    fun playAndVerify(
-        timeoutMs: Long = 800L,
-        onPlayIssued: ((Long) -> Unit)? = null
-    ): PlaybackVerification {
+    fun playAndVerify(timeoutMs: Long = 350L, onPlayIssued: ((Long) -> Unit)? = null): PlaybackVerification {
         val t = track ?: error("C2 AudioTrack is not prepared")
         require(stateMachine.state == C2ReplayStateMachine.State.BUFFER_LOADED) {
             "C2 buffer is not ready: ${stateMachine.state}"
@@ -85,14 +95,14 @@ internal class PersistentC2Player(
         val baselineTimestampValid = try { t.getTimestamp(baselineTimestamp) } catch (_: Throwable) { false }
         val baselineFrame = if (baselineTimestampValid) baselineTimestamp.framePosition else -1L
 
-        lastPlayCallNs = System.nanoTime()
+        lastPlayCallNs = System.nanoTime() // diagnostic only; never protocol t3
         t.play()
         stateMachine.playIssued()
         onLog("C2 play() issued")
         onPlayIssued?.invoke(lastPlayCallNs)
 
         val deadline = System.nanoTime() + timeoutMs * 1_000_000L
-        var firstHeadAdvanced = false
+        var headAdvanced = false
         var timestampValid = false
         var firstTimestampNs: Long? = null
         var firstTimestampFrame: Long? = null
@@ -100,30 +110,30 @@ internal class PersistentC2Player(
 
         while (System.nanoTime() < deadline) {
             lastHead = unsignedHead(t.playbackHeadPosition)
-            val headDelta = unsignedDelta(headBefore, lastHead)
-            if (!firstHeadAdvanced && headDelta > 0L) {
-                firstHeadAdvanced = true
+            if (!headAdvanced && unsignedDelta(headBefore, lastHead) > 0L) {
+                headAdvanced = true
                 onLog("C2 playback head advanced")
             }
-
             val ts = AudioTimestamp()
             val ok = try { t.getTimestamp(ts) } catch (_: Throwable) { false }
-            val timestampAdvanced = ok && ts.framePosition >= 0L &&
-                (!baselineTimestampValid || ts.framePosition > baselineFrame)
-            if (timestampAdvanced && !timestampValid) {
+            val advanced = ok && ts.framePosition >= 0L &&
+                (!baselineTimestampValid || ts.framePosition > baselineFrame) &&
+                (ts.framePosition > 0L || headAdvanced)
+            if (advanced && !timestampValid) {
                 timestampValid = true
                 firstTimestampNs = ts.nanoTime
                 firstTimestampFrame = ts.framePosition
             }
-
-            if (firstHeadAdvanced || timestampValid) break
+            if (headAdvanced && timestampValid) break
             Thread.sleep(2)
         }
 
-        val verified = firstHeadAdvanced || timestampValid
+        val verified = headAdvanced || timestampValid
         stateMachine.verificationFinished(verified)
         if (verified) onLog("C2 hardware playback verified")
+        else onLog("PLAY() CALLED — HARDWARE PLAYBACK NOT VERIFIED")
 
+        val routed = try { t.routedDevice } catch (_: Throwable) { null }
         return PlaybackVerification(
             playCallTimeNs = lastPlayCallNs,
             trackState = t.state,
@@ -133,16 +143,16 @@ internal class PersistentC2Player(
             writeBytes = lastWrittenBytes,
             playbackHeadBefore = headBefore,
             playbackHeadAfter = lastHead,
-            playbackHeadAdvanced = firstHeadAdvanced,
+            playbackHeadAdvanced = headAdvanced,
             audioTimestampValid = timestampValid,
             firstValidAudioTimestampNs = firstTimestampNs,
             firstValidAudioFramePosition = firstTimestampFrame,
-            playbackVerified = verified
+            playbackVerified = verified,
+            actualOutputRoute = describeDevice(routed),
+            actualOutputRouteType = routed?.type,
+            outputSampleRate = t.sampleRate,
+            underrunCount = try { t.underrunCount } catch (_: Throwable) { -1 }
         )
-    }
-
-    fun awaitPlaybackCompletion() {
-        waitUntilPlaybackWindowElapsed()
     }
 
     fun rearmForNextPlayback() {
@@ -151,7 +161,6 @@ internal class PersistentC2Player(
             stateMachine.state == C2ReplayStateMachine.State.PLAYBACK_VERIFIED ||
                 stateMachine.state == C2ReplayStateMachine.State.PLAYBACK_UNVERIFIED
         ) { "Cannot rearm C2 from ${stateMachine.state}" }
-
         waitUntilPlaybackWindowElapsed()
         try { t.stop() } catch (_: Throwable) {}
         try { t.flush() } catch (_: Throwable) {}
@@ -168,17 +177,23 @@ internal class PersistentC2Player(
             writtenSamples = lastWrittenSamples,
             writtenFrames = lastWrittenFrames,
             writtenBytes = lastWrittenBytes,
-            playbackHeadPosition = unsignedHead(t.playbackHeadPosition)
+            playbackHeadPosition = unsignedHead(t.playbackHeadPosition),
+            preferredRoute = describeDevice(preferredOutput)
         )
     }
+
+    fun outputSampleRate(): Int = track?.sampleRate ?: sampleRate
+    fun preferredOutputDescription(): String = describeDevice(preferredOutput)
 
     fun release() {
         val t = track
         if (t != null) {
+            try { routeListener?.let { t.removeOnRoutingChangedListener(it) } } catch (_: Throwable) {}
             try { t.stop() } catch (_: Throwable) {}
             try { t.flush() } catch (_: Throwable) {}
             try { t.release() } catch (_: Throwable) {}
         }
+        routeListener = null
         track = null
         stateMachine.release()
     }
@@ -191,11 +206,7 @@ internal class PersistentC2Player(
         for (mask in masks) {
             for (lowLatency in booleanArrayOf(true, false)) {
                 try {
-                    val minOut = AudioTrack.getMinBufferSize(
-                        sampleRate,
-                        mask,
-                        AudioFormat.ENCODING_PCM_16BIT
-                    )
+                    val minOut = AudioTrack.getMinBufferSize(sampleRate, mask, AudioFormat.ENCODING_PCM_16BIT)
                     require(minOut > 0) { "AudioTrack min buffer failed for mask=$mask: $minOut" }
                     val channels = if (mask == AudioFormat.CHANNEL_OUT_MONO) 1 else 2
                     val pcmBytes = samples.size * channels * 2
@@ -215,13 +226,9 @@ internal class PersistentC2Player(
                         )
                         .setBufferSizeInBytes(maxOf(minOut * 2, pcmBytes + 4096))
                         .setTransferMode(AudioTrack.MODE_STREAM)
-                    if (lowLatency) {
-                        builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                    }
+                    if (lowLatency) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     val candidate = builder.build()
-                    require(candidate.state == AudioTrack.STATE_INITIALIZED) {
-                        "AudioTrack state=${candidate.state}"
-                    }
+                    require(candidate.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack state=${candidate.state}" }
                     candidate.setVolume(1.0f)
                     return candidate
                 } catch (t: Throwable) {
@@ -234,9 +241,7 @@ internal class PersistentC2Player(
 
     private fun preloadInternal(t: AudioTrack, initial: Boolean) {
         val written = t.write(outputSamples, 0, outputSamples.size, AudioTrack.WRITE_BLOCKING)
-        require(written == outputSamples.size) {
-            "C2 buffer write incomplete: $written/${outputSamples.size} samples"
-        }
+        require(written == outputSamples.size) { "C2 buffer write incomplete: $written/${outputSamples.size} samples" }
         lastWrittenSamples = written
         lastWrittenFrames = written / t.channelCount.coerceAtLeast(1)
         lastWrittenBytes = written * 2
@@ -246,16 +251,33 @@ internal class PersistentC2Player(
 
     private fun waitUntilPlaybackWindowElapsed() {
         if (lastPlayCallNs <= 0L) return
-        val desiredNs = ((outputFrames * 1_000_000_000L) / sampleRate) + 100_000_000L
+        val desiredNs = ((outputFrames * 1_000_000_000L) / sampleRate) + 80_000_000L
         val elapsed = System.nanoTime() - lastPlayCallNs
         val remaining = desiredNs - elapsed
-        if (remaining > 0L) {
-            Thread.sleep(remaining / 1_000_000L, (remaining % 1_000_000L).toInt())
-        }
+        if (remaining > 0L) Thread.sleep(remaining / 1_000_000L, (remaining % 1_000_000L).toInt())
     }
 
     private fun unsignedHead(value: Int): Long = value.toLong() and 0xffffffffL
+    private fun unsignedDelta(before: Long, after: Long): Long = (after - before) and 0xffffffffL
 
-    private fun unsignedDelta(before: Long, after: Long): Long =
-        (after - before) and 0xffffffffL
+    companion object {
+        fun describeDevice(device: AudioDeviceInfo?): String {
+            if (device == null) return "unavailable"
+            return "${typeName(device.type)} id=${device.id} ${device.productName}"
+        }
+
+        fun isTrustedBuiltinSpeaker(type: Int?): Boolean = type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+
+        private fun typeName(type: Int): String = when (type) {
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "BUILTIN_SPEAKER"
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "BUILTIN_EARPIECE"
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "BLUETOOTH_A2DP"
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BLUETOOTH_SCO"
+            AudioDeviceInfo.TYPE_USB_DEVICE -> "USB_DEVICE"
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "USB_HEADSET"
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "WIRED_HEADPHONES"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "WIRED_HEADSET"
+            else -> "TYPE_$type"
+        }
+    }
 }
