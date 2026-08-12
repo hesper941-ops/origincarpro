@@ -5,7 +5,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
@@ -20,8 +19,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.math.PI
 import kotlin.math.cos
-import kotlin.math.log10
-import kotlin.math.sqrt
 
 class AcousticResponder(
     private val context: Context,
@@ -37,30 +34,19 @@ class AcousticResponder(
         const val CHIRP_SEC = 0.200
         const val HOP_SAMPLES = 240
 
+        // Robust first-stage settings. v0.5 prioritizes reliable acoustic reply.
         const val C1_PRETRIGGER = 0.18
         const val C1_THRESHOLD = 0.28
         const val C1_MIN_BAND_RATIO = 0.80
-        const val C2_DIAGNOSTIC_THRESHOLD = 0.22
     }
 
     data class Result(
         val t2Sample: Int,
-        val t2MonotonicNs: Long,
-        val t3MonotonicNs: Long,
-        val t3EquivalentSample: Int,
-        val replyDelayNs: Long,
-        val replyDelayMs: Double,
         val t2Score: Double,
-        val c2SelfScore: Double,
+        val replyPlayCallNs: Long,
+        val softwareDecisionToPlayUs: Double,
         val wavPath: String,
         val udpJson: String
-    )
-
-    private data class BandResult(
-        val f0: Int,
-        val f1: Int,
-        val score: Double,
-        val gainDb: Double
     )
 
     private val running = AtomicBoolean(false)
@@ -69,16 +55,17 @@ class AcousticResponder(
     private var aec: AcousticEchoCanceler? = null
     private var ns: NoiseSuppressor? = null
     private var agc: AutomaticGainControl? = null
+    private var replyQueued = false
 
     private val c1Full = Chirp.linearPcm16(SAMPLE_RATE, CHIRP_SEC, C1_F0, C1_F1)
     private val c2Full = Chirp.linearPcm16(SAMPLE_RATE, CHIRP_SEC, C2_F0, C2_F1)
 
     fun start(linuxHost: String, linuxPort: Int) {
         if (!running.compareAndSet(false, true)) return
-        thread(name = "AVTwin-Audio") {
+        thread(name = "AVTwin-Responder") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             try {
-                runHandshake(linuxHost, linuxPort)
+                runResponder(linuxHost, linuxPort)
             } catch (t: Throwable) {
                 post("ERROR: ${t.javaClass.simpleName}: ${t.message}")
             } finally {
@@ -88,29 +75,29 @@ class AcousticResponder(
         }
     }
 
-    fun startC2TimingTest() {
+    fun startReplyPlaybackTest() {
         if (!running.compareAndSet(false, true)) return
-        thread(name = "AVTwin-C2-TimingTest") {
+        thread(name = "AVTwin-ReplyTest") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             try {
-                runC2TimingTest()
+                val source = prepareAudio()
+                post(
+                    "C2 PLAYBACK TEST\n" +
+                        "source=$source\n" +
+                        "output=${outputDescription()}\n" +
+                        "playing ${C2_F0.toInt()}-${C2_F1.toInt()} Hz for 200 ms..."
+                )
+                val callNs = System.nanoTime()
+                playQueuedReply()
+                Thread.sleep(350)
+                post(
+                    "C2 PLAYBACK TEST: DONE\n" +
+                        "play() called at $callNs ns\n" +
+                        "No hardware timestamp required.\n" +
+                        "This only verifies that the tablet can issue the acoustic reply."
+                )
             } catch (t: Throwable) {
-                post("TIMING TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
-            } finally {
-                cleanupAudio()
-                running.set(false)
-            }
-        }
-    }
-
-    fun startBandDiagnostic() {
-        if (!running.compareAndSet(false, true)) return
-        thread(name = "AVTwin-BandDiag") {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-            try {
-                runBandDiagnostic()
-            } catch (t: Throwable) {
-                post("BAND TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
+                post("C2 PLAYBACK TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
             } finally {
                 cleanupAudio()
                 running.set(false)
@@ -125,8 +112,8 @@ class AcousticResponder(
 
     fun isRunning(): Boolean = running.get()
 
-    private fun runHandshake(linuxHost: String, linuxPort: Int) {
-        val sourceName = prepareInputAndOutput()
+    private fun runResponder(linuxHost: String, linuxPort: Int) {
+        val sourceName = prepareAudio()
         val accumulator = ShortAccumulator(SAMPLE_RATE * 12)
         val hop = ShortArray(HOP_SAMPLES)
         var lastUiAt = 0L
@@ -135,12 +122,13 @@ class AcousticResponder(
         var coarseT2 = -1
 
         post(
-            "ARMED v0.4\n" +
+            "ARMED v0.5 - RESPONDER MODE\n" +
+                "Goal: hear C1 -> immediately play C2\n" +
                 "48 kHz mono PCM16 | source=$sourceName\n" +
+                "C1=${C1_F0.toInt()}-${C1_F1.toInt()} Hz / 200 ms\n" +
+                "C2=${C2_F0.toInt()}-${C2_F1.toInt()} Hz / 200 ms\n" +
                 "output=${outputDescription()}\n" +
-                "C1=11-19 kHz / 200 ms\n" +
-                "t3 method=AudioTrack hardware timestamp\n" +
-                "waiting for Linux C1..."
+                "C2 is PRE-QUEUED; hardware timestamp is NOT required"
         )
 
         record!!.startRecording()
@@ -163,7 +151,9 @@ class AcousticResponder(
                 lastC1Score = score
                 lastBandRatio = if (score >= C1_PRETRIGGER) {
                     highToLowBandRatio(accumulator, candidate, c1Full.size)
-                } else 0.0
+                } else {
+                    0.0
+                }
 
                 if (score >= C1_THRESHOLD && lastBandRatio >= C1_MIN_BAND_RATIO) {
                     coarseT2 = candidate
@@ -178,193 +168,97 @@ class AcousticResponder(
                         "time=${fmt(accumulator.size.toDouble() / SAMPLE_RATE, 2)} s\n" +
                         "C1 score=${fmt(lastC1Score)} / ${fmt(C1_THRESHOLD)}\n" +
                         "HF/LF=${if (lastBandRatio > 0.0) fmt(lastBandRatio) else "--"} / ${fmt(C1_MIN_BAND_RATIO)}\n" +
-                        "t3=hardware timestamp"
+                        "reply status=READY"
                 )
             }
         }
 
         if (!running.get() || coarseT2 < 0) return
 
+        // Refine the arrival sample from audio already captured. This is useful for logging,
+        // but v0.5 does NOT wait for any AudioTrack timestamp before replying.
         val preReplyAudio = accumulator.copy()
-        val (t2, t2Score) = MatchedFilter.refineStrongest(preReplyAudio, c1Full, coarseT2, marginSamples = 96)
-        val t2Ns = recordingFrameToMonotonicNs(t2.toLong())
+        val (t2, t2Score) = MatchedFilter.refineStrongest(
+            preReplyAudio,
+            c1Full,
+            coarseT2,
+            marginSamples = 96
+        )
 
+        val decisionNs = System.nanoTime()
         post(
             "C1 DETECTED\n" +
-                "t2 sample=$t2 score=${fmt(t2Score)}\n" +
-                "t2 mono=$t2Ns ns\n" +
-                "queueing C2 and waiting for AudioTrack timestamp..."
+                "t2 sample=$t2\n" +
+                "score=${fmt(t2Score)}\n" +
+                "REPLYING C2 NOW..."
         )
 
-        val t3Ns = playSamplesWithHardwareTimestamp(c2Full)
-        val replyDelayNs = t3Ns - t2Ns
-        require(replyDelayNs > 0L) { "Audio timestamps produced non-positive t3-t2: $replyDelayNs ns" }
-        require(replyDelayNs < 2_000_000_000L) { "Audio timestamps produced implausible t3-t2: $replyDelayNs ns" }
-        val replyDelayMs = replyDelayNs / 1_000_000.0
-        val t3EquivalentSample = t2 + ((replyDelayNs * SAMPLE_RATE) / 1_000_000_000L).toInt()
+        val playCallNs = System.nanoTime()
+        playQueuedReply()
+        val softwareDecisionToPlayUs = (playCallNs - decisionNs) / 1000.0
+
+        // Tell Linux immediately that the Android responder has issued C2.
+        val earlyJson = """{"type":"avtwin_android_reply","version":"0.5","status":"c2_play_issued","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)}}"""
+        try {
+            UdpReporter.send(linuxHost, linuxPort, earlyJson)
+        } catch (_: Throwable) {
+            // UDP is informational only; acoustic reply must never depend on Wi-Fi.
+        }
 
         post(
-            "C2 PLAYBACK TIMESTAMP OK\n" +
-                "t3 mono=$t3Ns ns\n" +
-                "t3-t2=${fmt(replyDelayMs)} ms\n" +
-                "capturing 450 ms diagnostic tail..."
+            "REPLIED C2 ✓\n" +
+                "C1 t2 sample=$t2 score=${fmt(t2Score)}\n" +
+                "C2 play() issued\n" +
+                "software decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
+                "NOTE: this is not a precise acoustic t3\n" +
+                "capturing a short tail..."
         )
 
-        val tailEnd = accumulator.size + (0.45 * SAMPLE_RATE).toInt()
-        while (running.get() && accumulator.size < tailEnd) {
+        val tailTarget = accumulator.size + (0.55 * SAMPLE_RATE).toInt()
+        while (running.get() && accumulator.size < tailTarget) {
             val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
             if (n > 0) accumulator.append(hop, n)
         }
         try { record!!.stop() } catch (_: Throwable) {}
-        if (!running.get()) return
 
-        val audio = accumulator.copy()
-        val c2Self = bestScoreAfter(audio, c2Full, (t2 + (0.030 * SAMPLE_RATE).toInt()).coerceAtLeast(0))
-        val wav = saveWav(audio, "handshake_v04")
-
-        val json = """{"type":"avtwin_android_reply","version":"0.4","sample_rate":$SAMPLE_RATE,"timing_method":"audio_hardware_timestamps","t2_sample":$t2,"t2_monotonic_ns":$t2Ns,"t3_monotonic_ns":$t3Ns,"t3_equivalent_sample":$t3EquivalentSample,"reply_delay_ns":$replyDelayNs,"reply_delay_ms":${fmt(replyDelayMs, 6)},"t2_score":${fmt(t2Score, 5)},"c2_self_score":${fmt(c2Self, 5)}}"""
+        val wav = saveWav(accumulator.copy(), "responder_v05")
+        val finalJson = """{"type":"avtwin_android_reply","version":"0.5","status":"done","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)},"wav":"${escapeJson(wav.absolutePath)}"}"""
 
         try {
-            UdpReporter.send(linuxHost, linuxPort, json)
-            post(
-                "DONE v0.4\n" +
-                    "t2=$t2 score=${fmt(t2Score)}\n" +
-                    "t3-t2=${fmt(replyDelayMs)} ms\n" +
-                    "C2 self score=${fmt(c2Self)} (diagnostic only)\n" +
-                    "UDP -> $linuxHost:$linuxPort\n" +
-                    "WAV=${wav.absolutePath}"
-            )
-        } catch (t: Throwable) {
-            post(
-                "DONE v0.4 (UDP failed: ${t.message})\n" +
-                    "t3-t2=${fmt(replyDelayMs)} ms\n" +
-                    "WAV=${wav.absolutePath}"
-            )
-        }
+            UdpReporter.send(linuxHost, linuxPort, finalJson)
+        } catch (_: Throwable) {}
+
+        post(
+            "DONE v0.5\n" +
+                "C1 detected ✓\n" +
+                "C2 acoustic reply issued ✓\n" +
+                "t2=$t2 score=${fmt(t2Score)}\n" +
+                "decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
+                "UDP target=$linuxHost:$linuxPort\n" +
+                "WAV=${wav.absolutePath}\n\n" +
+                "Next: Linux listens for the returned C2."
+        )
 
         onResult(
             Result(
                 t2Sample = t2,
-                t2MonotonicNs = t2Ns,
-                t3MonotonicNs = t3Ns,
-                t3EquivalentSample = t3EquivalentSample,
-                replyDelayNs = replyDelayNs,
-                replyDelayMs = replyDelayMs,
                 t2Score = t2Score,
-                c2SelfScore = c2Self,
+                replyPlayCallNs = playCallNs,
+                softwareDecisionToPlayUs = softwareDecisionToPlayUs,
                 wavPath = wav.absolutePath,
-                udpJson = json
+                udpJson = finalJson
             )
         )
     }
 
-    private fun runC2TimingTest() {
-        val sourceName = prepareInputAndOutput()
-        val accumulator = ShortAccumulator(SAMPLE_RATE * 2)
-        val hop = ShortArray(HOP_SAMPLES)
-        val preRoll = (0.25 * SAMPLE_RATE).toInt()
-
-        post(
-            "C2 TIMING TEST START\n" +
-                "source=$sourceName\n" +
-                "output=${outputDescription()}\n" +
-                "goal: verify AudioTrack hardware timestamp\n" +
-                "self-detection is diagnostic only"
-        )
-
-        record!!.startRecording()
-        while (running.get() && accumulator.size < preRoll) {
-            val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
-            if (n > 0) accumulator.append(hop, n)
-        }
-        if (!running.get()) return
-
-        val t3Ns = playSamplesWithHardwareTimestamp(c2Full)
-        val target = accumulator.size + (0.65 * SAMPLE_RATE).toInt()
-        while (running.get() && accumulator.size < target) {
-            val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
-            if (n > 0) accumulator.append(hop, n)
-        }
-        try { record!!.stop() } catch (_: Throwable) {}
-        if (!running.get()) return
-
-        val audio = accumulator.copy()
-        val score = bestScoreAfter(audio, c2Full, (0.15 * SAMPLE_RATE).toInt())
-        val wav = saveWav(audio, "c2_timestamp_test")
-
-        post(
-            "C2 TIMESTAMP TEST: PASS\n" +
-                "AudioTrack start=$t3Ns ns MONOTONIC\n" +
-                "C2 self-detect=${if (score >= C2_DIAGNOSTIC_THRESHOLD) "PASS" else "FAIL"} score=${fmt(score)} / ${fmt(C2_DIAGNOSTIC_THRESHOLD)}\n" +
-                "NOTE: self-detect does NOT gate v0.4 handshake\n" +
-                "WAV=${wav.absolutePath}"
-        )
-    }
-
-    private fun runBandDiagnostic() {
-        val bands = arrayOf(
-            1_000.0 to 5_000.0,
-            5_000.0 to 9_000.0,
-            9_000.0 to 13_000.0,
-            13_000.0 to 17_000.0
-        )
-        val results = ArrayList<BandResult>()
-
-        for ((index, band) in bands.withIndex()) {
-            if (!running.get()) return
-            cleanupAudio()
-            val sourceName = prepareInputAndOutput()
-            val f0 = band.first
-            val f1 = band.second
-            val template = Chirp.linearPcm16(SAMPLE_RATE, 0.150, f0, f1)
-            val acc = ShortAccumulator(SAMPLE_RATE * 2)
-            val hop = ShortArray(HOP_SAMPLES)
-            val preRoll = (0.20 * SAMPLE_RATE).toInt()
-
-            post(
-                "BAND DIAGNOSTIC ${index + 1}/4\n" +
-                    "source=$sourceName | output=${outputDescription()}\n" +
-                    "testing ${f0.toInt()}-${f1.toInt()} Hz..."
-            )
-
-            record!!.startRecording()
-            while (running.get() && acc.size < preRoll) {
-                val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
-                if (n > 0) acc.append(hop, n)
-            }
-            if (!running.get()) return
-
-            playSamplesNoTimestamp(template)
-            val target = acc.size + (0.60 * SAMPLE_RATE).toInt()
-            while (running.get() && acc.size < target) {
-                val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
-                if (n > 0) acc.append(hop, n)
-            }
-            try { record!!.stop() } catch (_: Throwable) {}
-
-            val audio = acc.copy()
-            val score = bestScoreAfter(audio, template, (0.10 * SAMPLE_RATE).toInt())
-            val noiseRms = rms(audio, 0, (0.15 * SAMPLE_RATE).toInt().coerceAtMost(audio.size))
-            val maxRms = maxWindowRms(audio, preRoll, (0.025 * SAMPLE_RATE).toInt())
-            val gainDb = 20.0 * log10((maxRms + 1.0) / (noiseRms + 1.0))
-            results.add(BandResult(f0.toInt(), f1.toInt(), score, gainDb))
-        }
-
-        val best = results.maxByOrNull { it.score }
-        val lines = results.joinToString("\n") {
-            "${it.f0 / 1000}-${it.f1 / 1000} kHz: corr=${fmt(it.score)}  level=+${fmt(it.gainDb, 1)} dB"
-        }
-        post(
-            "BAND DIAGNOSTIC DONE\n" + lines +
-                "\nBest correlation: ${best?.f0?.div(1000)}-${best?.f1?.div(1000)} kHz\n" +
-                "Use this to judge whether 11-19 kHz C1 is realistic on this tablet."
-        )
-    }
-
-    private fun prepareInputAndOutput(): String {
+    private fun prepareAudio(): String {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val unprocessed = audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
-        val source = if (unprocessed) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.VOICE_RECOGNITION
+        val source = if (unprocessed) {
+            MediaRecorder.AudioSource.UNPROCESSED
+        } else {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        }
         val sourceName = if (unprocessed) "UNPROCESSED" else "VOICE_RECOGNITION"
 
         val minBuffer = AudioRecord.getMinBufferSize(
@@ -387,14 +281,27 @@ class AcousticResponder(
             .build()
         require(record?.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
         disablePreprocessing(record!!.audioSessionId)
-        prepareTrack()
+
+        prepareReplyTrackAndQueueC2()
         return sourceName
     }
 
-    private fun prepareTrack() {
+    private fun prepareReplyTrackAndQueueC2() {
         fun makeTrack(mask: Int): AudioTrack {
-            val minOut = AudioTrack.getMinBufferSize(SAMPLE_RATE, mask, AudioFormat.ENCODING_PCM_16BIT)
+            val minOut = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE,
+                mask,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
             require(minOut > 0) { "48 kHz PCM16 AudioTrack not supported for channel mask $mask: $minOut" }
+
+            val requiredSamples = if (mask == AudioFormat.CHANNEL_OUT_MONO) {
+                c2Full.size
+            } else {
+                c2Full.size * 2
+            }
+            val requiredBytes = requiredSamples * 2
+
             return AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -409,7 +316,7 @@ class AcousticResponder(
                         .setChannelMask(mask)
                         .build()
                 )
-                .setBufferSizeInBytes(maxOf(minOut * 2, c2Full.size * 4))
+                .setBufferSizeInBytes(maxOf(minOut * 2, requiredBytes + 4096))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
         }
@@ -419,79 +326,43 @@ class AcousticResponder(
         } catch (_: Throwable) {
             makeTrack(AudioFormat.CHANNEL_OUT_STEREO)
         }
-        require(track?.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack streaming initialization failed" }
-        track!!.setVolume(1.0f)
-    }
-
-    private fun playSamplesWithHardwareTimestamp(samples: ShortArray): Long {
-        val t = track ?: error("AudioTrack not prepared")
-        queueSamples(t, samples)
-        t.play()
-
-        val ts = AudioTimestamp()
-        val deadline = System.nanoTime() + 800_000_000L
-        while (System.nanoTime() < deadline && running.get()) {
-            if (t.getTimestamp(ts) && ts.framePosition > 0L) {
-                return ts.nanoTime - framesToNs(ts.framePosition)
-            }
-            Thread.sleep(4)
+        require(track?.state == AudioTrack.STATE_INITIALIZED) {
+            "AudioTrack streaming initialization failed"
         }
-        throw IllegalStateException("AudioTrack hardware timestamp unavailable within 800 ms")
+        track!!.setVolume(1.0f)
+
+        // Pre-queue the fixed C2 while the track is stopped. Detection then only needs play().
+        queueReplySamples(track!!)
+        replyQueued = true
     }
 
-    private fun playSamplesNoTimestamp(samples: ShortArray) {
-        val t = track ?: error("AudioTrack not prepared")
-        queueSamples(t, samples)
-        t.play()
-    }
-
-    private fun queueSamples(t: AudioTrack, samples: ShortArray) {
+    private fun queueReplySamples(t: AudioTrack) {
         try { t.pause() } catch (_: Throwable) {}
         try { t.flush() } catch (_: Throwable) {}
 
         if (t.channelCount == 1) {
-            val written = t.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-            require(written == samples.size) { "Could not queue mono audio: $written/${samples.size}" }
+            val written = t.write(c2Full, 0, c2Full.size, AudioTrack.WRITE_BLOCKING)
+            require(written == c2Full.size) {
+                "Could not pre-queue mono C2: $written/${c2Full.size}"
+            }
         } else {
-            val stereo = ShortArray(samples.size * 2)
-            for (i in samples.indices) {
-                stereo[2 * i] = samples[i]
-                stereo[2 * i + 1] = samples[i]
+            val stereo = ShortArray(c2Full.size * 2)
+            for (i in c2Full.indices) {
+                stereo[2 * i] = c2Full[i]
+                stereo[2 * i + 1] = c2Full[i]
             }
             val written = t.write(stereo, 0, stereo.size, AudioTrack.WRITE_BLOCKING)
-            require(written == stereo.size) { "Could not queue stereo audio: $written/${stereo.size}" }
-        }
-    }
-
-    private fun recordingFrameToMonotonicNs(frame: Long): Long {
-        val r = record ?: error("AudioRecord not prepared")
-        val ts = AudioTimestamp()
-        var attempts = 0
-        while (attempts < 25 && running.get()) {
-            val rc = r.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC)
-            if (rc == AudioRecord.SUCCESS && ts.framePosition > 0L) {
-                return ts.nanoTime + framesToNs(frame - ts.framePosition)
+            require(written == stereo.size) {
+                "Could not pre-queue stereo C2: $written/${stereo.size}"
             }
-            attempts++
-            Thread.sleep(2)
         }
-        throw IllegalStateException("AudioRecord hardware timestamp unavailable")
     }
 
-    private fun framesToNs(frames: Long): Long = (frames * 1_000_000_000L) / SAMPLE_RATE
-
-    private fun bestScoreAfter(audio: ShortArray, template: ShortArray, firstStart: Int): Double {
-        if (audio.size < template.size) return 0.0
-        val first = firstStart.coerceIn(0, audio.size - template.size)
-        val last = audio.size - template.size
-        var best = 0.0
-        var s = first
-        while (s <= last) {
-            val score = MatchedFilter.score(audio, template, s, decimation = 6)
-            if (score > best) best = score
-            s += 8
-        }
-        return best
+    private fun playQueuedReply() {
+        val t = track ?: error("AudioTrack not prepared")
+        require(replyQueued) { "C2 reply was not pre-queued" }
+        t.play()
+        replyQueued = false
     }
 
     private fun highToLowBandRatio(audio: ShortAccumulator, start: Int, length: Int): Double {
@@ -519,29 +390,6 @@ class AcousticResponder(
             i++
         }
         return s1 * s1 + s2 * s2 - coeff * s1 * s2
-    }
-
-    private fun rms(audio: ShortArray, start: Int, length: Int): Double {
-        if (length <= 0 || start < 0 || start + length > audio.size) return 0.0
-        var sum = 0.0
-        for (i in start until start + length) {
-            val x = audio[i].toDouble()
-            sum += x * x
-        }
-        return sqrt(sum / length)
-    }
-
-    private fun maxWindowRms(audio: ShortArray, start: Int, window: Int): Double {
-        if (audio.isEmpty() || window <= 0) return 0.0
-        var best = 0.0
-        var s = start.coerceAtLeast(0)
-        val step = (window / 2).coerceAtLeast(1)
-        while (s + window <= audio.size) {
-            val value = rms(audio, s, window)
-            if (value > best) best = value
-            s += step
-        }
-        return best
     }
 
     private fun outputDescription(): String {
@@ -592,8 +440,10 @@ class AcousticResponder(
         aec = null
         ns = null
         agc = null
+        replyQueued = false
     }
 
+    private fun escapeJson(value: String): String = value.replace("\\", "\\\\").replace("\"", "\\\"")
     private fun fmt(v: Double, digits: Int = 3): String = "% .${digits}f".format(Locale.US, v).trim()
     private fun post(s: String) = onStatus(s)
 }
