@@ -47,11 +47,11 @@ class ContinuousSessionLogicTest {
         assertFalse("duplicate pending ARM rejected", p.accept(ArmCommand(1, "s1", 12), 110).accepted)
         val claim = p.claimNext(200)
         assertEquals("armed", claim.pairingMode)
-        assertEquals(12, claim.measurementId)
+        assertEquals(12L, claim.measurementId)
         assertFalse("old ARM cannot be reused", p.accept(ArmCommand(1, "s1", 12), 210).accepted)
         assertTrue(p.accept(ArmCommand(1, "s1", 13), 300).accepted)
         val next = p.claimNext(301)
-        assertEquals(13, next.measurementId)
+        assertEquals(13L, next.measurementId)
     }
 
     @Test
@@ -60,8 +60,8 @@ class ContinuousSessionLogicTest {
         val a = p.claimNext(1)
         val b = p.claimNext(2)
         assertEquals("chronological_unarmed", a.pairingMode)
-        assertEquals(1, a.measurementId)
-        assertEquals(2, b.measurementId)
+        assertEquals(1L, a.measurementId)
+        assertEquals(2L, b.measurementId)
     }
 
     @Test
@@ -70,7 +70,7 @@ class ContinuousSessionLogicTest {
         assertTrue(p.accept(ArmCommand(1, "s", 99), 100).accepted)
         val claim = p.claimNext(200)
         assertEquals("chronological_unarmed", claim.pairingMode)
-        assertEquals(1, claim.measurementId)
+        assertEquals(1L, claim.measurementId)
     }
 
     @Test
@@ -78,7 +78,7 @@ class ContinuousSessionLogicTest {
         val a = ArmCommand.parse("""{"type":"arm","protocol_version":1,"session_id":"abc","measurement_id":12}""")
         assertNotNull(a)
         assertEquals("abc", a!!.sessionId)
-        assertEquals(12, a.measurementId)
+        assertEquals(12L, a.measurementId)
         assertNull(ArmCommand.parse("""{"type":"other"}"""))
     }
 
@@ -86,7 +86,7 @@ class ContinuousSessionLogicTest {
     fun audioTimestampProjection_producesSameCaptureTimelineT3() {
         val sampleRate = 48_000
         val capture = CaptureAudioTimestamp(framePosition = 50_000, nanoTime = 2_000_000_000L, observedReadFrameCount = 50_000)
-        // Playback frame 480 is presented at 2.020 s, so frame 0 started at 2.010 s.
+        // Playback frame 480 of this round is presented at 2.020 s, so round frame 0 was 2.010 s.
         val playback = PlaybackAudioTimestamp(framePosition = 480, nanoTime = 2_020_000_000L)
         val result = ReplyTimingMapper.mapToCaptureTimeline(
             t2Sample = 49_000,
@@ -100,8 +100,35 @@ class ContinuousSessionLogicTest {
             outputRouteTrusted = true
         )
         assertTrue(result.t3Precise)
-        assertEquals(50_480, result.t3Sample)
-        assertEquals(1_480, result.replyDelaySamples)
+        assertEquals(50_480L, result.t3Sample)
+        assertEquals(1_480L, result.replyDelaySamples)
+    }
+
+    @Test
+    fun audioTimestampProjection_worksForLaterPersistentTrackRound() {
+        val sampleRate = 48_000
+        val capture = CaptureAudioTimestamp(framePosition = 200_000, nanoTime = 5_000_000_000L, observedReadFrameCount = 200_000)
+        // A cumulative AudioTrack may start this round at frame 96,000. Frame 96,480 at 5.020 s
+        // still means THIS round began at 5.010 s.
+        val playback = PlaybackAudioTimestamp(
+            framePosition = 96_480,
+            nanoTime = 5_020_000_000L,
+            roundStartFramePosition = 96_000
+        )
+        val result = ReplyTimingMapper.mapToCaptureTimeline(
+            t2Sample = 199_000,
+            sampleRate = sampleRate,
+            playback = playback,
+            capture = capture,
+            inputSampleRate = sampleRate,
+            outputSampleRate = sampleRate,
+            routeStable = true,
+            inputRouteTrusted = true,
+            outputRouteTrusted = true
+        )
+        assertTrue(result.t3Precise)
+        assertEquals(200_480L, result.t3Sample)
+        assertEquals(1_480L, result.replyDelaySamples)
     }
 
     @Test
