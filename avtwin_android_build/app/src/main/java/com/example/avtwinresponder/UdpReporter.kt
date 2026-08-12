@@ -35,14 +35,34 @@ object UdpReporter {
         datagramTransport.send(host, port, json)
     }
 
+    /**
+     * Production result reporting is deliberately single-shot.
+     *
+     * Acoustic C1 -> C2 is the handshake. UDP only carries timing metadata after the
+     * acoustic response has already happened, so duplicating the same reply_timing packet
+     * can look like multiple responder events on a Linux controller that has not yet added
+     * event-id de-duplication. The repeats argument is kept for source/protocol compatibility,
+     * but the production path sends exactly one datagram.
+     *
+     * If reliable delivery is needed later, use an explicit ACK protocol rather than blind
+     * duplicate sends.
+     */
     fun sendRepeated(
         host: String,
         port: Int,
         json: String,
-        repeats: Int = 3,
-        spacingMs: Long = 35L
-    ): SendReport = sendRepeatedWithTransport(host, port, json, repeats, spacingMs, datagramTransport)
+        repeats: Int = 1,
+        spacingMs: Long = 0L
+    ): SendReport = sendRepeatedWithTransport(
+        host = host,
+        port = port,
+        json = json,
+        repeats = 1,
+        spacingMs = 0L,
+        transport = datagramTransport
+    )
 
+    /** Testable retry primitive retained for future ACK/retry experiments. */
     internal fun sendRepeatedWithTransport(
         host: String,
         port: Int,
@@ -57,17 +77,16 @@ object UdpReporter {
             attempts += Attempt(1, wallNow(), System.nanoTime(), false, "blank_host")
             return SendReport(host, port, attempts)
         }
-        for (i in 1..repeats.coerceAtLeast(1)) {
+        val count = repeats.coerceAtLeast(1)
+        for (i in 1..count) {
             val diagNs = System.nanoTime() // diagnostic only, not acoustic timing
             try {
-                // The exact same JSON payload is used for every retry. Therefore the
-                // android_event_id embedded by the caller remains stable for Linux de-duplication.
                 transport.send(host, port, json)
                 attempts += Attempt(i, wallNow(), diagNs, true, null)
             } catch (t: Throwable) {
                 attempts += Attempt(i, wallNow(), diagNs, false, "${t.javaClass.simpleName}: ${t.message}")
             }
-            if (i < repeats && spacingMs > 0L) sleeper(spacingMs)
+            if (i < count && spacingMs > 0L) sleeper(spacingMs)
         }
         return SendReport(host, port, attempts)
     }
