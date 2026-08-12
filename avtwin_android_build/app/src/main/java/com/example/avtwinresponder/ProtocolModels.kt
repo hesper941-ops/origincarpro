@@ -3,6 +3,7 @@ package com.example.avtwinresponder
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 object Sha256 {
     fun hex(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
@@ -59,6 +60,35 @@ object JsonWire {
     }
 }
 
+/**
+ * Process-wide gate for the Android responder's formal experiment mode.
+ *
+ * It is deliberately NOT a timing source. It only decides whether the detector is allowed
+ * to associate the next acoustic C1 with a Linux measurement. Every accepted ARM advances
+ * a generation so StreamingC1Detector can discard samples buffered before that ARM.
+ */
+object StrictArmGate {
+    private val generationCounter = AtomicLong(0L)
+    @Volatile private var armed = false
+
+    fun reset() {
+        armed = false
+        generationCounter.incrementAndGet()
+    }
+
+    fun arm() {
+        armed = true
+        generationCounter.incrementAndGet()
+    }
+
+    fun consume() {
+        armed = false
+    }
+
+    fun isArmed(): Boolean = armed
+    fun generation(): Long = generationCounter.get()
+}
+
 data class ArmCommand(
     val protocolVersion: Int,
     val sessionId: String,
@@ -82,6 +112,15 @@ data class PairingClaim(
     val armReceivedDiagnosticMs: Long?
 )
 
+/**
+ * Strict protocol semantics:
+ *   one accepted ARM -> at most one claim -> at most one acoustic response.
+ *
+ * There is intentionally no chronological_unarmed production fallback in v0.8.2. If an
+ * internal race ever attempts to claim a C1 without a fresh ARM, fail closed instead of
+ * authorizing C2. elapsedRealtime values below are protocol freshness diagnostics only and
+ * are never used as t2/t3 acoustic timing.
+ */
 class ArmPairingManager(
     private val currentSessionId: String,
     private val maxArmAgeMs: Long = 10_000L
@@ -91,7 +130,10 @@ class ArmPairingManager(
     private var pending: ArmCommand? = null
     private var pendingReceivedMs: Long = 0L
     private var lastClaimedMeasurementId: Long = Long.MIN_VALUE
-    private var localSequence: Long = 0L
+
+    init {
+        StrictArmGate.reset()
+    }
 
     @Synchronized
     fun accept(command: ArmCommand, nowDiagnosticMs: Long): AcceptResult {
@@ -104,27 +146,30 @@ class ArmPairingManager(
         }
         pending = command
         pendingReceivedMs = nowDiagnosticMs
-        return AcceptResult(true, if (p == null) "accepted" else "accepted_superseding_pending")
+        StrictArmGate.arm()
+        return AcceptResult(true, if (p == null) "accepted_strict" else "accepted_superseding_pending_strict")
     }
 
     @Synchronized
     fun claimNext(nowDiagnosticMs: Long): PairingClaim {
         val p = pending
+        pending = null
         if (p != null) {
             val age = nowDiagnosticMs - pendingReceivedMs
-            pending = null
             if (age in 0..maxArmAgeMs) {
                 lastClaimedMeasurementId = maxOf(lastClaimedMeasurementId, p.measurementId)
-                return PairingClaim(p.sessionId, p.measurementId, "armed", pendingReceivedMs)
+                StrictArmGate.consume()
+                return PairingClaim(p.sessionId, p.measurementId, "strict_armed", pendingReceivedMs)
             }
         }
-        localSequence++
-        return PairingClaim(currentSessionId, localSequence, "chronological_unarmed", null)
+        StrictArmGate.consume()
+        throw IllegalStateException("STRICT ARM required or ARM expired; refusing acoustic response")
     }
 
     @Synchronized
     fun clearPending() {
         pending = null
+        StrictArmGate.consume()
     }
 
     @Synchronized
