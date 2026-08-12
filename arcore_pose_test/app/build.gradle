@@ -1,0 +1,20 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.rirresearch.arcoreposetest'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.rirresearch.arcoreposetest"
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+    }
+}
+
+dependencies {
+    implementation 'com.google.ar:core:1.54.0'
+}
