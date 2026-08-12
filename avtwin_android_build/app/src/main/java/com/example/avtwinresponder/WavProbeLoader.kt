@@ -20,10 +20,10 @@ object WavProbeLoader {
             require(data.size <= MAX_FILE_BYTES) { "WAV is too large (>16 MB)" }
             data
         } ?: error("Cannot open selected file")
-        return decodeBytes(name, bytes)
+        return decodeBytes(name, bytes, uri.toString())
     }
 
-    internal fun decodeBytes(name: String, bytes: ByteArray): ProbeSignal {
+    internal fun decodeBytes(name: String, bytes: ByteArray, sourceUri: String? = null): ProbeSignal {
         require(bytes.size >= 44) { "File is too small to be a WAV" }
         require(ascii(bytes, 0, 4) == "RIFF" && ascii(bytes, 8, 4) == "WAVE") {
             "Only RIFF/WAVE files are supported"
@@ -85,8 +85,8 @@ object WavProbeLoader {
         require(frameBytes > 0 && dataSize >= frameBytes) { "Invalid WAV data size" }
         val frameCount = dataSize / frameBytes
 
-        // AV-Twin experiment convention: stereo probe WAVs have LEFT silent and RIGHT chirp.
-        // Never average L/R: use RIGHT (channel index 1) explicitly when available.
+        // Project convention: stereo probes carry the chirp in RIGHT and keep LEFT silent.
+        // RIGHT must be preserved exactly; averaging L/R would attenuate it by 6 dB.
         val selectedChannel = if (channels >= 2) 1 else 0
         val sourceChannel = if (channels >= 2) "RIGHT" else "MONO"
         val selected = ShortArray(frameCount)
@@ -113,11 +113,8 @@ object WavProbeLoader {
         }
         if (channels == 1) rightPeak = 0.0
 
-        val target = if (sampleRate == ProbeSignal.SAMPLE_RATE) {
-            selected
-        } else {
+        val target = if (sampleRate == ProbeSignal.SAMPLE_RATE) selected else
             resampleLinear(selected, sampleRate, ProbeSignal.SAMPLE_RATE)
-        }
 
         val durationSec = target.size.toDouble() / ProbeSignal.SAMPLE_RATE
         require(durationSec >= MIN_DURATION_SEC) {
@@ -136,7 +133,10 @@ object WavProbeLoader {
             sourceChannel = sourceChannel,
             leftPeak = leftPeak,
             rightPeak = rightPeak,
-            internalPeak = ProbeSignal.peakOf(target)
+            internalPeak = ProbeSignal.peakOf(target),
+            sourceSha256 = Sha256.hex(bytes),
+            internalPcmSha256 = Sha256.pcm16Hex(target),
+            sourceUri = sourceUri
         )
     }
 
@@ -156,27 +156,23 @@ object WavProbeLoader {
         return out
     }
 
-    private fun pcmToUnit(b: ByteArray, o: Int, bits: Int): Double {
-        return when (bits) {
-            8 -> (((b[o].toInt() and 0xff) - 128) / 128.0).coerceIn(-1.0, 1.0)
-            16 -> s16(b, o) / 32768.0
-            24 -> {
-                var v = (b[o].toInt() and 0xff) or
-                    ((b[o + 1].toInt() and 0xff) shl 8) or
-                    ((b[o + 2].toInt() and 0xff) shl 16)
-                if ((v and 0x800000) != 0) v = v or -0x1000000
-                v / 8388608.0
-            }
-            32 -> s32(b, o) / 2147483648.0
-            else -> 0.0
+    private fun pcmToUnit(b: ByteArray, o: Int, bits: Int): Double = when (bits) {
+        8 -> (((b[o].toInt() and 0xff) - 128) / 128.0).coerceIn(-1.0, 1.0)
+        16 -> s16(b, o) / 32768.0
+        24 -> {
+            var v = (b[o].toInt() and 0xff) or
+                ((b[o + 1].toInt() and 0xff) shl 8) or
+                ((b[o + 2].toInt() and 0xff) shl 16)
+            if ((v and 0x800000) != 0) v = v or -0x1000000
+            v / 8388608.0
         }
+        32 -> s32(b, o) / 2147483648.0
+        else -> 0.0
     }
 
     private fun float32ToUnit(b: ByteArray, o: Int): Double {
-        val bits = s32(b, o)
-        val f = Float.fromBits(bits)
-        if (!f.isFinite()) return 0.0
-        return f.toDouble().coerceIn(-1.0, 1.0)
+        val f = Float.fromBits(s32(b, o))
+        return if (f.isFinite()) f.toDouble().coerceIn(-1.0, 1.0) else 0.0
     }
 
     private fun displayName(context: Context, uri: Uri): String {
@@ -189,22 +185,14 @@ object WavProbeLoader {
         return uri.lastPathSegment ?: "selected_probe.wav"
     }
 
-    private fun ascii(b: ByteArray, o: Int, n: Int): String =
-        String(b, o, n, StandardCharsets.US_ASCII)
-
-    private fun u16(b: ByteArray, o: Int): Int =
-        (b[o].toInt() and 0xff) or ((b[o + 1].toInt() and 0xff) shl 8)
-
+    private fun ascii(b: ByteArray, o: Int, n: Int): String = String(b, o, n, StandardCharsets.US_ASCII)
+    private fun u16(b: ByteArray, o: Int): Int = (b[o].toInt() and 0xff) or ((b[o + 1].toInt() and 0xff) shl 8)
     private fun s16(b: ByteArray, o: Int): Int {
         val v = u16(b, o)
         return if ((v and 0x8000) != 0) v - 0x10000 else v
     }
-
     private fun s32(b: ByteArray, o: Int): Int =
-        (b[o].toInt() and 0xff) or
-            ((b[o + 1].toInt() and 0xff) shl 8) or
-            ((b[o + 2].toInt() and 0xff) shl 16) or
-            (b[o + 3].toInt() shl 24)
-
+        (b[o].toInt() and 0xff) or ((b[o + 1].toInt() and 0xff) shl 8) or
+            ((b[o + 2].toInt() and 0xff) shl 16) or (b[o + 3].toInt() shl 24)
     private fun u32(b: ByteArray, o: Int): Long = s32(b, o).toLong() and 0xffffffffL
 }
