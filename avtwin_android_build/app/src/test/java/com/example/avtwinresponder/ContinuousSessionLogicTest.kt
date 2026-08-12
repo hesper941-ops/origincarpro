@@ -9,8 +9,10 @@ import org.junit.Test
 
 class ContinuousSessionLogicTest {
     @Test
-    fun multipleC1Cycles_doNotRetriggerUntilCooldownEnds() {
-        val sm = ContinuousResponderStateMachine(cooldownSamples = 4800)
+    fun multipleC1Cycles_doNotRetriggerUntilConfiguredCooldownEnds() {
+        // This test isolates the configurable cooldown. The separate test below verifies the
+        // production 800 ms minimum re-arm floor.
+        val sm = ContinuousResponderStateMachine(cooldownSamples = 4800, minimumRearmSamples = 0)
         sm.start()
         assertTrue(sm.acceptC1())
         assertFalse("same C1 cannot trigger twice", sm.acceptC1())
@@ -24,6 +26,21 @@ class ContinuousSessionLogicTest {
         assertTrue(sm.updateCaptureSample(14_800))
         assertEquals(ContinuousResponderStateMachine.State.LISTENING, sm.state)
         assertTrue("next C1 after cooldown is legal at state-machine level", sm.acceptC1())
+    }
+
+    @Test
+    fun productionMinimumRearmFloor_isEightHundredMsAt48k() {
+        val sm = ContinuousResponderStateMachine(cooldownSamples = 4_800)
+        sm.start()
+        assertTrue(sm.acceptC1())
+        sm.c2Scheduled()
+        sm.c2Playing()
+        sm.reporting()
+        sm.enterCooldown(10_000)
+        assertEquals(48_400L, sm.cooldownUntilSample)
+        assertFalse(sm.updateCaptureSample(48_399))
+        assertTrue(sm.updateCaptureSample(48_400))
+        assertEquals(ContinuousResponderStateMachine.State.LISTENING, sm.state)
     }
 
     @Test
