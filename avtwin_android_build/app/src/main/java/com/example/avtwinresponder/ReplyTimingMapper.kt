@@ -10,14 +10,15 @@ data class CaptureAudioTimestamp(
 
 data class PlaybackAudioTimestamp(
     val framePosition: Long,
-    val nanoTime: Long
+    val nanoTime: Long,
+    val roundStartFramePosition: Long
 )
 
 data class ReplyTimingResult(
     val t3Precise: Boolean,
     val t3Sample: Long?,
     val replyDelaySamples: Long?,
-    val playbackFrameZeroNanoTime: Long?,
+    val playbackRoundStartNanoTime: Long?,
     val reason: String?
 )
 
@@ -41,33 +42,42 @@ object ReplyTimingMapper {
         if (!routeStable) return fail("audio_route_changed_during_measurement")
         if (!inputRouteTrusted) return fail("input_route_not_trusted")
         if (!outputRouteTrusted) return fail("output_route_not_trusted")
-        if (playback.nanoTime <= 0L || capture.nanoTime <= 0L || playback.framePosition < 0L || capture.framePosition < 0L) {
-            return fail("invalid_audio_timestamp")
-        }
+        if (
+            playback.nanoTime <= 0L || capture.nanoTime <= 0L ||
+            playback.framePosition < 0L || playback.roundStartFramePosition < 0L || capture.framePosition < 0L
+        ) return fail("invalid_audio_timestamp")
 
+        val framesSinceRoundStart = playback.framePosition - playback.roundStartFramePosition
+        if (framesSinceRoundStart < 0L) return fail("playback_timestamp_precedes_round_start")
+
+        // Both Android audio timestamps are in a monotonic timebase. We use the AudioTrack
+        // timestamp only to infer the presentation time of THIS ROUND's first C2 frame, then
+        // project that instant onto the persistent AudioRecord frame axis. Diagnostic Kotlin
+        // clocks are intentionally absent from this calculation.
         val nsPerFrame = 1_000_000_000.0 / sampleRate.toDouble()
-        val playbackFrameZeroNs = playback.nanoTime - (playback.framePosition * nsPerFrame).roundToLong()
-        val deltaNs = playbackFrameZeroNs - capture.nanoTime
-        val projected = capture.framePosition + (deltaNs * sampleRate.toDouble() / 1_000_000_000.0).roundToLong()
+        val playbackRoundStartNs = playback.nanoTime - (framesSinceRoundStart * nsPerFrame).roundToLong()
+        val deltaNs = playbackRoundStartNs - capture.nanoTime
+        val projected = capture.framePosition +
+            (deltaNs * sampleRate.toDouble() / 1_000_000_000.0).roundToLong()
         val replyDelay = projected - t2Sample
 
-        if (replyDelay < 0L) return fail("mapped_t3_before_t2", playbackFrameZeroNs)
-        if (replyDelay > maxReplyDelaySamples) return fail("reply_delay_out_of_range", playbackFrameZeroNs)
+        if (replyDelay < 0L) return fail("mapped_t3_before_t2", playbackRoundStartNs)
+        if (replyDelay > maxReplyDelaySamples) return fail("reply_delay_out_of_range", playbackRoundStartNs)
 
         return ReplyTimingResult(
             t3Precise = true,
             t3Sample = projected,
             replyDelaySamples = replyDelay,
-            playbackFrameZeroNanoTime = playbackFrameZeroNs,
+            playbackRoundStartNanoTime = playbackRoundStartNs,
             reason = null
         )
     }
 
-    private fun fail(reason: String, frameZeroNs: Long? = null) = ReplyTimingResult(
+    private fun fail(reason: String, roundStartNs: Long? = null) = ReplyTimingResult(
         t3Precise = false,
         t3Sample = null,
         replyDelaySamples = null,
-        playbackFrameZeroNanoTime = frameZeroNs,
+        playbackRoundStartNanoTime = roundStartNs,
         reason = reason
     )
 }
