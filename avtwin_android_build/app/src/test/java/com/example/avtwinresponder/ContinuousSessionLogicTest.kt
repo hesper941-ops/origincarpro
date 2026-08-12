@@ -10,7 +10,7 @@ import org.junit.Test
 class ContinuousSessionLogicTest {
     @Test
     fun multipleC1Cycles_doNotRetriggerUntilCooldownEnds() {
-        val sm = ContinuousResponderStateMachine(cooldownSamples = 4800)
+        val sm = ContinuousResponderStateMachine(cooldownSamples = 4800, minimumRearmSamples = 0)
         sm.start()
         assertTrue(sm.acceptC1())
         assertFalse("same C1 cannot trigger twice", sm.acceptC1())
@@ -27,8 +27,25 @@ class ContinuousSessionLogicTest {
     }
 
     @Test
+    fun defaultAcousticRearmGuard_blocksSamePhysicalC1TailFor800ms() {
+        val sm = ContinuousResponderStateMachine(cooldownSamples = 4_800)
+        sm.start()
+        assertTrue(sm.acceptC1())
+        sm.c2Scheduled()
+        sm.c2Playing()
+        sm.reporting()
+        sm.enterCooldown(100_000)
+
+        assertEquals(138_400L, sm.cooldownUntilSample)
+        assertFalse(sm.updateCaptureSample(138_399))
+        assertFalse(sm.acceptC1())
+        assertTrue(sm.updateCaptureSample(138_400))
+        assertTrue(sm.acceptC1())
+    }
+
+    @Test
     fun pauseResumeAndSafeStop_areDeterministic() {
-        val sm = ContinuousResponderStateMachine(100)
+        val sm = ContinuousResponderStateMachine(100, minimumRearmSamples = 0)
         sm.start()
         sm.requestPause()
         assertEquals(ContinuousResponderStateMachine.State.PAUSED, sm.state)
@@ -86,7 +103,6 @@ class ContinuousSessionLogicTest {
     fun audioTimestampProjection_producesSameCaptureTimelineT3() {
         val sampleRate = 48_000
         val capture = CaptureAudioTimestamp(framePosition = 50_000, nanoTime = 2_000_000_000L, observedReadFrameCount = 50_000)
-        // Playback frame 480 of this round is presented at 2.020 s, so round frame 0 was 2.010 s.
         val playback = PlaybackAudioTimestamp(framePosition = 480, nanoTime = 2_020_000_000L)
         val result = ReplyTimingMapper.mapToCaptureTimeline(
             t2Sample = 49_000,
@@ -108,8 +124,6 @@ class ContinuousSessionLogicTest {
     fun audioTimestampProjection_worksForLaterPersistentTrackRound() {
         val sampleRate = 48_000
         val capture = CaptureAudioTimestamp(framePosition = 200_000, nanoTime = 5_000_000_000L, observedReadFrameCount = 200_000)
-        // A cumulative AudioTrack may start this round at frame 96,000. Frame 96,480 at 5.020 s
-        // still means THIS round began at 5.010 s.
         val playback = PlaybackAudioTimestamp(
             framePosition = 96_480,
             nanoTime = 5_020_000_000L,
