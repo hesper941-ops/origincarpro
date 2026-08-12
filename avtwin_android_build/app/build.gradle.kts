@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.avtwinresponder"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.8.0"
+        versionCode = 9
+        versionName = "0.8.1"
     }
 
     compileOptions {
