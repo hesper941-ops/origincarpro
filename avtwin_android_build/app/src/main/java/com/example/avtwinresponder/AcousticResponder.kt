@@ -1,311 +1,452 @@
 package com.example.avtwinresponder
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.AudioTrack
+import android.media.AudioRouting
+import android.media.AudioTimestamp
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
+import android.net.Uri
 import android.os.Process
-import android.util.Log
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
+import android.os.SystemClock
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
-import kotlin.math.PI
-import kotlin.math.cos
 
 class AcousticResponder(
     private val context: Context,
     private val c1Signal: ProbeSignal,
     private val c2Signal: ProbeSignal,
     private val onStatus: (String) -> Unit,
-    private val onResult: (Result) -> Unit
+    private val onSnapshot: (SessionSnapshot) -> Unit
 ) {
+    data class SessionConfig(
+        val linuxHost: String,
+        val controlPort: Int,
+        val resultPort: Int,
+        val resultTreeUri: Uri,
+        val saveDebugAudio: Boolean,
+        val cooldownMs: Int = 300
+    )
+
+    data class SessionSnapshot(
+        val state: String,
+        val sessionId: String?,
+        val measurementId: Long?,
+        val pendingArmMeasurementId: Long?,
+        val successResponses: Long,
+        val c1Rejected: Long,
+        val c2Failures: Long,
+        val udpFailures: Long,
+        val lastReplyDelaySamples: Long?,
+        val lastT3Precise: Boolean,
+        val inputRoute: String,
+        val outputRoute: String,
+        val note: String = ""
+    )
+
     companion object {
         const val SAMPLE_RATE = ProbeSignal.SAMPLE_RATE
         const val HOP_SAMPLES = 240
-        const val C1_PRETRIGGER = 0.18
         const val C1_THRESHOLD = 0.28
+        const val C1_PRETRIGGER = 0.18
         const val C1_MIN_BAND_RATIO = 0.80
-        private const val TAG = "AVTwinResponder"
-        private const val TEST_CYCLES = 20
     }
 
-    data class Result(
-        val t2Sample: Int,
-        val t2Score: Double,
-        val replyPlayCallNs: Long,
-        val softwareDecisionToPlayUs: Double,
-        val playbackVerified: Boolean,
-        val firstValidAudioTimestampNs: Long?,
-        val firstValidAudioFramePosition: Long?,
-        val wavPath: String,
-        val udpJson: String
-    )
-
     private val running = AtomicBoolean(false)
+    private val testRunning = AtomicBoolean(false)
+    private val totalFramesRead = AtomicLong(0L)
+    private val routeGeneration = AtomicLong(0L)
+
+    private var captureThread: Thread? = null
+    private var responseThread: Thread? = null
     private var record: AudioRecord? = null
-    private var c2Player: PersistentC2Player? = null
+    private var recordRouteListener: AudioRouting.OnRoutingChangedListener? = null
+    private var player: PersistentC2Player? = null
+    private var udpControl: UdpControlServer? = null
+    private var storage: SafSessionStorage? = null
+    private var stateMachine: ContinuousResponderStateMachine? = null
+    private var pairing: ArmPairingManager? = null
+    private var detector: StreamingC1Detector? = null
+
     private var aec: AcousticEchoCanceler? = null
     private var ns: NoiseSuppressor? = null
     private var agc: AutomaticGainControl? = null
+    private var audioManager: AudioManager? = null
+    private var focusRequest: AudioFocusRequest? = null
+    @Volatile private var audioFocusLost = false
+    @Volatile private var latestCaptureTimestamp: CaptureAudioTimestamp? = null
+    @Volatile private var inputRoute = "unavailable"
+    @Volatile private var outputRoute = "unavailable"
 
-    private val c1Full = c1Signal.samples
-    private val c2Full = c2Signal.samples
+    private var currentConfig: SessionConfig? = null
+    private var sessionId: String? = null
+    @Volatile private var currentMeasurementId: Long? = null
+    private var successResponses = 0L
+    private var c1Rejected = 0L
+    private var c2Failures = 0L
+    private var udpFailures = 0L
+    private var lastReplyDelaySamples: Long? = null
+    private var lastT3Precise = false
 
-    init {
-        require(c1Full.isNotEmpty()) { "C1 template is empty" }
-        require(c2Full.isNotEmpty()) { "C2 reply is empty" }
-    }
-
-    fun start(linuxHost: String, linuxPort: Int) {
+    fun startSession(config: SessionConfig) {
         if (!running.compareAndSet(false, true)) return
-        thread(name = "AVTwin-Responder") {
+        currentConfig = config
+        captureThread = thread(name = "AVTwin-Continuous-Capture") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             try {
-                runResponder(linuxHost, linuxPort)
+                runContinuousSession(config)
             } catch (t: Throwable) {
-                post("ERROR: ${t.javaClass.simpleName}: ${t.message}")
-                log("ERROR: ${t.javaClass.simpleName}: ${t.message}")
+                log("SESSION ERROR: ${t.javaClass.simpleName}: ${t.message}")
+                storage?.appendEvent(JsonWire.obj("type" to "session_error", "error" to "${t.javaClass.simpleName}: ${t.message}"))
             } finally {
-                cleanupAudio()
                 running.set(false)
+                try { responseThread?.join(1500) } catch (_: Throwable) {}
+                cleanupSessionAudio()
+                udpControl?.stop()
+                udpControl = null
+                stateMachine?.stop()
+                updateSessionFile("stopped")
+                snapshot("session stopped")
             }
         }
     }
 
-    fun startReplyPlaybackTest() {
-        if (!running.compareAndSet(false, true)) return
-        thread(name = "AVTwin-C2-x20") {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-            try {
-                val source = prepareAudio()
-                val prep = c2Player!!.preparationSnapshot()
-                val report = StringBuilder()
-                report.append("C2 REPEAT PLAYBACK TEST x$TEST_CYCLES\n")
-                report.append("source=$source\n")
-                report.append("C2=${c2Signal.name}\n")
-                report.append(c2Signal.channelDiagnostics()).append('\n')
-                report.append(preparationText(prep)).append("\n\n")
-                var passCount = 0
-
-                for (i in 1..TEST_CYCLES) {
-                    if (!running.get()) return@thread
-                    if (i > 1) c2Player!!.rearmForNextPlayback()
-                    val verification = c2Player!!.playAndVerify()
-                    if (verification.playbackVerified) passCount++
-                    report.append("[$i/$TEST_CYCLES] ")
-                    report.append(if (verification.playbackVerified) "PASS" else "FAIL")
-                    report.append('\n')
-                    report.append(verificationText(verification)).append("\n\n")
-                    post(report.toString())
-                }
-
-                c2Player!!.awaitPlaybackCompletion()
-                val overall = passCount == TEST_CYCLES
-                report.append(
-                    if (overall) {
-                        "C2 PLAYBACK TEST: PASS $passCount/$TEST_CYCLES\nC2 HARDWARE PLAYBACK VERIFIED on every cycle"
-                    } else {
-                        "C2 PLAYBACK TEST: FAIL $passCount/$TEST_CYCLES\nOne or more cycles were not hardware-verified"
-                    }
-                )
-                post(report.toString())
-            } catch (t: Throwable) {
-                post("C2 PLAYBACK TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
-                log("C2 PLAYBACK TEST ERROR: ${t.message}")
-            } finally {
-                cleanupAudio()
-                running.set(false)
-            }
-        }
+    fun pauseListening() {
+        stateMachine?.requestPause()
+        pairing?.clearPending()
+        log("listening paused; pending ARM cleared")
+        snapshot("paused")
     }
 
-    fun stop() {
+    fun resumeListening() {
+        detector?.reset(totalFramesRead.get())
+        stateMachine?.resume()
+        log("listening resumed")
+        snapshot("resumed")
+    }
+
+    fun stopAndSave() {
         running.set(false)
         try { record?.stop() } catch (_: Throwable) {}
+        udpControl?.stop()
+        log("safe stop requested")
     }
 
     fun isRunning(): Boolean = running.get()
+    fun isTestRunning(): Boolean = testRunning.get()
 
-    private fun runResponder(linuxHost: String, linuxPort: Int) {
-        val sourceName = prepareAudio()
-        val prep = c2Player!!.preparationSnapshot()
-        val accumulator = ShortAccumulator(maxOf(SAMPLE_RATE * 12, c1Full.size * 3))
-        val hop = ShortArray(HOP_SAMPLES)
-        var lastUiAt = 0L
-        var lastC1Score = 0.0
-        var lastBandRatio = 0.0
-        var coarseT2 = -1
-
-        post(
-            "ARMED v0.7 - RESPONDER MODE\n" +
-                "Goal: hear known C1 -> immediately return selected C2\n" +
-                "48 kHz mono PCM16 | source=$sourceName\n" +
-                "C1=${c1Signal.summary()}\n${c1Signal.channelDiagnostics()}\n" +
-                "C2=${c2Signal.summary()}\n${c2Signal.channelDiagnostics()}\n" +
-                "C1 gate=${if (c1Signal.isBuiltIn) "matched filter + HF/LF" else "matched filter against selected WAV"}\n" +
-                preparationText(prep) + "\n" +
-                "C2 prepared / AudioTrack initialized / buffer loaded\n" +
-                "reply status=READY"
-        )
-
-        record!!.startRecording()
-
-        while (running.get() && coarseT2 < 0) {
-            val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
-            if (n <= 0) continue
-            accumulator.append(hop, n)
-
-            if (accumulator.size >= c1Full.size) {
-                val newest = accumulator.size - c1Full.size
-                val (candidate, score) = MatchedFilter.bestRecent(
-                    accumulator,
-                    c1Full,
-                    newest,
-                    HOP_SAMPLES * 2,
-                    startStep = 8,
-                    decimation = 8
+    fun startRepeatedPlaybackTest() {
+        if (running.get() || !testRunning.compareAndSet(false, true)) return
+        thread(name = "AVTwin-C2-x20") {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            var p: PersistentC2Player? = null
+            try {
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                p = PersistentC2Player(
+                    samples = c2Signal.samples,
+                    preferredOutput = AudioRouteUtil.preferredBuiltinSpeaker(manager),
+                    onLog = { onStatus("C2 x20 TEST\n$it") }
                 )
-                lastC1Score = score
-
-                val gateOk = if (c1Signal.isBuiltIn) {
-                    lastBandRatio = if (score >= C1_PRETRIGGER) {
-                        highToLowBandRatio(accumulator, candidate, c1Full.size)
-                    } else 0.0
-                    lastBandRatio >= C1_MIN_BAND_RATIO
-                } else {
-                    true
+                val prep = p.prepare()
+                val lines = ArrayList<String>()
+                lines += "C2 x20 persistent AudioTrack test"
+                lines += "state=${prep.trackState} performanceMode=${prep.performanceMode} frames=${prep.writtenFrames}"
+                for (i in 1..20) {
+                    val v = p.playAndVerify()
+                    val pass = v.playbackVerified
+                    lines += "[$i/20] ${if (pass) "PASS" else "FAIL"} head=${v.playbackHeadBefore}->${v.playbackHeadAfter} ts=${v.audioTimestampValid} route=${v.actualOutputRoute}"
+                    onStatus(lines.joinToString("\n"))
+                    if (i < 20) p.rearmForNextPlayback()
                 }
-
-                if (score >= C1_THRESHOLD && gateOk) coarseT2 = candidate
-            }
-
-            val now = System.currentTimeMillis()
-            if (now - lastUiAt >= 250 && coarseT2 < 0) {
-                lastUiAt = now
-                val gateText = if (c1Signal.isBuiltIn) {
-                    "HF/LF=${if (lastBandRatio > 0.0) fmt(lastBandRatio) else "--"} / ${fmt(C1_MIN_BAND_RATIO)}"
-                } else {
-                    "custom C1: waveform correlation only"
-                }
-                post(
-                    "WAIT_C1\n" +
-                        "template=${c1Signal.name}\n" +
-                        "time=${fmt(accumulator.size.toDouble() / SAMPLE_RATE, 2)} s\n" +
-                        "C1 score=${fmt(lastC1Score)} / ${fmt(C1_THRESHOLD)}\n" +
-                        "$gateText\n" +
-                        "C2 buffer=PRELOADED / reply status=READY"
-                )
+                val passCount = lines.count { it.contains("] PASS") }
+                lines += "RESULT: $passCount/20 hardware-verified"
+                onStatus(lines.joinToString("\n"))
+            } catch (t: Throwable) {
+                onStatus("C2 x20 TEST ERROR: ${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                p?.release()
+                testRunning.set(false)
             }
         }
-
-        if (!running.get() || coarseT2 < 0) return
-
-        val preReplyAudio = accumulator.copy()
-        val (t2, t2Score) = MatchedFilter.refineStrongest(
-            preReplyAudio,
-            c1Full,
-            coarseT2,
-            marginSamples = 96
-        )
-        log("C1 detected")
-
-        val decisionNs = System.nanoTime()
-        post(
-            "C1 DETECTED\n" +
-                "c1_detect_sample=$t2\n" +
-                "score=${fmt(t2Score)}\n" +
-                "decision_time_ns=$decisionNs\n" +
-                "REPLYING PRELOADED C2 NOW..."
-        )
-
-        var playCallNsFromCallback = 0L
-        val verification = c2Player!!.playAndVerify(onPlayIssued = { playNs ->
-            playCallNsFromCallback = playNs
-            val decisionToPlayUs = (playNs - decisionNs) / 1000.0
-            val earlyJson = """{"type":"avtwin_android_reply","version":"0.6","status":"c2_play_issued","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playNs,"decision_to_play_us":${fmt(decisionToPlayUs, 3)}}"""
-            try { UdpReporter.send(linuxHost, linuxPort, earlyJson) } catch (_: Throwable) {}
-        })
-
-        val playCallNs = if (playCallNsFromCallback != 0L) playCallNsFromCallback else verification.playCallTimeNs
-        val softwareDecisionToPlayUs = (playCallNs - decisionNs) / 1000.0
-        val playbackStatus = if (verification.playbackVerified) {
-            "C2 HARDWARE PLAYBACK VERIFIED"
-        } else {
-            "PLAY() CALLED — HARDWARE PLAYBACK NOT VERIFIED"
-        }
-
-        post(
-            "$playbackStatus\n" +
-                "c1_detect_sample=$t2\n" +
-                "decision_time_ns=$decisionNs\n" +
-                "play_call_time_ns=$playCallNs\n" +
-                "first_valid_audio_timestamp_ns=${verification.firstValidAudioTimestampNs ?: "NONE"}\n" +
-                "first_valid_audio_frame_position=${verification.firstValidAudioFramePosition ?: "NONE"}\n" +
-                "playback_verified=${verification.playbackVerified}\n" +
-                verificationText(verification) + "\n" +
-                "t3_precise=false"
-        )
-
-        val tailSamples = maxOf((0.55 * SAMPLE_RATE).toInt(), c2Full.size + (0.25 * SAMPLE_RATE).toInt())
-        val tailTarget = accumulator.size + tailSamples
-        while (running.get() && accumulator.size < tailTarget) {
-            val n = record!!.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING)
-            if (n > 0) accumulator.append(hop, n)
-        }
-        try { record!!.stop() } catch (_: Throwable) {}
-        c2Player!!.awaitPlaybackCompletion()
-
-        val wav = saveWav(accumulator.copy(), "responder_v07")
-        val finalJson = """{"type":"avtwin_android_reply","version":"0.6","status":"done","sample_rate":$SAMPLE_RATE,"timing_method":"software_play_call_only","t3_precise":false,"c1_template":"${escapeJson(c1Signal.name)}","c2_template":"${escapeJson(c2Signal.name)}","t2_sample":$t2,"t2_score":${fmt(t2Score, 5)},"reply_play_call_ns":$playCallNs,"decision_to_play_us":${fmt(softwareDecisionToPlayUs, 3)},"playback_verified":${verification.playbackVerified},"first_valid_audio_timestamp_ns":${verification.firstValidAudioTimestampNs ?: "null"},"first_valid_audio_frame_position":${verification.firstValidAudioFramePosition ?: "null"},"playback_head_before":${verification.playbackHeadBefore},"playback_head_after":${verification.playbackHeadAfter},"wav":"${escapeJson(wav.absolutePath)}"}"""
-        try { UdpReporter.send(linuxHost, linuxPort, finalJson) } catch (_: Throwable) {}
-
-        post(
-            "DONE v0.7\n" +
-                "C1 detected ✓ (${c1Signal.name})\n" +
-                "$playbackStatus\n" +
-                "t2=$t2 score=${fmt(t2Score)}\n" +
-                "decision->play=${fmt(softwareDecisionToPlayUs)} us\n" +
-                "t3_precise=false\n" +
-                "UDP target=$linuxHost:$linuxPort\n" +
-                "WAV=${wav.absolutePath}"
-        )
-
-        onResult(
-            Result(
-                t2Sample = t2,
-                t2Score = t2Score,
-                replyPlayCallNs = playCallNs,
-                softwareDecisionToPlayUs = softwareDecisionToPlayUs,
-                playbackVerified = verification.playbackVerified,
-                firstValidAudioTimestampNs = verification.firstValidAudioTimestampNs,
-                firstValidAudioFramePosition = verification.firstValidAudioFramePosition,
-                wavPath = wav.absolutePath,
-                udpJson = finalJson
-            )
-        )
     }
 
-    private fun prepareAudio(): String {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val unprocessed = audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
-        val source = if (unprocessed) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.VOICE_RECOGNITION
-        val sourceName = if (unprocessed) "UNPROCESSED" else "VOICE_RECOGNITION"
+    fun testUdp(host: String, port: Int) {
+        thread(name = "AVTwin-UDP-Test") {
+            val eventId = UUID.randomUUID().toString()
+            val json = JsonWire.obj(
+                "type" to "udp_test",
+                "protocol_version" to 1,
+                "android_event_id" to eventId,
+                "plays_audio" to false
+            )
+            val report = UdpReporter.sendRepeated(host, port, json, repeats = 1)
+            onStatus(
+                "UDP TEST ${if (report.success) "PASS" else "FAIL"}\n" +
+                    "target=$host:$port\nandroid_event_id=$eventId\nNo audio was played."
+            )
+        }
+    }
 
-        val minBuffer = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
+    private fun runContinuousSession(config: SessionConfig) {
+        resetCounters()
+        val sid = UUID.randomUUID().toString()
+        sessionId = sid
+        pairing = ArmPairingManager(sid)
+        stateMachine = ContinuousResponderStateMachine(config.cooldownMs.toLong() * SAMPLE_RATE / 1000L)
+        detector = StreamingC1Detector(
+            fullTemplate = c1Signal.samples,
+            threshold = C1_THRESHOLD,
+            pretrigger = C1_PRETRIGGER,
+            useHighFrequencyGate = c1Signal.isBuiltIn,
+            minBandRatio = C1_MIN_BAND_RATIO,
+            detectionMs = 60
         )
-        require(minBuffer > 0) { "48 kHz mono PCM16 AudioRecord is not supported on this device" }
-        record = AudioRecord.Builder()
+        detector!!.reset(0L)
+
+        storage = SafSessionStorage(context, config.resultTreeUri, sid, c1Signal, c2Signal, config.saveDebugAudio)
+        storage!!.start(sessionJson("starting"))
+        log("session_id=$sid")
+        log("C1 source SHA256=${c1Signal.sourceSha256}; internal=${c1Signal.internalPcmSha256}")
+        log("C2 source SHA256=${c2Signal.sourceSha256}; internal=${c2Signal.internalPcmSha256}")
+
+        preparePersistentAudio()
+        startUdpControl(config)
+
+        val r = record ?: error("AudioRecord not prepared")
+        r.startRecording()
+        require(r.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "AudioRecord did not enter RECORDING state" }
+        totalFramesRead.set(0L)
+        latestCaptureTimestamp = null
+        stateMachine!!.start()
+        log("LISTENING started; AudioRecord remains open for the whole session")
+        snapshot("waiting for ARM/C1")
+
+        val hop = ShortArray(HOP_SAMPLES)
+        var timestampPollCounter = 0
+        while (running.get()) {
+            val startFrame = totalFramesRead.get()
+            val n = try { r.read(hop, 0, hop.size, AudioRecord.READ_BLOCKING) } catch (_: Throwable) { -1 }
+            if (n <= 0) {
+                if (!running.get()) break
+                continue
+            }
+            val endFrame = totalFramesRead.addAndGet(n.toLong())
+
+            timestampPollCounter++
+            if (timestampPollCounter >= 5) {
+                timestampPollCounter = 0
+                updateCaptureTimestamp(r, endFrame)
+                inputRoute = AudioRouteUtil.describe(try { r.routedDevice } catch (_: Throwable) { null })
+            }
+
+            if (stateMachine!!.updateCaptureSample(endFrame)) {
+                detector!!.reset(endFrame)
+                log("COOLDOWN complete -> LISTENING")
+                snapshot("cooldown complete")
+            }
+
+            if (stateMachine!!.isListening()) {
+                val d = detector!!.process(hop, n, startFrame)
+                if (d != null) {
+                    if (d.detected) {
+                        val t2 = d.t2Sample ?: continue
+                        if (stateMachine!!.acceptC1()) {
+                            val claim = pairing!!.claimNext(SystemClock.elapsedRealtime())
+                            currentMeasurementId = claim.measurementId
+                            val routeGenAtDetect = routeGeneration.get()
+                            log("C1 detected: t2_sample=$t2 score=${fmt(d.score)} measurement=${claim.measurementId} pairing=${claim.pairingMode}")
+                            storage?.appendEvent(
+                                JsonWire.obj(
+                                    "type" to "c1_detected",
+                                    "session_id" to claim.sessionId,
+                                    "measurement_id" to claim.measurementId,
+                                    "pairing_mode" to claim.pairingMode,
+                                    "t2_sample" to t2,
+                                    "candidate_peak_sample" to d.candidateSample,
+                                    "c1_score" to d.score,
+                                    "detection_completed_at_sample" to d.detectionCompletedAtSample,
+                                    "detection_latency_samples" to (d.detectionCompletedAtSample - t2),
+                                    "band_ratio" to d.bandRatio
+                                )
+                            )
+                            launchResponse(d, claim, routeGenAtDetect)
+                        }
+                    } else {
+                        c1Rejected++
+                        storage?.appendEvent(
+                            JsonWire.obj(
+                                "type" to "c1_rejected",
+                                "candidate_peak_sample" to d.candidateSample,
+                                "score" to d.score,
+                                "reason" to d.rejectionReason,
+                                "band_ratio" to d.bandRatio
+                            )
+                        )
+                        snapshot("C1 candidate rejected: ${d.rejectionReason}")
+                    }
+                }
+            } else {
+                detector!!.appendOnly(hop, n, startFrame)
+            }
+        }
+    }
+
+    private fun launchResponse(
+        detection: StreamingC1Detector.Detection,
+        claim: PairingClaim,
+        routeGenAtDetect: Long
+    ) {
+        responseThread = thread(name = "AVTwin-C2-Response") {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            val t2 = detection.t2Sample ?: return@thread
+            var verification: PersistentC2Player.PlaybackVerification? = null
+            var playbackError: String? = null
+            val decisionTimeNs = System.nanoTime() // diagnostic scheduler time, not an audio timestamp
+            try {
+                stateMachine?.c2Scheduled()
+                log("C2_SCHEDULED measurement=${claim.measurementId}")
+                verification = player!!.playAndVerify { playNs ->
+                    stateMachine?.c2Playing()
+                    log("C2_PLAYING play_call_time_ns=$playNs (diagnostic only)")
+                }
+            } catch (t: Throwable) {
+                playbackError = "${t.javaClass.simpleName}: ${t.message}"
+                c2Failures++
+                log("C2 playback failure: $playbackError")
+            }
+
+            try { stateMachine?.reporting() } catch (_: Throwable) {}
+            val v = verification
+            if (v != null) {
+                outputRoute = v.actualOutputRoute
+                if (v.playbackVerified) successResponses++ else c2Failures++
+            }
+
+            val captureTs = latestCaptureTimestamp
+            val playbackTs = if (v?.audioTimestampValid == true && v.firstValidAudioTimestampNs != null && v.firstValidAudioFramePosition != null) {
+                PlaybackAudioTimestamp(v.firstValidAudioFramePosition, v.firstValidAudioTimestampNs)
+            } else null
+            val r = record
+            val inputDevice = try { r?.routedDevice } catch (_: Throwable) { null }
+            val routeStable = routeGeneration.get() == routeGenAtDetect && !audioFocusLost
+            val timing = ReplyTimingMapper.mapToCaptureTimeline(
+                t2Sample = t2,
+                sampleRate = SAMPLE_RATE,
+                playback = playbackTs,
+                capture = captureTs,
+                inputSampleRate = r?.sampleRate ?: -1,
+                outputSampleRate = v?.outputSampleRate ?: player?.outputSampleRate() ?: -1,
+                routeStable = routeStable,
+                inputRouteTrusted = AudioRouteUtil.trustedInput(inputDevice),
+                outputRouteTrusted = PersistentC2Player.isTrustedBuiltinSpeaker(v?.actualOutputRouteType)
+            )
+            lastT3Precise = timing.t3Precise
+            lastReplyDelaySamples = timing.replyDelaySamples
+
+            val eventId = ReplyEventId().value
+            val playCallNs = v?.playCallTimeNs
+            val replyJson = JsonWire.obj(
+                "type" to "reply_timing",
+                "protocol_version" to 1,
+                "session_id" to claim.sessionId,
+                "measurement_id" to claim.measurementId,
+                "android_event_id" to eventId,
+                "pairing_mode" to claim.pairingMode,
+                "t3_precise" to timing.t3Precise,
+                "t2_sample" to t2,
+                "t3_sample" to timing.t3Sample,
+                "reply_delay_samples" to timing.replyDelaySamples,
+                "sample_rate" to SAMPLE_RATE,
+                "c1_score" to detection.score,
+                "c1_detected" to true,
+                "c2_started" to (v != null),
+                "playback_verified" to (v?.playbackVerified ?: false),
+                "error" to (playbackError ?: timing.reason),
+                "decision_time_ns" to decisionTimeNs,
+                "play_call_time_ns" to playCallNs,
+                "first_valid_audio_timestamp_ns" to v?.firstValidAudioTimestampNs,
+                "first_valid_audio_frame_position" to v?.firstValidAudioFramePosition,
+                "playback_frame_zero_nano_time" to timing.playbackFrameZeroNanoTime,
+                "detection_completed_at_sample" to detection.detectionCompletedAtSample,
+                "detection_latency_samples" to (detection.detectionCompletedAtSample - t2),
+                "audio_track_head_before" to v?.playbackHeadBefore,
+                "audio_track_head_after" to v?.playbackHeadAfter,
+                "audio_track_timestamp_valid" to v?.audioTimestampValid,
+                "audio_track_underruns" to v?.underrunCount,
+                "input_route" to inputRoute,
+                "output_route" to outputRoute,
+                "route_stable" to routeStable,
+                "t3_method" to if (timing.t3Precise) "AudioTrack+AudioRecord_MONOTONIC_frame_projection" else "unavailable"
+            )
+            storage?.appendEvent(replyJson)
+            log(
+                "REPORT measurement=${claim.measurementId} event=$eventId t3_precise=${timing.t3Precise} " +
+                    "reply_delay_samples=${timing.replyDelaySamples ?: "null"} reason=${timing.reason ?: "none"}"
+            )
+
+            val config = currentConfig
+            if (config != null) {
+                val sendReport = UdpReporter.sendRepeated(config.linuxHost, config.resultPort, replyJson, repeats = 3)
+                if (!sendReport.success) udpFailures++
+                for (attempt in sendReport.attempts) {
+                    storage?.appendEvent(
+                        JsonWire.obj(
+                            "type" to "udp_send",
+                            "android_event_id" to eventId,
+                            "target_ip" to config.linuxHost,
+                            "target_port" to config.resultPort,
+                            "attempt" to attempt.attempt,
+                            "diagnostic_wall_time" to attempt.diagnosticWallTime,
+                            "diagnostic_nano_time" to attempt.diagnosticNanoTime,
+                            "success" to attempt.success,
+                            "error" to attempt.error
+                        )
+                    )
+                }
+            }
+
+            if (config?.saveDebugAudio == true) {
+                detector?.debugWindow(t2, SAMPLE_RATE / 10, SAMPLE_RATE * 35 / 100)?.let {
+                    storage?.saveDebugWindow("m${claim.measurementId}_c1_window.wav", it)
+                }
+                storage?.saveDebugWindow("m${claim.measurementId}_c2_reference.wav", c2Signal.samples)
+            }
+
+            try {
+                player?.rearmForNextPlayback()
+            } catch (t: Throwable) {
+                c2Failures++
+                log("C2 rearm failure: ${t.javaClass.simpleName}: ${t.message}; stopping session for safety")
+                running.set(false)
+            }
+
+            val currentCapture = totalFramesRead.get()
+            try { stateMachine?.enterCooldown(currentCapture) } catch (_: Throwable) {}
+            updateSessionFile("running")
+            snapshot(if (timing.t3Precise) "reply timing ready" else "t3_precise=false: ${timing.reason}")
+        }
+    }
+
+    private fun preparePersistentAudio() {
+        val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager = manager
+        requestAudioFocus(manager)
+
+        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        require(minBuffer > 0) { "48 kHz mono PCM16 AudioRecord unsupported" }
+        val source = if (manager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true") {
+            MediaRecorder.AudioSource.UNPROCESSED
+        } else MediaRecorder.AudioSource.VOICE_RECOGNITION
+        val r = AudioRecord.Builder()
             .setAudioSource(source)
             .setAudioFormat(
                 AudioFormat.Builder()
@@ -314,132 +455,177 @@ class AcousticResponder(
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(maxOf(minBuffer * 8, HOP_SAMPLES * 24))
+            .setBufferSizeInBytes(maxOf(minBuffer * 8, HOP_SAMPLES * 32))
             .build()
-        require(record?.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
-        disablePreprocessing(record!!.audioSessionId)
+        require(r.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
+        val mic = AudioRouteUtil.preferredBuiltinMic(manager)
+        if (mic != null) log("preferred built-in mic accepted=${r.setPreferredDevice(mic)} ${AudioRouteUtil.describe(mic)}")
+        disablePreprocessing(r.audioSessionId)
+        recordRouteListener = AudioRouting.OnRoutingChangedListener { router ->
+            routeGeneration.incrementAndGet()
+            inputRoute = AudioRouteUtil.describe(router.routedDevice)
+            log("input route changed: $inputRoute")
+        }.also { r.addOnRoutingChangedListener(it, null) }
+        record = r
 
-        c2Player = PersistentC2Player(c2Full, SAMPLE_RATE, ::log)
-        c2Player!!.prepare()
-        return sourceName
+        val speaker = AudioRouteUtil.preferredBuiltinSpeaker(manager)
+        player = PersistentC2Player(
+            samples = c2Signal.samples,
+            preferredOutput = speaker,
+            onLog = { log(it) },
+            onRouteChanged = {
+                routeGeneration.incrementAndGet()
+                outputRoute = it
+                log(it)
+            }
+        )
+        val prep = player!!.prepare()
+        outputRoute = prep.preferredRoute
+        log(
+            "C2 persistent track ready: state=${prep.trackState} performanceMode=${prep.performanceMode} " +
+                "frames=${prep.writtenFrames} bytes=${prep.writtenBytes} preferred=${prep.preferredRoute}"
+        )
     }
 
-    private fun preparationText(p: PersistentC2Player.Preparation): String =
-        "AudioTrack state=${trackStateName(p.trackState)} (${p.trackState})\n" +
-            "playState=${playStateName(p.playState)} (${p.playState})\n" +
-            "channels=${p.channelCount}\n" +
-            "performanceMode=${performanceModeName(p.performanceMode)} (${p.performanceMode})\n" +
-            "write=${p.writtenSamples} samples / ${p.writtenFrames} frames / ${p.writtenBytes} bytes\n" +
-            "playbackHeadPosition=${p.playbackHeadPosition}"
-
-    private fun verificationText(v: PersistentC2Player.PlaybackVerification): String =
-        "AudioTrack state=${trackStateName(v.trackState)} (${v.trackState})\n" +
-            "playState=${playStateName(v.playState)} (${v.playState})\n" +
-            "write=${v.writeSamples} samples / ${v.writeFrames} frames / ${v.writeBytes} bytes\n" +
-            "playbackHeadPosition=${v.playbackHeadBefore} -> ${v.playbackHeadAfter}\n" +
-            "playbackHeadAdvanced=${v.playbackHeadAdvanced}\n" +
-            "AudioTimestamp valid=${v.audioTimestampValid}\n" +
-            "timestamp framePosition=${v.firstValidAudioFramePosition ?: "NONE"}\n" +
-            "timestamp nanoTime=${v.firstValidAudioTimestampNs ?: "NONE"}"
-
-    private fun trackStateName(state: Int): String = when (state) {
-        AudioTrack.STATE_INITIALIZED -> "INITIALIZED"
-        AudioTrack.STATE_UNINITIALIZED -> "UNINITIALIZED"
-        else -> "UNKNOWN"
+    private fun startUdpControl(config: SessionConfig) {
+        udpControl = UdpControlServer(
+            port = config.controlPort,
+            onArm = { command, source ->
+                val result = pairing?.accept(command, SystemClock.elapsedRealtime())
+                    ?: ArmPairingManager.AcceptResult(false, "session_not_ready")
+                log("ARM from $source measurement=${command.measurementId} accepted=${result.accepted} reason=${result.reason}")
+                storage?.appendEvent(
+                    JsonWire.obj(
+                        "type" to "arm_received",
+                        "protocol_version" to command.protocolVersion,
+                        "session_id" to command.sessionId,
+                        "measurement_id" to command.measurementId,
+                        "source" to source,
+                        "accepted" to result.accepted,
+                        "reason" to result.reason
+                    )
+                )
+                snapshot("ARM ${if (result.accepted) "accepted" else "rejected"}: ${result.reason}")
+            },
+            onMalformed = { raw, source ->
+                log("non-ARM UDP from $source ignored")
+                storage?.appendEvent(JsonWire.obj("type" to "udp_control_ignored", "source" to source, "raw" to raw.take(2048)))
+            },
+            onError = { error -> log(error); udpFailures++; snapshot(error) }
+        ).also { it.start() }
+        log("UDP ARM listener started on 0.0.0.0:${config.controlPort}")
     }
 
-    private fun playStateName(state: Int): String = when (state) {
-        AudioTrack.PLAYSTATE_STOPPED -> "STOPPED"
-        AudioTrack.PLAYSTATE_PAUSED -> "PAUSED"
-        AudioTrack.PLAYSTATE_PLAYING -> "PLAYING"
-        else -> "UNKNOWN"
-    }
-
-    private fun performanceModeName(mode: Int): String = when (mode) {
-        AudioTrack.PERFORMANCE_MODE_LOW_LATENCY -> "LOW_LATENCY"
-        AudioTrack.PERFORMANCE_MODE_POWER_SAVING -> "POWER_SAVING"
-        AudioTrack.PERFORMANCE_MODE_NONE -> "NONE"
-        else -> "UNKNOWN"
-    }
-
-    private fun highToLowBandRatio(audio: ShortAccumulator, start: Int, length: Int): Double {
-        if (start < 0 || start + length > audio.size) return 0.0
-        val high = doubleArrayOf(12_000.0, 14_000.0, 16_000.0, 18_000.0)
-        val low = doubleArrayOf(2_000.0, 4_000.0, 6_000.0, 8_000.0)
-        var hi = 0.0
-        var lo = 0.0
-        for (f in high) hi += goertzelPower(audio, start, length, f)
-        for (f in low) lo += goertzelPower(audio, start, length, f)
-        return hi / (lo + 1.0)
-    }
-
-    private fun goertzelPower(audio: ShortAccumulator, start: Int, length: Int, freq: Double): Double {
-        val omega = 2.0 * PI * freq / SAMPLE_RATE
-        val coeff = 2.0 * cos(omega)
-        var s1 = 0.0
-        var s2 = 0.0
-        var i = 0
-        while (i < length) {
-            val sample = audio[start + i].toDouble()
-            val s0 = sample + coeff * s1 - s2
-            s2 = s1
-            s1 = s0
-            i++
+    private fun updateCaptureTimestamp(r: AudioRecord, observedReadFrames: Long) {
+        val ts = AudioTimestamp()
+        val rc = try { r.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC) } catch (_: Throwable) { -1 }
+        if (rc == 0 && ts.nanoTime > 0L && ts.framePosition >= 0L) {
+            latestCaptureTimestamp = CaptureAudioTimestamp(ts.framePosition, ts.nanoTime, observedReadFrames)
         }
-        return s1 * s1 + s2 * s2 - coeff * s1 * s2
     }
 
-    private fun saveWav(audio: ShortArray, prefix: String): File {
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
-        val dir = File(baseDir, "recordings")
-        val wav = File(dir, "${prefix}_$stamp.wav")
-        WavWriter.writeMonoPcm16(wav, audio, SAMPLE_RATE)
-        return wav
+    private fun requestAudioFocus(manager: AudioManager) {
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+        focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(attributes)
+            .setOnAudioFocusChangeListener { change ->
+                audioFocusLost = change != AudioManager.AUDIOFOCUS_GAIN
+                log("audio focus change=$change lost=$audioFocusLost")
+                if (audioFocusLost) routeGeneration.incrementAndGet()
+            }
+            .build()
+        val result = manager.requestAudioFocus(focusRequest!!)
+        audioFocusLost = result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        log("audio focus request result=$result")
     }
 
     private fun disablePreprocessing(sessionId: Int) {
-        try {
-            if (AcousticEchoCanceler.isAvailable()) {
-                aec = AcousticEchoCanceler.create(sessionId)
-                aec?.enabled = false
-            }
-        } catch (_: Throwable) {}
-        try {
-            if (NoiseSuppressor.isAvailable()) {
-                ns = NoiseSuppressor.create(sessionId)
-                ns?.enabled = false
-            }
-        } catch (_: Throwable) {}
-        try {
-            if (AutomaticGainControl.isAvailable()) {
-                agc = AutomaticGainControl.create(sessionId)
-                agc?.enabled = false
-            }
-        } catch (_: Throwable) {}
+        try { if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sessionId)?.also { it.enabled = false } } catch (_: Throwable) {}
+        try { if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sessionId)?.also { it.enabled = false } } catch (_: Throwable) {}
+        try { if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(sessionId)?.also { it.enabled = false } } catch (_: Throwable) {}
     }
 
-    private fun cleanupAudio() {
-        try { record?.stop() } catch (_: Throwable) {}
-        try { record?.release() } catch (_: Throwable) {}
-        try { c2Player?.release() } catch (_: Throwable) {}
+    private fun cleanupSessionAudio() {
+        val r = record
+        if (r != null) {
+            try { recordRouteListener?.let { r.removeOnRoutingChangedListener(it) } } catch (_: Throwable) {}
+            try { r.stop() } catch (_: Throwable) {}
+            try { r.release() } catch (_: Throwable) {}
+        }
+        recordRouteListener = null
+        record = null
+        player?.release()
+        player = null
         try { aec?.release() } catch (_: Throwable) {}
         try { ns?.release() } catch (_: Throwable) {}
         try { agc?.release() } catch (_: Throwable) {}
-        record = null
-        c2Player = null
-        aec = null
-        ns = null
-        agc = null
+        aec = null; ns = null; agc = null
+        val manager = audioManager
+        val focus = focusRequest
+        if (manager != null && focus != null) try { manager.abandonAudioFocusRequest(focus) } catch (_: Throwable) {}
+        focusRequest = null
+        audioManager = null
     }
 
-    private fun escapeJson(value: String): String = value
-        .replace("\\", "\\\\")
-        .replace("\"", "\\\"")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
+    private fun resetCounters() {
+        successResponses = 0; c1Rejected = 0; c2Failures = 0; udpFailures = 0
+        lastReplyDelaySamples = null; lastT3Precise = false; currentMeasurementId = null
+        inputRoute = "unavailable"; outputRoute = "unavailable"; routeGeneration.set(0L)
+    }
+
+    private fun snapshot(note: String = "") {
+        val sm = stateMachine
+        onSnapshot(
+            SessionSnapshot(
+                state = sm?.state?.name ?: if (running.get()) "STARTING" else "STOPPED",
+                sessionId = sessionId,
+                measurementId = currentMeasurementId,
+                pendingArmMeasurementId = pairing?.pendingMeasurementId(),
+                successResponses = successResponses,
+                c1Rejected = c1Rejected,
+                c2Failures = c2Failures,
+                udpFailures = udpFailures,
+                lastReplyDelaySamples = lastReplyDelaySamples,
+                lastT3Precise = lastT3Precise,
+                inputRoute = inputRoute,
+                outputRoute = outputRoute,
+                note = note
+            )
+        )
+    }
+
+    private fun sessionJson(status: String): String = JsonWire.obj(
+        "protocol_version" to 1,
+        "session_id" to sessionId,
+        "status" to status,
+        "sample_rate" to SAMPLE_RATE,
+        "c1_name" to c1Signal.name,
+        "c1_source_sha256" to c1Signal.sourceSha256,
+        "c1_internal_pcm_sha256" to c1Signal.internalPcmSha256,
+        "c2_name" to c2Signal.name,
+        "c2_source_sha256" to c2Signal.sourceSha256,
+        "c2_internal_pcm_sha256" to c2Signal.internalPcmSha256,
+        "success_responses" to successResponses,
+        "c1_rejected" to c1Rejected,
+        "c2_failures" to c2Failures,
+        "udp_failures" to udpFailures,
+        "last_reply_delay_samples" to lastReplyDelaySamples,
+        "last_t3_precise" to lastT3Precise,
+        "input_route" to inputRoute,
+        "output_route" to outputRoute
+    )
+
+    private fun updateSessionFile(status: String) {
+        try { storage?.updateSessionJson(sessionJson(status)) } catch (t: Throwable) { onStatus("SAVE ERROR: ${t.message}") }
+    }
+
+    private fun log(message: String) {
+        onStatus(message)
+        try { storage?.appendLog(message) } catch (_: Throwable) {}
+    }
 
     private fun fmt(v: Double, digits: Int = 3): String = "% .${digits}f".format(Locale.US, v).trim()
-    private fun post(s: String) = onStatus(s)
-    private fun log(s: String) = Log.i(TAG, s)
 }
