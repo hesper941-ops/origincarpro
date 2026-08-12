@@ -141,6 +141,10 @@ internal class PersistentC2Player(
         )
     }
 
+    fun awaitPlaybackCompletion() {
+        waitUntilPlaybackWindowElapsed()
+    }
+
     fun rearmForNextPlayback() {
         val t = track ?: error("C2 AudioTrack is not prepared")
         require(
