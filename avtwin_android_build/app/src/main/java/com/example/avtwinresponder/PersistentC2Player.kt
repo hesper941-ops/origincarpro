@@ -39,7 +39,6 @@ internal class PersistentC2Player(
         val audioTimestampValid: Boolean,
         val firstValidAudioTimestampNs: Long?,
         // Frame offset from THIS C2 round's playback start, not AudioTrack lifetime zero.
-        // audio_track_head_before is also reported so raw/cumulative diagnostics remain visible.
         val firstValidAudioFramePosition: Long?,
         val playbackVerified: Boolean,
         val actualOutputRoute: String,
@@ -68,7 +67,9 @@ internal class PersistentC2Player(
             onLog("C2 preferred output=${describeDevice(preferredOutput)} accepted=$preferred")
         }
         routeListener = AudioRouting.OnRoutingChangedListener { router ->
-            onRouteChanged("output route changed: ${describeDevice(router.routedDevice)}")
+            val route = describeDevice(router.routedDevice)
+            onLog("output route changed: $route")
+            onRouteChanged(route)
         }.also { t.addOnRoutingChangedListener(it, null) }
         stateMachine.trackInitialized()
         onLog("C2 AudioTrack initialized")
@@ -95,7 +96,7 @@ internal class PersistentC2Player(
         val headBefore = unsignedHead(t.playbackHeadPosition)
         val baselineTimestamp = AudioTimestamp()
         val baselineTimestampValid = try { t.getTimestamp(baselineTimestamp) } catch (_: Throwable) { false }
-        val baselineFrame = if (baselineTimestampValid) baselineTimestamp.framePosition else -1L
+        val baselineTimestampNs = if (baselineTimestampValid) baselineTimestamp.nanoTime else -1L
 
         lastPlayCallNs = System.nanoTime() // diagnostic only; never protocol t3
         t.play()
@@ -118,14 +119,13 @@ internal class PersistentC2Player(
             }
             val ts = AudioTimestamp()
             val ok = try { t.getTimestamp(ts) } catch (_: Throwable) { false }
-            val advanced = ok && ts.framePosition >= 0L &&
-                (!baselineTimestampValid || ts.framePosition > baselineFrame) &&
-                (ts.framePosition > 0L || headAdvanced)
-            if (advanced && !timestampValid) {
+            // Some devices reset framePosition after stop/flush. Freshness is therefore judged by
+            // the AUDIO timestamp's own monotonic nanoTime, not by requiring an ever-growing frame.
+            val fresh = ok && ts.framePosition >= 0L && ts.nanoTime > 0L &&
+                (!baselineTimestampValid || ts.nanoTime > baselineTimestampNs)
+            if (fresh && !timestampValid) {
                 timestampValid = true
                 firstTimestampNs = ts.nanoTime
-                // stop()/flush() may reset a track's frame counter on some devices, while others
-                // expose a cumulative coordinate. Normalize either behavior to this round's start.
                 firstTimestampFrame = if (ts.framePosition >= headBefore) {
                     ts.framePosition - headBefore
                 } else {
@@ -271,7 +271,8 @@ internal class PersistentC2Player(
     companion object {
         fun describeDevice(device: AudioDeviceInfo?): String {
             if (device == null) return "unavailable"
-            return "${typeName(device.type)} id=${device.id} ${device.productName}"
+            val rates = device.sampleRates.joinToString(",").ifBlank { "unspecified" }
+            return "${typeName(device.type)} id=${device.id} ${device.productName} rates=$rates"
         }
 
         fun isTrustedBuiltinSpeaker(type: Int?): Boolean = type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
