@@ -23,8 +23,7 @@ class MainActivity : Activity() {
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var startStop: Button
-    private lateinit var timingTest: Button
-    private lateinit var bandTest: Button
+    private lateinit var testReply: Button
     private var responder: AcousticResponder? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,14 +42,23 @@ class MainActivity : Activity() {
         }
 
         val titleView = TextView(this).apply {
-            text = "AV-Twin Acoustic Responder v0.4"
+            text = "AV-Twin Acoustic Responder v0.5"
             textSize = 22f
             gravity = Gravity.CENTER_HORIZONTAL
         }
-        root.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            titleView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         val hintView = TextView(this).apply {
-            text = "Android responder (B)\nC1 11-19 kHz -> t2 -> C2 -> hardware AudioTrack t3 -> UDP to Linux\nC2 microphone self-detection is diagnostic only\nXiaomi/HyperOS AudioTrack mode: STREAM"
+            text = "PRIMARY GOAL: receive C1 -> immediately return C2\n" +
+                "C1: 11-19 kHz / 200 ms\n" +
+                "C2: 300 Hz-9 kHz / 200 ms\n" +
+                "C2 is pre-queued before listening; AudioTrack hardware timestamp is NOT required."
             textSize = 14f
             setPadding(0, dp(10), 0, dp(10))
         }
@@ -61,41 +69,66 @@ class MainActivity : Activity() {
             setText("192.168.1.100")
             inputType = InputType.TYPE_CLASS_TEXT
         }
-        root.addView(host, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            host,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         port = EditText(this).apply {
             hint = "UDP port"
             setText("5005")
             inputType = InputType.TYPE_CLASS_NUMBER
         }
-        root.addView(port, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            port,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         startStop = Button(this).apply {
-            text = "ARM / START LISTENING"
+            text = "ARM RESPONDER / WAIT FOR C1"
             setOnClickListener { toggleListening() }
         }
-        root.addView(startStop, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            startStop,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
-        timingTest = Button(this).apply {
-            text = "TEST C2 HARDWARE TIMESTAMP"
-            setOnClickListener { runTimingTest() }
+        testReply = Button(this).apply {
+            text = "TEST: PLAY C2 REPLY NOW"
+            setOnClickListener { runReplyTest() }
         }
-        root.addView(timingTest, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        bandTest = Button(this).apply {
-            text = "RUN 4-BAND SPEAKER/MIC DIAGNOSTIC"
-            setOnClickListener { runBandTest() }
-        }
-        root.addView(bandTest, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            testReply,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         status = TextView(this).apply {
-            text = "Idle\nStep 1: TEST C2 HARDWARE TIMESTAMP.\nStep 2: RUN 4-BAND DIAGNOSTIC.\nThen ARM and let Linux send C1."
+            text = "Idle\n1) You may press TEST to confirm C2 playback.\n2) Press ARM.\n3) Linux sends C1.\n4) Tablet should detect C1 and immediately issue C2."
             textSize = 16f
             setTextIsSelectable(true)
             setPadding(0, dp(16), 0, dp(16))
         }
         val scroll = ScrollView(this).apply { addView(status) }
-        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(
+            scroll,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
 
         setContentView(root)
     }
@@ -108,10 +141,8 @@ class MainActivity : Activity() {
                     status.text = s
                     if (
                         s.startsWith("DONE") ||
-                        s.startsWith("C2 TIMESTAMP TEST") ||
-                        s.startsWith("BAND DIAGNOSTIC DONE") ||
-                        s.startsWith("TIMING TEST ERROR") ||
-                        s.startsWith("BAND TEST ERROR") ||
+                        s.startsWith("C2 PLAYBACK TEST: DONE") ||
+                        s.startsWith("C2 PLAYBACK TEST ERROR") ||
                         s.startsWith("ERROR")
                     ) {
                         setIdleButtons()
@@ -122,11 +153,11 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     setIdleButtons()
                     status.append(
-                        "\n\nreply duration=${"%.3f".format(r.replyDelayMs)} ms" +
-                            "\nt2 sample=${r.t2Sample}" +
-                            "\nt3 equivalent sample=${r.t3EquivalentSample}" +
-                            "\nt2 score=${"%.3f".format(r.t2Score)}" +
-                            "\nC2 self score=${"%.3f".format(r.c2SelfScore)} (diagnostic)"
+                        "\n\nResponder result:" +
+                            "\nC1 t2 sample=${r.t2Sample}" +
+                            "\nC1 score=${"%.3f".format(r.t2Score)}" +
+                            "\nsoftware decision->play=${"%.3f".format(r.softwareDecisionToPlayUs)} us" +
+                            "\nC2 reply issued=YES"
                     )
                 }
             }
@@ -150,38 +181,25 @@ class MainActivity : Activity() {
         responder!!.start(linuxHost, udpPort)
     }
 
-    private fun runTimingTest() {
+    private fun runReplyTest() {
         if (!ensurePermissionForAction()) return
         if (responder?.isRunning() == true) {
-            Toast.makeText(this, "Stop the current audio test first", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Stop the current responder first", Toast.LENGTH_SHORT).show()
             return
         }
         responder = makeResponder()
         setRunningButtons()
-        responder!!.startC2TimingTest()
-    }
-
-    private fun runBandTest() {
-        if (!ensurePermissionForAction()) return
-        if (responder?.isRunning() == true) {
-            Toast.makeText(this, "Stop the current audio test first", Toast.LENGTH_SHORT).show()
-            return
-        }
-        responder = makeResponder()
-        setRunningButtons()
-        responder!!.startBandDiagnostic()
+        responder!!.startReplyPlaybackTest()
     }
 
     private fun setRunningButtons() {
         startStop.text = "STOP"
-        timingTest.isEnabled = false
-        bandTest.isEnabled = false
+        testReply.isEnabled = false
     }
 
     private fun setIdleButtons() {
-        startStop.text = "ARM / START LISTENING"
-        timingTest.isEnabled = true
-        bandTest.isEnabled = true
+        startStop.text = "ARM RESPONDER / WAIT FOR C1"
+        testReply.isEnabled = true
     }
 
     private fun ensurePermissionForAction(): Boolean {
@@ -198,7 +216,11 @@ class MainActivity : Activity() {
         }
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_AUDIO && grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
             Toast.makeText(this, "Microphone permission is required", Toast.LENGTH_LONG).show()
