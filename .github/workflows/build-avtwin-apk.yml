@@ -39,11 +39,11 @@ jobs:
         run: gradle -p avtwin_android_build :app:assembleDebug --stacktrace
 
       - name: Rename APK
-        run: cp avtwin_android_build/app/build/outputs/apk/debug/app-debug.apk AVTwinAndroidResponder-v0.4-debug.apk
+        run: cp avtwin_android_build/app/build/outputs/apk/debug/app-debug.apk AVTwinAndroidResponder-v0.5-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AVTwinAndroidResponder-v0.4-debug-apk
-          path: AVTwinAndroidResponder-v0.4-debug.apk
+          name: AVTwinAndroidResponder-v0.5-debug-apk
+          path: AVTwinAndroidResponder-v0.5-debug.apk
           if-no-files-found: error
