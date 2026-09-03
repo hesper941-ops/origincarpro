@@ -24,6 +24,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
@@ -71,16 +72,15 @@ public class MainActivity extends Activity {
         scroll.addView(root);
 
         TextView title = new TextView(this);
-        title.setText("PPT 图片顺序修复 v1.2");
+        title.setText("PPT 图片顺序修复 v1.3");
         title.setTextSize(26);
         title.setPadding(0, 0, 0, dp(12));
         root.addView(title);
 
         TextView desc = new TextView(this);
         desc.setText(
-                "兼容 QQ 浏览器导图、小米相册和 Notein 图片选择器。\n\n" +
-                "新版会同时处理：文件名、MediaStore 时间、EXIF 时间和写入顺序。\n" +
-                "这样即使 Notein 不按文件名排序，也更容易保持 1→2→3 的页序。\n\n" +
+                "针对 Notein 再加强排序：所有页都放在同一天内，只相差 1 秒，避免被按日期/时间段拆组。\n\n" +
+                "同时统一文件名、TITLE、DATE_TAKEN、DATE_ADDED、DATE_MODIFIED、EXIF 时间，并保持第一页最新。\n\n" +
                 "不会修改或删除原文件。");
         desc.setTextSize(16);
         root.addView(desc);
@@ -102,7 +102,7 @@ public class MainActivity extends Activity {
         root.addView(zeroBasedBox);
 
         startButton = new Button(this);
-        startButton.setText("② 生成 Notein 兼容相册");
+        startButton.setText("② 生成 Notein 同日严格排序相册");
         startButton.setEnabled(false);
         startButton.setOnClickListener(v -> startFix());
         root.addView(startButton);
@@ -180,23 +180,30 @@ public class MainActivity extends Activity {
                 selected = new ArrayList<>(uniquePages.values());
                 Collections.sort(selected, Comparator.comparingInt(a -> a.suffixNumber));
 
-                String albumName = "PPT_Notein_" +
+                String albumName = "PPT_Notein_Strict_" +
                         new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
 
                 int total = selected.size();
                 int ok = 0;
-                long baseTime = System.currentTimeMillis();
 
-                // 关键：倒序插入。若 Notein 按 MediaStore _ID/添加顺序倒序显示，第一页会获得最大的 _ID。
+                Calendar anchor = Calendar.getInstance();
+                anchor.set(Calendar.HOUR_OF_DAY, 20);
+                anchor.set(Calendar.MINUTE, 0);
+                anchor.set(Calendar.SECOND, 0);
+                anchor.set(Calendar.MILLISECOND, 0);
+                long baseTime = anchor.getTimeInMillis();
+
+                // 仍然倒序插入，让第一页获得最大的 MediaStore _ID；
+                // 但所有页的逻辑时间固定在同一天 20:00 附近，每页只差 1 秒。
                 for (int i = total - 1; i >= 0; i--) {
                     ImageItem item = selected.get(i);
-                    long pageTime = baseTime - ((long) i * 60_000L);
+                    long pageTime = baseTime - ((long) i * 1000L);
                     if (copyToGallery(item, albumName, pageTime)) ok++;
 
                     final int done = total - i;
                     final String name = item.name;
                     runOnUiThread(() -> statusText.setText(
-                            "正在生成 Notein 兼容顺序 " + done + "/" + total + "\n" + name));
+                            "正在生成同日严格排序 " + done + "/" + total + "\n" + name));
                 }
 
                 final int success = ok;
@@ -204,14 +211,16 @@ public class MainActivity extends Activity {
                     statusText.setText(
                             "完成！成功 " + success + "/" + total + " 张。\n\n" +
                             "新相册：Pictures/" + albumName + "\n" +
-                            "已同步处理：\n" +
-                            "• 001/002/003 文件名\n" +
+                            "本版已强制：\n" +
+                            "• 所有图片位于同一天\n" +
+                            "• 每页仅相差 1 秒\n" +
+                            "• 001/002/003 文件名 + TITLE\n" +
                             "• DATE_TAKEN / DATE_ADDED / DATE_MODIFIED\n" +
                             "• EXIF DateTimeOriginal / DateTimeDigitized\n" +
-                            "• 针对 Notein 的倒序写入顺序\n\n" +
-                            "请在 Notein 中重新进入图片选择器查看这个新相册。");
+                            "• 第一页最后写入，获得最大 MediaStore _ID\n\n" +
+                            "请完全退出 Notein 后重新打开，再进入图片选择器查看这个新相册。");
                     startButton.setEnabled(true);
-                    Toast.makeText(this, "Notein 兼容相册已生成", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "v1.3 相册已生成", Toast.LENGTH_LONG).show();
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -270,9 +279,13 @@ public class MainActivity extends Activity {
         ContentResolver resolver = getContentResolver();
         Uri outputUri = null;
         try {
-            String displayName = String.format(Locale.US, "%03d.%s", item.pageNumber, item.ext);
+            String pageLabel = String.format(Locale.US, "%03d", item.pageNumber);
+            String displayName = pageLabel + "." + item.ext;
+
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, displayName);
+            values.put(MediaStore.Images.Media.TITLE, pageLabel);
+            values.put(MediaStore.Images.Media.DESCRIPTION, "PPT page " + pageLabel);
             values.put(MediaStore.Images.Media.MIME_TYPE, item.mime);
             values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/" + albumName);
             values.put(MediaStore.Images.Media.DATE_TAKEN, pageTime);
@@ -292,7 +305,6 @@ public class MainActivity extends Activity {
                 out.flush();
             }
 
-            // JPEG 写入 EXIF 时间；不支持 EXIF 的格式自动跳过。
             if ("jpg".equalsIgnoreCase(item.ext) || "jpeg".equalsIgnoreCase(item.ext)) {
                 try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(outputUri, "rw")) {
                     if (pfd != null) {
@@ -303,6 +315,7 @@ public class MainActivity extends Activity {
                         exif.setAttribute(ExifInterface.TAG_DATETIME, t);
                         exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, t);
                         exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, t);
+                        exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, "PPT page " + pageLabel);
                         exif.saveAttributes();
                     }
                 } catch (Exception ignored) {}
@@ -310,6 +323,7 @@ public class MainActivity extends Activity {
 
             ContentValues done = new ContentValues();
             done.put(MediaStore.Images.Media.IS_PENDING, 0);
+            done.put(MediaStore.Images.Media.TITLE, pageLabel);
             done.put(MediaStore.Images.Media.DATE_TAKEN, pageTime);
             done.put(MediaStore.Images.Media.DATE_ADDED, pageTime / 1000L);
             done.put(MediaStore.Images.Media.DATE_MODIFIED, pageTime / 1000L);
