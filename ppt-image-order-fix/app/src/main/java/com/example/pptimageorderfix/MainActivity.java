@@ -4,12 +4,14 @@ import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.UriPermission;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
+import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
@@ -26,6 +28,9 @@ import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -48,6 +53,8 @@ public class MainActivity extends Activity {
         String ext;
         int suffixNumber;
         int pageNumber;
+        String batchKey;
+        long batchId;
     }
 
     @Override
@@ -72,9 +79,10 @@ public class MainActivity extends Activity {
                 "专门处理 QQ 浏览器 PPT 转图片后的顺序问题。\n\n" +
                 "它会：\n" +
                 "1. 读取文件名最后的 _0、_1、_2…\n" +
-                "2. 按数字而不是文字排序\n" +
-                "3. 复制成 001.jpg、002.jpg、003.jpg…\n" +
-                "4. 写入新的系统相册，并设置时间顺序，让小米相册更稳定地按 PPT 页码显示\n\n" +
+                "2. 自动识别同目录中的多次 QQ 转换记录，只处理最新一批\n" +
+                "3. 按数字而不是文字排序\n" +
+                "4. 复制成 001.jpg、002.jpg、003.jpg…\n" +
+                "5. 写入新的系统相册，并设置时间顺序，让小米相册更稳定地按 PPT 页码显示\n\n" +
                 "不会修改或删除原文件。");
         desc.setTextSize(16);
         root.addView(desc);
@@ -171,17 +179,48 @@ public class MainActivity extends Activity {
                     return;
                 }
 
-                Collections.sort(items, Comparator.comparingInt(a -> a.suffixNumber));
+                Map<String, List<ImageItem>> batches = new LinkedHashMap<>();
+                for (ImageItem item : items) {
+                    batches.computeIfAbsent(item.batchKey, k -> new ArrayList<>()).add(item);
+                }
+
+                List<ImageItem> selected = null;
+                long newestBatchId = Long.MIN_VALUE;
+                for (Map.Entry<String, List<ImageItem>> entry : batches.entrySet()) {
+                    long id = entry.getValue().isEmpty() ? 0L : entry.getValue().get(0).batchId;
+                    if (selected == null || id > newestBatchId ||
+                            (id == newestBatchId && entry.getValue().size() > selected.size())) {
+                        newestBatchId = id;
+                        selected = entry.getValue();
+                    }
+                }
+
+                if (selected == null || selected.isEmpty()) {
+                    throw new Exception("没有可处理的图片批次");
+                }
+
+                TreeMap<Integer, ImageItem> uniquePages = new TreeMap<>();
+                for (ImageItem item : selected) {
+                    uniquePages.put(item.suffixNumber, item);
+                }
+                selected = new ArrayList<>(uniquePages.values());
+                Collections.sort(selected, Comparator.comparingInt(a -> a.suffixNumber));
 
                 String albumName = "PPT_Ordered_" +
                         new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
 
                 long baseTime = System.currentTimeMillis();
-                int total = items.size();
+                int total = selected.size();
                 int ok = 0;
 
+                final int batchCount = batches.size();
+                final int selectedCount = total;
+                runOnUiThread(() -> statusText.setText(
+                        "检测到 " + batchCount + " 批 QQ 转换记录，已自动选择最新一批。\n" +
+                        "本批共 " + selectedCount + " 页，开始整理…"));
+
                 for (int i = 0; i < total; i++) {
-                    ImageItem item = items.get(i);
+                    ImageItem item = selected.get(i);
                     long takenTime = baseTime - i * 1000L;
                     if (copyToGallery(item, albumName, takenTime)) {
                         ok++;
@@ -197,8 +236,10 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     statusText.setText(
                             "完成！成功 " + success + "/" + total + " 张。\n\n" +
+                            (batchCount > 1 ? "检测到旧转换记录，已自动忽略，只处理最新一批。\n" : "") +
                             "新相册位置：Pictures/" + albumName + "\n" +
                             "文件名已整理为 001、002、003…\n" +
+                            "不会再出现 001 (1).jpg 这类重复名。\n" +
                             "原文件未修改。");
                     startButton.setEnabled(true);
                     Toast.makeText(this, "整理完成", Toast.LENGTH_LONG).show();
@@ -252,6 +293,8 @@ public class MainActivity extends Activity {
                 item.ext = normalizeExt(m.group(2));
                 item.suffixNumber = suffix;
                 item.pageNumber = page;
+                item.batchKey = name.substring(0, m.start());
+                item.batchId = extractBatchId(item.batchKey);
                 result.add(item);
             }
         }
@@ -303,6 +346,17 @@ public class MainActivity extends Activity {
             }
             return false;
         }
+    }
+
+    private long extractBatchId(String batchKey) {
+        Matcher matcher = Pattern.compile("(\\d{10,})").matcher(batchKey);
+        long value = 0L;
+        while (matcher.find()) {
+            try {
+                value = Long.parseLong(matcher.group(1));
+            } catch (NumberFormatException ignored) {}
+        }
+        return value;
     }
 
     private String normalizeExt(String ext) {
