@@ -4,20 +4,21 @@ import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
-import android.content.UriPermission;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
-import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import androidx.exifinterface.media.ExifInterface;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -26,10 +27,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TimeZone;
 import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -69,20 +71,16 @@ public class MainActivity extends Activity {
         scroll.addView(root);
 
         TextView title = new TextView(this);
-        title.setText("PPT 图片顺序修复");
+        title.setText("PPT 图片顺序修复 v1.2");
         title.setTextSize(26);
         title.setPadding(0, 0, 0, dp(12));
         root.addView(title);
 
         TextView desc = new TextView(this);
         desc.setText(
-                "专门处理 QQ 浏览器 PPT 转图片后的顺序问题。\n\n" +
-                "它会：\n" +
-                "1. 读取文件名最后的 _0、_1、_2…\n" +
-                "2. 自动识别同目录中的多次 QQ 转换记录，只处理最新一批\n" +
-                "3. 按数字而不是文字排序\n" +
-                "4. 复制成 001.jpg、002.jpg、003.jpg…\n" +
-                "5. 写入新的系统相册，并设置时间顺序，让小米相册更稳定地按 PPT 页码显示\n\n" +
+                "兼容 QQ 浏览器导图、小米相册和 Notein 图片选择器。\n\n" +
+                "新版会同时处理：文件名、MediaStore 时间、EXIF 时间和写入顺序。\n" +
+                "这样即使 Notein 不按文件名排序，也更容易保持 1→2→3 的页序。\n\n" +
                 "不会修改或删除原文件。");
         desc.setTextSize(16);
         root.addView(desc);
@@ -103,14 +101,8 @@ public class MainActivity extends Activity {
         zeroBasedBox.setChecked(true);
         root.addView(zeroBasedBox);
 
-        TextView hint = new TextView(this);
-        hint.setText("你截图里的情况应保持勾选。如果以后遇到 _1 就是第1页的文件，再取消勾选。");
-        hint.setTextSize(13);
-        hint.setPadding(0, 0, 0, dp(10));
-        root.addView(hint);
-
         startButton = new Button(this);
-        startButton.setText("② 一键整理到新相册");
+        startButton.setText("② 生成 Notein 兼容相册");
         startButton.setEnabled(false);
         startButton.setOnClickListener(v -> startFix());
         root.addView(startButton);
@@ -125,8 +117,7 @@ public class MainActivity extends Activity {
     }
 
     private int dp(int value) {
-        float density = getResources().getDisplayMetrics().density;
-        return Math.round(value * density);
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     private void chooseFolder() {
@@ -143,14 +134,9 @@ public class MainActivity extends Activity {
         if (requestCode == REQ_FOLDER && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri == null) return;
-
-            int flags = data.getFlags() &
-                    (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
             try {
-                getContentResolver().takePersistableUriPermission(
-                        uri, flags & Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } catch (Exception ignored) {}
-
             selectedTreeUri = uri;
             folderText.setText("已选择：\n" + uri);
             startButton.setEnabled(true);
@@ -170,14 +156,7 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 List<ImageItem> items = scanFolder(selectedTreeUri, zeroBasedBox.isChecked());
-
-                if (items.isEmpty()) {
-                    runOnUiThread(() -> {
-                        statusText.setText("没有找到文件名以 _数字.jpg / png / webp 结尾的图片。");
-                        startButton.setEnabled(true);
-                    });
-                    return;
-                }
+                if (items.isEmpty()) throw new Exception("没有找到 _数字.jpg/png/webp 格式的图片");
 
                 Map<String, List<ImageItem>> batches = new LinkedHashMap<>();
                 for (ImageItem item : items) {
@@ -186,65 +165,54 @@ public class MainActivity extends Activity {
 
                 List<ImageItem> selected = null;
                 long newestBatchId = Long.MIN_VALUE;
-                for (Map.Entry<String, List<ImageItem>> entry : batches.entrySet()) {
-                    long id = entry.getValue().isEmpty() ? 0L : entry.getValue().get(0).batchId;
+                for (List<ImageItem> batch : batches.values()) {
+                    long id = batch.isEmpty() ? 0L : batch.get(0).batchId;
                     if (selected == null || id > newestBatchId ||
-                            (id == newestBatchId && entry.getValue().size() > selected.size())) {
+                            (id == newestBatchId && batch.size() > selected.size())) {
                         newestBatchId = id;
-                        selected = entry.getValue();
+                        selected = batch;
                     }
                 }
-
-                if (selected == null || selected.isEmpty()) {
-                    throw new Exception("没有可处理的图片批次");
-                }
+                if (selected == null || selected.isEmpty()) throw new Exception("没有可处理批次");
 
                 TreeMap<Integer, ImageItem> uniquePages = new TreeMap<>();
-                for (ImageItem item : selected) {
-                    uniquePages.put(item.suffixNumber, item);
-                }
+                for (ImageItem item : selected) uniquePages.put(item.suffixNumber, item);
                 selected = new ArrayList<>(uniquePages.values());
                 Collections.sort(selected, Comparator.comparingInt(a -> a.suffixNumber));
 
-                String albumName = "PPT_Ordered_" +
+                String albumName = "PPT_Notein_" +
                         new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
 
-                long baseTime = System.currentTimeMillis();
                 int total = selected.size();
                 int ok = 0;
+                long baseTime = System.currentTimeMillis();
 
-                final int batchCount = batches.size();
-                final int selectedCount = total;
-                runOnUiThread(() -> statusText.setText(
-                        "检测到 " + batchCount + " 批 QQ 转换记录，已自动选择最新一批。\n" +
-                        "本批共 " + selectedCount + " 页，开始整理…"));
-
-                for (int i = 0; i < total; i++) {
+                // 关键：倒序插入。若 Notein 按 MediaStore _ID/添加顺序倒序显示，第一页会获得最大的 _ID。
+                for (int i = total - 1; i >= 0; i--) {
                     ImageItem item = selected.get(i);
-                    long takenTime = baseTime - i * 1000L;
-                    if (copyToGallery(item, albumName, takenTime)) {
-                        ok++;
-                    }
+                    long pageTime = baseTime - ((long) i * 60_000L);
+                    if (copyToGallery(item, albumName, pageTime)) ok++;
 
-                    final int done = i + 1;
+                    final int done = total - i;
                     final String name = item.name;
-                    runOnUiThread(() ->
-                            statusText.setText("正在整理 " + done + "/" + total + "\n" + name));
+                    runOnUiThread(() -> statusText.setText(
+                            "正在生成 Notein 兼容顺序 " + done + "/" + total + "\n" + name));
                 }
 
                 final int success = ok;
                 runOnUiThread(() -> {
                     statusText.setText(
                             "完成！成功 " + success + "/" + total + " 张。\n\n" +
-                            (batchCount > 1 ? "检测到旧转换记录，已自动忽略，只处理最新一批。\n" : "") +
-                            "新相册位置：Pictures/" + albumName + "\n" +
-                            "文件名已整理为 001、002、003…\n" +
-                            "不会再出现 001 (1).jpg 这类重复名。\n" +
-                            "原文件未修改。");
+                            "新相册：Pictures/" + albumName + "\n" +
+                            "已同步处理：\n" +
+                            "• 001/002/003 文件名\n" +
+                            "• DATE_TAKEN / DATE_ADDED / DATE_MODIFIED\n" +
+                            "• EXIF DateTimeOriginal / DateTimeDigitized\n" +
+                            "• 针对 Notein 的倒序写入顺序\n\n" +
+                            "请在 Notein 中重新进入图片选择器查看这个新相册。");
                     startButton.setEnabled(true);
-                    Toast.makeText(this, "整理完成", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "Notein 兼容相册已生成", Toast.LENGTH_LONG).show();
                 });
-
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     statusText.setText("处理失败：\n" + e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -256,11 +224,9 @@ public class MainActivity extends Activity {
 
     private List<ImageItem> scanFolder(Uri treeUri, boolean zeroBased) throws Exception {
         List<ImageItem> result = new ArrayList<>();
-
         String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
         Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId);
-
-        String[] projection = new String[] {
+        String[] projection = new String[]{
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                 DocumentsContract.Document.COLUMN_MIME_TYPE
@@ -268,7 +234,6 @@ public class MainActivity extends Activity {
 
         try (Cursor cursor = getContentResolver().query(childrenUri, projection, null, null, null)) {
             if (cursor == null) return result;
-
             int idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
             int nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
             int mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
@@ -277,8 +242,8 @@ public class MainActivity extends Activity {
                 String docId = cursor.getString(idIndex);
                 String name = cursor.getString(nameIndex);
                 String mime = cursor.getString(mimeIndex);
-
                 if (name == null) continue;
+
                 Matcher m = PAGE_SUFFIX.matcher(name);
                 if (!m.find()) continue;
 
@@ -298,25 +263,21 @@ public class MainActivity extends Activity {
                 result.add(item);
             }
         }
-
         return result;
     }
 
-    private boolean copyToGallery(ImageItem item, String albumName, long takenTime) {
+    private boolean copyToGallery(ImageItem item, String albumName, long pageTime) {
         ContentResolver resolver = getContentResolver();
         Uri outputUri = null;
-
         try {
             String displayName = String.format(Locale.US, "%03d.%s", item.pageNumber, item.ext);
-
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, displayName);
             values.put(MediaStore.Images.Media.MIME_TYPE, item.mime);
-            values.put(MediaStore.Images.Media.RELATIVE_PATH,
-                    Environment.DIRECTORY_PICTURES + "/" + albumName);
-            values.put(MediaStore.Images.Media.DATE_TAKEN, takenTime);
-            values.put(MediaStore.Images.Media.DATE_ADDED, takenTime / 1000L);
-            values.put(MediaStore.Images.Media.DATE_MODIFIED, takenTime / 1000L);
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/" + albumName);
+            values.put(MediaStore.Images.Media.DATE_TAKEN, pageTime);
+            values.put(MediaStore.Images.Media.DATE_ADDED, pageTime / 1000L);
+            values.put(MediaStore.Images.Media.DATE_MODIFIED, pageTime / 1000L);
             values.put(MediaStore.Images.Media.IS_PENDING, 1);
 
             outputUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
@@ -327,19 +288,33 @@ public class MainActivity extends Activity {
                 if (in == null || out == null) throw new Exception("无法打开图片流");
                 byte[] buffer = new byte[128 * 1024];
                 int n;
-                while ((n = in.read(buffer)) > 0) {
-                    out.write(buffer, 0, n);
-                }
+                while ((n = in.read(buffer)) > 0) out.write(buffer, 0, n);
                 out.flush();
+            }
+
+            // JPEG 写入 EXIF 时间；不支持 EXIF 的格式自动跳过。
+            if ("jpg".equalsIgnoreCase(item.ext) || "jpeg".equalsIgnoreCase(item.ext)) {
+                try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(outputUri, "rw")) {
+                    if (pfd != null) {
+                        ExifInterface exif = new ExifInterface(pfd.getFileDescriptor());
+                        SimpleDateFormat exifFmt = new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US);
+                        exifFmt.setTimeZone(TimeZone.getDefault());
+                        String t = exifFmt.format(new Date(pageTime));
+                        exif.setAttribute(ExifInterface.TAG_DATETIME, t);
+                        exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, t);
+                        exif.setAttribute(ExifInterface.TAG_DATETIME_DIGITIZED, t);
+                        exif.saveAttributes();
+                    }
+                } catch (Exception ignored) {}
             }
 
             ContentValues done = new ContentValues();
             done.put(MediaStore.Images.Media.IS_PENDING, 0);
-            done.put(MediaStore.Images.Media.DATE_TAKEN, takenTime);
-            done.put(MediaStore.Images.Media.DATE_MODIFIED, takenTime / 1000L);
+            done.put(MediaStore.Images.Media.DATE_TAKEN, pageTime);
+            done.put(MediaStore.Images.Media.DATE_ADDED, pageTime / 1000L);
+            done.put(MediaStore.Images.Media.DATE_MODIFIED, pageTime / 1000L);
             resolver.update(outputUri, done, null, null);
             return true;
-
         } catch (Exception e) {
             if (outputUri != null) {
                 try { resolver.delete(outputUri, null, null); } catch (Exception ignored) {}
@@ -352,17 +327,15 @@ public class MainActivity extends Activity {
         Matcher matcher = Pattern.compile("(\\d{10,})").matcher(batchKey);
         long value = 0L;
         while (matcher.find()) {
-            try {
-                value = Long.parseLong(matcher.group(1));
-            } catch (NumberFormatException ignored) {}
+            try { value = Long.parseLong(matcher.group(1)); }
+            catch (NumberFormatException ignored) {}
         }
         return value;
     }
 
     private String normalizeExt(String ext) {
         String e = ext.toLowerCase(Locale.US);
-        if ("jpeg".equals(e)) return "jpg";
-        return e;
+        return "jpeg".equals(e) ? "jpg" : e;
     }
 
     private String guessMime(String ext) {
